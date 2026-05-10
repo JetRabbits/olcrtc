@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/openlibrecommunity/olcrtc/internal/app/session"
-	"github.com/openlibrecommunity/olcrtc/internal/logger"
+	"github.com/openlibrecommunity/olcrtc/pkg/app/session"
+	"github.com/openlibrecommunity/olcrtc/pkg/logger"
 )
 
 func TestToSessionConfig(t *testing.T) {

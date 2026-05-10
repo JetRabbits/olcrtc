@@ -15,9 +15,9 @@ import (
 
 	protoLogger "github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
-	"github.com/openlibrecommunity/olcrtc/internal/app/session"
-	"github.com/openlibrecommunity/olcrtc/internal/logger"
-	"github.com/openlibrecommunity/olcrtc/internal/names"
+	"github.com/openlibrecommunity/olcrtc/pkg/app/session"
+	"github.com/openlibrecommunity/olcrtc/pkg/logger"
+	"github.com/openlibrecommunity/olcrtc/pkg/names"
 )
 
 const modeGen = "gen"

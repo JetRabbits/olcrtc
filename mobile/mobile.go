@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openlibrecommunity/olcrtc/internal/app/session"
-	"github.com/openlibrecommunity/olcrtc/internal/client"
-	"github.com/openlibrecommunity/olcrtc/internal/logger"
-	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	"github.com/openlibrecommunity/olcrtc/pkg/app/session"
+	"github.com/openlibrecommunity/olcrtc/pkg/client"
+	"github.com/openlibrecommunity/olcrtc/pkg/logger"
+	"github.com/openlibrecommunity/olcrtc/pkg/protect"
 
 	_ "golang.org/x/mobile/bind"                       // ensure gomobile bind is available
 	_ "google.golang.org/genproto/protobuf/field_mask" // keep gomobile on post-split genproto modules
