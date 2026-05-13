@@ -14,6 +14,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/link"
 	"github.com/openlibrecommunity/olcrtc/internal/link/direct"
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
 	"github.com/openlibrecommunity/olcrtc/internal/server"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -363,6 +364,15 @@ func Run(ctx context.Context, cfg Config) error {
 			Engine:          cfg.Engine,
 			URL:             cfg.URL,
 			Token:           cfg.Token,
+			OnSessionOpen: func(sessionID, deviceID string, claims map[string]any) {
+				logger.Infof("session opened: id=%s device=%s claims=%v", sessionID, deviceID, claims)
+			},
+			OnSessionClose: func(sessionID, reason string) {
+				logger.Infof("session closed: id=%s reason=%s", sessionID, reason)
+			},
+			OnTraffic: func(sessionID, addr string, bytesIn, bytesOut uint64) {
+				logger.Infof("traffic: session=%s addr=%s in=%d out=%d", sessionID, addr, bytesIn, bytesOut)
+			},
 		}); err != nil {
 			return fmt.Errorf("server: %w", err)
 		}
