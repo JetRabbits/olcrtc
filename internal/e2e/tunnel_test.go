@@ -983,6 +983,29 @@ func startEchoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+func startUDPEchoServer(t *testing.T) string {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp echo: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = conn.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	return conn.LocalAddr().String()
+}
+
 func freeLocalAddr(ctx context.Context, t *testing.T) string {
 	t.Helper()
 	var lc net.ListenConfig
@@ -1257,6 +1280,91 @@ func connectViaSOCKS(t *testing.T, socksAddr, targetAddr string) net.Conn {
 	return conn
 }
 
+func udpAssociateViaSOCKS(t *testing.T, socksAddr string) (*net.TCPConn, *net.UDPConn) {
+	t.Helper()
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", socksAddr)
+	if err != nil {
+		t.Fatalf("resolve socks tcp addr: %v", err)
+	}
+	tcpConn, err := net.DialTCP("tcp4", nil, tcpAddr)
+	if err != nil {
+		t.Fatalf("dial socks tcp: %v", err)
+	}
+
+	if _, err := tcpConn.Write([]byte{5, 1, 0}); err != nil {
+		_ = tcpConn.Close()
+		t.Fatalf("write socks greeting: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(tcpConn, greeting); err != nil {
+		_ = tcpConn.Close()
+		t.Fatalf("read socks greeting: %v", err)
+	}
+	if !bytes.Equal(greeting, []byte{5, 0}) {
+		_ = tcpConn.Close()
+		t.Fatalf("socks greeting = %v, want [5 0]", greeting)
+	}
+
+	if _, err := tcpConn.Write([]byte{5, 3, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		_ = tcpConn.Close()
+		t.Fatalf("write socks udp associate: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(tcpConn, reply); err != nil {
+		_ = tcpConn.Close()
+		t.Fatalf("read socks udp associate reply: %v", err)
+	}
+	if reply[0] != 5 || reply[1] != 0 || reply[3] != 1 {
+		_ = tcpConn.Close()
+		t.Fatalf("socks udp associate reply = %v, want IPv4 success", reply)
+	}
+
+	relayIP := net.IPv4(reply[4], reply[5], reply[6], reply[7])
+	relayPort := int(binary.BigEndian.Uint16(reply[8:10]))
+	udpConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: relayIP, Port: relayPort})
+	if err != nil {
+		_ = tcpConn.Close()
+		t.Fatalf("dial socks udp relay: %v", err)
+	}
+	return tcpConn, udpConn
+}
+
+func socksUDPDatagram(t *testing.T, targetAddr string, payload []byte) []byte {
+	t.Helper()
+
+	host, portText, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		t.Fatalf("split udp target addr: %v", err)
+	}
+	ip4 := net.ParseIP(host).To4()
+	if ip4 == nil {
+		t.Fatalf("udp target must be IPv4, got %q", host)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse udp target port: %v", err)
+	}
+
+	out := make([]byte, 0, 10+len(payload))
+	out = append(out, 0, 0, 0, 1)
+	out = append(out, ip4...)
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], uint16(port)) //nolint:gosec // SOCKS5 port is uint16 by definition
+	out = append(out, portBuf[:]...)
+	out = append(out, payload...)
+	return out
+}
+
+func parseSocksUDPDatagram(t *testing.T, data []byte) (string, []byte) {
+	t.Helper()
+	if len(data) < 10 || data[0] != 0 || data[1] != 0 || data[2] != 0 || data[3] != 1 {
+		t.Fatalf("invalid SOCKS UDP datagram: %v", data)
+	}
+	addr := net.JoinHostPort(net.IP(data[4:8]).String(), strconv.Itoa(int(binary.BigEndian.Uint16(data[8:10]))))
+	return addr, data[10:]
+}
+
 func TestBuiltInProviderTransportMatrixValidates(t *testing.T) {
 	session.RegisterDefaults()
 
@@ -1456,6 +1564,37 @@ func TestClientServerSOCKSTunnelOverMemoryDatachannel(t *testing.T) {
 	}
 	if !bytes.Equal(line, payload) {
 		t.Fatalf("echo = %q, want %q", line, payload)
+	}
+}
+
+func TestClientServerSOCKSUDPAssociateOverMemoryDatachannel(t *testing.T) {
+	udpEchoAddr := startUDPEchoServer(t)
+	rt := startTunnel(t)
+	defer rt.stop(t)
+
+	tcpControl, udpConn := udpAssociateViaSOCKS(t, rt.socksAddr)
+	defer func() { _ = tcpControl.Close() }()
+	defer func() { _ = udpConn.Close() }()
+
+	payload := []byte("olcrtc-e2e-udp-payload")
+	if _, err := udpConn.Write(socksUDPDatagram(t, udpEchoAddr, payload)); err != nil {
+		t.Fatalf("write socks udp datagram: %v", err)
+	}
+
+	buf := make([]byte, 1500)
+	if err := udpConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set udp read deadline: %v", err)
+	}
+	n, err := udpConn.Read(buf)
+	if err != nil {
+		t.Fatalf("read socks udp echo: %v", err)
+	}
+	addr, echoed := parseSocksUDPDatagram(t, buf[:n])
+	if addr != udpEchoAddr {
+		t.Fatalf("udp reply addr = %q, want %q", addr, udpEchoAddr)
+	}
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("udp echo = %q, want %q", echoed, payload)
 	}
 }
 
