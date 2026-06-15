@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/framing"
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
@@ -25,6 +26,13 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/xtaci/smux"
+)
+
+const (
+	socksCommandConnect      = 1
+	socksCommandUDPAssociate = 3
+	udpDialCommand           = "udp-dial"
+	maxUDPPacketSize         = 65535
 )
 
 var (
@@ -66,6 +74,18 @@ type Client struct {
 	dnsServer   string
 	socksUser   string
 	socksPass   string
+}
+
+type socksRequest struct {
+	command byte
+	addr    string
+	port    int
+}
+
+type socksUDPDatagram struct {
+	addr    string
+	port    int
+	payload []byte
 }
 
 // HealthFunc is called when the client control health snapshot changes.
@@ -614,14 +634,14 @@ func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
 	}
 }
 
-func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
+func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	if err := c.socks5Handshake(conn); err != nil {
 		return
 	}
 
-	targetAddr, targetPort, err := c.socks5Request(conn)
+	req, err := c.readSocks5Request(conn)
 	if err != nil {
 		return
 	}
@@ -634,7 +654,12 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
-	c.tunnel(conn, sess, targetAddr, targetPort)
+	switch req.command {
+	case socksCommandConnect:
+		c.tunnel(conn, sess, req.addr, req.port)
+	case socksCommandUDPAssociate:
+		c.udpAssociate(ctx, conn, sess)
+	}
 }
 
 func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
@@ -688,6 +713,163 @@ func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targ
 	}
 	_ = stream.SetReadDeadline(time.Time{})
 	return nil
+}
+
+func (c *Client) sendUDPDialRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
+	req, err := json.Marshal(map[string]any{
+		"cmd":  udpDialCommand,
+		"addr": targetAddr,
+		"port": targetPort,
+	})
+	if err != nil {
+		return fmt.Errorf("sid=%d marshal udp-dial req: %w", stream.ID(), err)
+	}
+
+	_ = stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := stream.Write(req); err != nil {
+		return fmt.Errorf("sid=%d write udp-dial req: %w", stream.ID(), err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+	return nil
+}
+
+func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.Session) {
+	udpConn, err := c.listenUDPRelay(tcpConn.LocalAddr())
+	if err != nil {
+		logger.Warnf("UDP ASSOCIATE listen failed: %v", err)
+		_, _ = tcpConn.Write(replyHostUnreachable())
+		return
+	}
+	defer func() { _ = udpConn.Close() }()
+
+	bound := udpConn.LocalAddr().(*net.UDPAddr)
+	if _, err := tcpConn.Write(replySuccessAddr(bound.IP, bound.Port)); err != nil {
+		return
+	}
+
+	var (
+		streamMu      sync.Mutex
+		stream        *smux.Stream
+		targetAddr    string
+		targetPort    int
+		udpClientMu   sync.RWMutex
+		udpClientAddr *net.UDPAddr
+	)
+
+	closeStream := func() {
+		streamMu.Lock()
+		if stream != nil {
+			_ = stream.Close()
+			stream = nil
+		}
+		streamMu.Unlock()
+	}
+	defer closeStream()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		_, _ = io.Copy(io.Discard, tcpConn)
+		_ = udpConn.Close()
+		closeStream()
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = udpConn.Close()
+			closeStream()
+		case <-done:
+		}
+	}()
+
+	buf := make([]byte, maxUDPPacketSize)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, src, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		datagram, err := parseSocks5UDPDatagram(buf[:n])
+		if err != nil {
+			logger.Debugf("UDP ASSOCIATE parse failed: %v", err)
+			continue
+		}
+
+		udpClientMu.Lock()
+		udpClientAddr = src
+		udpClientMu.Unlock()
+
+		streamMu.Lock()
+		if stream == nil || targetAddr != datagram.addr || targetPort != datagram.port {
+			if stream != nil {
+				_ = stream.Close()
+			}
+			stream, err = sess.OpenStream()
+			if err == nil {
+				targetAddr = datagram.addr
+				targetPort = datagram.port
+				err = c.sendUDPDialRequest(stream, targetAddr, targetPort)
+			}
+			if err == nil {
+				go c.forwardUDPReplies(udpConn, stream, targetAddr, targetPort, &udpClientMu, &udpClientAddr)
+			}
+		}
+		current := stream
+		if err == nil && current != nil {
+			err = framing.WriteBytes(current, datagram.payload, maxUDPPacketSize)
+		}
+		streamMu.Unlock()
+
+		if err != nil {
+			logger.Debugf("UDP ASSOCIATE stream write failed: %v", err)
+			closeStream()
+		}
+	}
+}
+
+func (c *Client) listenUDPRelay(tcpAddr net.Addr) (*net.UDPConn, error) {
+	host := "127.0.0.1"
+	if addr, ok := tcpAddr.(*net.TCPAddr); ok && addr.IP != nil && !addr.IP.IsUnspecified() {
+		host = addr.IP.String()
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp4", udpAddr)
+}
+
+func (c *Client) forwardUDPReplies(
+	udpConn *net.UDPConn,
+	stream *smux.Stream,
+	targetAddr string,
+	targetPort int,
+	udpClientMu *sync.RWMutex,
+	udpClientAddr **net.UDPAddr,
+) {
+	for {
+		packet, err := framing.ReadBytes(stream, maxUDPPacketSize)
+		if err != nil {
+			return
+		}
+		out, err := marshalSocks5UDPDatagram(targetAddr, targetPort, packet)
+		if err != nil {
+			return
+		}
+
+		udpClientMu.RLock()
+		addr := *udpClientAddr
+		udpClientMu.RUnlock()
+		if addr == nil {
+			continue
+		}
+		_, _ = udpConn.WriteToUDP(out, addr)
+	}
 }
 
 func (c *Client) socks5Handshake(conn net.Conn) error {
@@ -757,26 +939,37 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 }
 
 func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
+	req, err := c.readSocks5Request(conn)
+	if err != nil {
+		return "", 0, err
+	}
+	if req.command != socksCommandConnect {
+		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, req.command)
+	}
+	return req.addr, req.port, nil
+}
+
+func (c *Client) readSocks5Request(conn net.Conn) (socksRequest, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read socks5 request: %w", err)
+		return socksRequest{}, fmt.Errorf("read socks5 request: %w", err)
 	}
-	if header[1] != 1 {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
+	if header[1] != socksCommandConnect && header[1] != socksCommandUDPAssociate {
+		return socksRequest{}, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
 	}
 
 	addr, err := c.readSocks5Addr(conn, header[3])
 	if err != nil {
-		return "", 0, err
+		return socksRequest{}, err
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", 0, fmt.Errorf("read socks5 port: %w", err)
+		return socksRequest{}, fmt.Errorf("read socks5 port: %w", err)
 	}
 	port := int(binary.BigEndian.Uint16(portBuf))
 
-	return addr, port, nil
+	return socksRequest{command: header[1], addr: addr, port: port}, nil
 }
 
 func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
@@ -797,13 +990,107 @@ func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
 			return "", fmt.Errorf("read socks5 domain: %w", err)
 		}
 		return string(buf), nil
+	case 4: // IPv6
+		buf := make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", fmt.Errorf("read socks5 ipv6: %w", err)
+		}
+		return net.IP(buf).String(), nil
 	default:
 		return "", fmt.Errorf("%w: %d", ErrUnsupportedAddressType, addrType)
 	}
 }
 
+func parseSocks5UDPDatagram(data []byte) (socksUDPDatagram, error) {
+	if len(data) < 4 {
+		return socksUDPDatagram{}, io.ErrUnexpectedEOF
+	}
+	if data[0] != 0 || data[1] != 0 || data[2] != 0 {
+		return socksUDPDatagram{}, ErrUnsupportedSOCKSCommand
+	}
+
+	addr, off, err := parseSocks5AddrBytes(data, 3)
+	if err != nil {
+		return socksUDPDatagram{}, err
+	}
+	if len(data) < off+2 {
+		return socksUDPDatagram{}, io.ErrUnexpectedEOF
+	}
+	port := int(binary.BigEndian.Uint16(data[off : off+2]))
+	return socksUDPDatagram{addr: addr, port: port, payload: data[off+2:]}, nil
+}
+
+func parseSocks5AddrBytes(data []byte, off int) (string, int, error) {
+	if len(data) <= off {
+		return "", 0, io.ErrUnexpectedEOF
+	}
+	switch data[off] {
+	case 1:
+		if len(data) < off+5 {
+			return "", 0, io.ErrUnexpectedEOF
+		}
+		return net.IP(data[off+1 : off+5]).String(), off + 5, nil
+	case 3:
+		if len(data) < off+2 {
+			return "", 0, io.ErrUnexpectedEOF
+		}
+		addrLen := int(data[off+1])
+		if len(data) < off+2+addrLen {
+			return "", 0, io.ErrUnexpectedEOF
+		}
+		return string(data[off+2 : off+2+addrLen]), off + 2 + addrLen, nil
+	case 4:
+		if len(data) < off+17 {
+			return "", 0, io.ErrUnexpectedEOF
+		}
+		return net.IP(data[off+1 : off+17]).String(), off + 17, nil
+	default:
+		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedAddressType, data[off])
+	}
+}
+
+func marshalSocks5UDPDatagram(addr string, port int, payload []byte) ([]byte, error) {
+	out := make([]byte, 0, 4+len(addr)+2+len(payload))
+	out = append(out, 0, 0, 0)
+	ip := net.ParseIP(addr)
+	if ip4 := ip.To4(); ip4 != nil {
+		out = append(out, 1)
+		out = append(out, ip4...)
+	} else if ip16 := ip.To16(); ip16 != nil {
+		out = append(out, 4)
+		out = append(out, ip16...)
+	} else {
+		if len(addr) > 255 {
+			return nil, fmt.Errorf("udp address too long: %d", len(addr))
+		}
+		out = append(out, 3, byte(len(addr)))
+		out = append(out, addr...)
+	}
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], uint16(port)) //nolint:gosec // port is parsed from SOCKS or configured endpoint
+	out = append(out, portBuf[:]...)
+	out = append(out, payload...)
+	return out, nil
+}
+
 func replySuccess() []byte {
 	return []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+}
+
+func replySuccessAddr(ip net.IP, port int) []byte {
+	if ip4 := ip.To4(); ip4 != nil {
+		resp := []byte{5, 0, 0, 1, ip4[0], ip4[1], ip4[2], ip4[3], 0, 0}
+		binary.BigEndian.PutUint16(resp[8:10], uint16(port)) //nolint:gosec // ephemeral UDP listener port
+		return resp
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		resp := make([]byte, 22)
+		copy(resp[:4], []byte{5, 0, 0, 4})
+		copy(resp[4:20], ip16)
+		binary.BigEndian.PutUint16(resp[20:22], uint16(port)) //nolint:gosec // ephemeral UDP listener port
+		return resp
+	}
+	return replySuccess()
 }
 
 func replyHostUnreachable() []byte {

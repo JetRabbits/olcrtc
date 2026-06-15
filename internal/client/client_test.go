@@ -13,6 +13,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/framing"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -303,6 +304,42 @@ func TestSocks5RequestDomain(t *testing.T) {
 	}
 }
 
+func TestReadSocks5RequestUDPAssociate(t *testing.T) {
+	c := &Client{}
+	server, client := net.Pipe()
+	defer func() {
+		_ = server.Close()
+		_ = client.Close()
+	}()
+
+	done := make(chan struct {
+		req socksRequest
+		err error
+	}, 1)
+	go func() {
+		req, err := c.readSocks5Request(server)
+		done <- struct {
+			req socksRequest
+			err error
+		}{req: req, err: err}
+	}()
+
+	req := []byte{5, socksCommandUDPAssociate, 0, 1, 0, 0, 0, 0}
+	port := make([]byte, 2)
+	binary.BigEndian.PutUint16(port, 0)
+	if _, err := client.Write(append(req, port...)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("readSocks5Request() error = %v", res.err)
+	}
+	if res.req.command != socksCommandUDPAssociate || res.req.addr != "0.0.0.0" || res.req.port != 0 {
+		t.Fatalf("readSocks5Request() = %+v", res.req)
+	}
+}
+
 func TestSocks5RequestRejectsCommandAndAddressType(t *testing.T) {
 	c := &Client{}
 	server, client := net.Pipe()
@@ -452,6 +489,199 @@ func TestSendConnectRequestOverSmux(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("server side error = %v", err)
 	}
+}
+
+func TestSendUDPDialRequestOverSmux(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer func() { _ = stream.Close() }()
+
+		var req map[string]any
+		if err := json.NewDecoder(stream).Decode(&req); err != nil {
+			done <- err
+			return
+		}
+		if req["cmd"] != udpDialCommand || req["addr"] != "127.0.0.1" {
+			done <- errors.New("unexpected udp-dial request")
+			return
+		}
+		done <- nil
+	}()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	c := &Client{deviceID: "client-1"}
+	if err := c.sendUDPDialRequest(stream, "127.0.0.1", 51820); err != nil {
+		t.Fatalf("sendUDPDialRequest() error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server side error = %v", err)
+	}
+}
+
+func TestHandleSocks5UDPAssociateRoundTrip(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer func() { _ = stream.Close() }()
+
+		req, initial, err := readStreamRequestForTest(stream)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if req["cmd"] != udpDialCommand || req["addr"] != "127.0.0.1" {
+			serverDone <- errors.New("unexpected udp-dial request")
+			return
+		}
+		reader := io.Reader(stream)
+		if len(initial) > 0 {
+			reader = io.MultiReader(bytes.NewReader(initial), stream)
+		}
+		packet, err := framing.ReadBytes(reader, maxUDPPacketSize)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if !bytes.Equal(packet, []byte("udp-packet")) {
+			serverDone <- errors.New("unexpected framed udp payload")
+			return
+		}
+		serverDone <- framing.WriteBytes(stream, []byte("udp-reply"), maxUDPPacketSize)
+	}()
+
+	socksServer, socksClient := net.Pipe()
+	defer func() {
+		_ = socksServer.Close()
+		_ = socksClient.Close()
+	}()
+	c := &Client{deviceID: "client-1", session: clientSess}
+	clientDone := make(chan struct{})
+	go func() {
+		c.handleSocks5(context.Background(), socksServer)
+		close(clientDone)
+	}()
+
+	if _, err := socksClient.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatalf("Write(greeting) error = %v", err)
+	}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(socksClient, method); err != nil {
+		t.Fatalf("ReadFull(method) error = %v", err)
+	}
+	if !bytes.Equal(method, []byte{5, 0}) {
+		t.Fatalf("method = %v", method)
+	}
+	if _, err := socksClient.Write([]byte{5, socksCommandUDPAssociate, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatalf("Write(udp associate) error = %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(socksClient, reply); err != nil {
+		t.Fatalf("ReadFull(reply) error = %v", err)
+	}
+	if reply[1] != 0 {
+		t.Fatalf("UDP ASSOCIATE reply = %v", reply)
+	}
+	relayPort := int(binary.BigEndian.Uint16(reply[8:10]))
+	udpClient, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort})
+	if err != nil {
+		t.Fatalf("DialUDP() error = %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+
+	out, err := marshalSocks5UDPDatagram("127.0.0.1", 9999, []byte("udp-packet"))
+	if err != nil {
+		t.Fatalf("marshalSocks5UDPDatagram() error = %v", err)
+	}
+	if _, err := udpClient.Write(out); err != nil {
+		t.Fatalf("UDP Write() error = %v", err)
+	}
+
+	buf := make([]byte, 1500)
+	_ = udpClient.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := udpClient.Read(buf)
+	if err != nil {
+		t.Fatalf("UDP Read() error = %v", err)
+	}
+	datagram, err := parseSocks5UDPDatagram(buf[:n])
+	if err != nil {
+		t.Fatalf("parseSocks5UDPDatagram() error = %v", err)
+	}
+	if datagram.addr != "127.0.0.1" || datagram.port != 9999 || !bytes.Equal(datagram.payload, []byte("udp-reply")) {
+		t.Fatalf("udp reply datagram = %+v", datagram)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server side error = %v", err)
+	}
+	_ = socksClient.Close()
+	<-clientDone
+}
+
+func readStreamRequestForTest(stream *smux.Stream) (map[string]any, []byte, error) {
+	buf := make([]byte, 0, 256)
+	tmp := make([]byte, 64)
+	for len(buf) <= 4096 {
+		n, err := stream.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			dec := json.NewDecoder(bytes.NewReader(buf))
+			var req map[string]any
+			if err := dec.Decode(&req); err == nil {
+				return req, buf[int(dec.InputOffset()):], nil
+			}
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return nil, nil, errors.New("request too large")
 }
 
 func TestSendConnectRequestRejectsBadAck(t *testing.T) {

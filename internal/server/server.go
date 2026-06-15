@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,7 +28,11 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const connectCommand = "connect"
+const (
+	connectCommand   = "connect"
+	udpDialCommand   = "udp-dial"
+	maxUDPPacketSize = 65535
+)
 
 var (
 	// ErrKeyRequired re-exports runtime.ErrKeyRequired for compatibility with
@@ -921,9 +926,9 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 		n, err := stream.Read(tmp)
 		if n > 0 {
 			header = append(header, tmp[:n]...)
-			if req, ok := parseConnectRequest(header); ok {
+			if req, headerLen, ok := parseStreamRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
-				s.dispatch(stream, req, sessionID)
+				s.dispatch(stream, req, sessionID, header[headerLen:])
 				return
 			}
 		}
@@ -937,14 +942,20 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 }
 
 func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
+	req, _, ok := parseStreamRequest(buf)
+	return req, ok
+}
+
+func parseStreamRequest(buf []byte) (ConnectRequest, int, bool) {
 	var req ConnectRequest
-	if err := json.Unmarshal(buf, &req); err != nil {
-		return req, false
+	dec := json.NewDecoder(bytes.NewReader(buf))
+	if err := dec.Decode(&req); err != nil {
+		return req, 0, false
 	}
-	if req.Cmd != connectCommand {
-		return req, false
+	if req.Cmd != connectCommand && req.Cmd != udpDialCommand {
+		return req, 0, false
 	}
-	return req, true
+	return req, int(dec.InputOffset()), true
 }
 
 // defaultAuthHook admits every client and assigns a random session ID.
@@ -953,7 +964,16 @@ func defaultAuthHook(_ string, _ map[string]any) (string, error) {
 	return uuid.NewString(), nil
 }
 
-func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID string) {
+func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID string, initial []byte) {
+	if req.Cmd == udpDialCommand {
+		s.dispatchUDPDial(stream, req, initial)
+		return
+	}
+
+	s.dispatchConnect(stream, req, sessionID, initial)
+}
+
+func (s *Server) dispatchConnect(stream *smux.Stream, req ConnectRequest, sessionID string, initial []byte) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
 
@@ -971,6 +991,11 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID str
 
 	if _, err := stream.Write([]byte{0x00}); err != nil {
 		return
+	}
+	if len(initial) > 0 {
+		if _, err := conn.Write(initial); err != nil {
+			return
+		}
 	}
 
 	var bytesOut uint64
@@ -992,6 +1017,59 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID str
 	}
 	if s.onTraffic != nil {
 		s.onTraffic(sessionID, addr, bytesIn, bytesOut)
+	}
+}
+
+func (s *Server) dispatchUDPDial(stream *smux.Stream, req ConnectRequest, initial []byte) {
+	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
+	logger.Infof("sid=%d udp-dial %s", stream.ID(), addr)
+
+	dialer := &net.Dialer{
+		Timeout:  10 * time.Second,
+		Resolver: s.resolver,
+	}
+	conn, err := dialer.Dial("udp", addr)
+	if err != nil {
+		logger.Infof("sid=%d udp-dial %s failed: %v", stream.ID(), addr, err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	go s.frameUDPReplies(stream, conn)
+
+	reader := io.Reader(stream)
+	if len(initial) > 0 {
+		reader = io.MultiReader(bytes.NewReader(initial), stream)
+	}
+	for {
+		packet, err := framing.ReadBytes(reader, maxUDPPacketSize)
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				logger.Debugf("sid=%d udp-dial read frame failed: %v", stream.ID(), err)
+			}
+			return
+		}
+		if len(packet) == 0 {
+			continue
+		}
+		if _, err := conn.Write(packet); err != nil {
+			logger.Debugf("sid=%d udp-dial write failed: %v", stream.ID(), err)
+			return
+		}
+	}
+}
+
+func (s *Server) frameUDPReplies(stream *smux.Stream, conn net.Conn) {
+	buf := make([]byte, maxUDPPacketSize)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := framing.WriteBytes(stream, buf[:n], maxUDPPacketSize); err != nil {
+			_ = stream.Close()
+			return
+		}
 	}
 }
 
