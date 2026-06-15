@@ -13,6 +13,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/framing"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -84,6 +85,34 @@ func TestParseConnectRequest(t *testing.T) {
 	}
 	if _, ok := parseConnectRequest([]byte(`{"cmd":"other"}`)); ok {
 		t.Fatal("parseConnectRequest() unexpectedly accepted wrong command")
+	}
+
+	udpReq, err := json.Marshal(ConnectRequest{
+		Cmd:  udpDialCommand,
+		Addr: "127.0.0.1",
+		Port: 51820,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(udp) error = %v", err)
+	}
+	if req, ok := parseConnectRequest(udpReq); !ok || req.Cmd != udpDialCommand {
+		t.Fatalf("parseConnectRequest(udp) = (%+v, %v)", req, ok)
+	}
+
+	var frame bytes.Buffer
+	if err := framing.WriteBytes(&frame, []byte("packet"), maxUDPPacketSize); err != nil {
+		t.Fatalf("framing.WriteBytes() error = %v", err)
+	}
+	withFrame := append(append([]byte(nil), udpReq...), frame.Bytes()...)
+	_, headerLen, ok := parseStreamRequest(withFrame)
+	if !ok {
+		t.Fatal("parseStreamRequest() returned ok=false")
+	}
+	if headerLen != len(udpReq) {
+		t.Fatalf("parseStreamRequest() headerLen = %d, want %d", headerLen, len(udpReq))
+	}
+	if !bytes.Equal(withFrame[headerLen:], frame.Bytes()) {
+		t.Fatal("parseStreamRequest() did not preserve trailing frame bytes")
 	}
 }
 
@@ -372,6 +401,100 @@ func TestHandleStreamDispatchAfterConnect(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 	<-done
+}
+
+func TestHandleStreamUDPDialBridgeRoundTrip(t *testing.T) {
+	udpConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer func() { _ = udpConn.Close() }()
+
+	udpDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		_ = udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, addr, err := udpConn.ReadFrom(buf)
+		if err != nil {
+			udpDone <- err
+			return
+		}
+		if !bytes.Equal(buf[:n], []byte("udp-packet")) {
+			udpDone <- errors.New("unexpected udp payload")
+			return
+		}
+		_, err = udpConn.WriteTo([]byte("udp-reply"), addr)
+		udpDone <- err
+	}()
+
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	streamDone := make(chan struct{})
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err == nil {
+			(&Server{resolver: net.DefaultResolver}).handleStream(context.Background(), stream, "sid-1")
+		}
+		close(streamDone)
+	}()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+
+	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	req, err := json.Marshal(ConnectRequest{
+		Cmd:  udpDialCommand,
+		Addr: "127.0.0.1",
+		Port: udpAddr.Port,
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var frame bytes.Buffer
+	if err := framing.WriteBytes(&frame, []byte("udp-packet"), maxUDPPacketSize); err != nil {
+		t.Fatalf("framing.WriteBytes() error = %v", err)
+	}
+	writeBuf := append(append([]byte(nil), req...), frame.Bytes()...)
+	if _, err := stream.Write(writeBuf); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	_ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reply, err := framing.ReadBytes(stream, maxUDPPacketSize)
+	if err != nil {
+		t.Fatalf("framing.ReadBytes() error = %v", err)
+	}
+	if !bytes.Equal(reply, []byte("udp-reply")) {
+		t.Fatalf("reply = %q", reply)
+	}
+	_ = stream.Close()
+
+	select {
+	case err := <-udpDone:
+		if err != nil {
+			t.Fatalf("udp bridge error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for udp server")
+	}
+	<-streamDone
 }
 
 func TestReinstallSessionFiresOnClose(t *testing.T) {
