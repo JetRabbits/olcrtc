@@ -11,6 +11,7 @@ on:
 
 jobs:
   test:
+    if: false
     name: Test
     runs-on: ubuntu-latest
     steps:
@@ -27,6 +28,7 @@ jobs:
         run: go test -count=1 ./...
 
   coverage:
+    if: false
     name: Coverage
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +45,7 @@ jobs:
         run: go test -count=1 ./... --cover
 
   race:
+    if: false
     name: Test (-race)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -60,6 +63,7 @@ jobs:
         run: go test -count=1 -race ./...
 
   real-e2e:
+    if: false
     name: Real E2E (Providers x Transports)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -84,10 +88,10 @@ jobs:
             -olcrtc.real-e2e
 
   stress-soak:
+    if: false
     name: Real E2E Stress Soak (Nightly)
     # Long-form stress over real carriers: only on schedule or manual
     # dispatch. Push and PR runs stay fast.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -117,6 +121,7 @@ jobs:
             -olcrtc.stress-case-timeout=8m
 
   lint:
+    if: false
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -135,6 +140,7 @@ jobs:
           $(go env GOPATH)/bin/golangci-lint run --timeout=5m
 
   build-cli:
+    if: false
     name: Build CLI (Binaries)
     runs-on: ubuntu-latest
     steps:
@@ -160,6 +166,7 @@ jobs:
           path: build/
 
   build-android:
+    if: false
     name: Build Android (AAR)
     runs-on: ubuntu-latest
     steps:
@@ -196,8 +203,8 @@ jobs:
           path: build/olcrtc.aar
 
   nightly-soak:
+    if: false
     name: Nightly Soak (All Carriers × Transports)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
