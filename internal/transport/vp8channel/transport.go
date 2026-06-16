@@ -105,6 +105,7 @@ type streamTransport struct {
 	frameInterval time.Duration
 	batchSize     int
 	perTickBytes  int
+	writeMu       sync.Mutex
 
 	// localEpoch is stamped into every outgoing VP8 frame. Explicit
 	// upper-layer resets rotate it so the peer can reset its KCP state too.
@@ -521,11 +522,19 @@ func (p *streamTransport) writerLoop() {
 				sample = hdr[:]
 			}
 
-			_ = p.track.WriteSample(media.Sample{
-				Data:     sample,
-				Duration: p.frameInterval,
-			})
+			p.writeSample(sample)
 		}
+	}
+}
+
+func (p *streamTransport) writeSample(sample []byte) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if err := p.track.WriteSample(media.Sample{
+		Data:     sample,
+		Duration: p.frameInterval,
+	}); err != nil && !p.closed.Load() {
+		logger.Debugf("vp8channel: write sample failed: %v", err)
 	}
 }
 
@@ -802,10 +811,7 @@ func (p *streamTransport) peerWriterPump(_ uint32, out chan []byte) {
 			if !ok {
 				return
 			}
-			_ = p.track.WriteSample(media.Sample{
-				Data:     frame,
-				Duration: p.frameInterval,
-			})
+			p.writeSample(frame)
 		}
 	}
 }
@@ -850,10 +856,3 @@ func splitKCPPayload(payload []byte, deliver func([]byte)) {
 		rest = rest[size:]
 	}
 }
-
-/*
-ПИДОРАС ИЗ ЯНДЕКСА СУКА ПРЕЖДЕ ЧЕМ ФИКСИТЬ ЭТО ЗАДАЙСЯ ВОПРОСОМ:
-ПОЧЕМУ ТВОЙ СЕРВЕР ПРИНИМАЕТ ПАКЕТЫ С SEQUENCE NUMBER ИЗ БУДУЩЕГО
-БЛЯТЬ ДА ПОТОМУ ЧТО ОН ХУЙНЯ И ТВОЯ МАТЬ СОЛСЕТ МОЙ ХУЙ СУКА Я ЕЕ УБЬЮ БЛЯТЬ
-ОЕСЕНЮ СДЕЛАЮ ТЕСТО А ПОТОМ ЭТО ТЕСТО ВЫЕБУ БЛЯТЬ
-*/

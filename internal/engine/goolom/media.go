@@ -10,6 +10,8 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+const setSlotsRefreshInterval = 2 * time.Second
+
 func (s *Session) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh chan struct{}) {
 	s.dc.OnOpen(func() {
 		numWorkers := 4
@@ -77,11 +79,10 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 
 	s.sendAck(uid)
 
-	if s.onData == nil {
-		if err := s.sendSetSlots(); err != nil {
-			logger.Debugf("setSlots error: %v", err)
-		}
+	if err := s.sendSetSlots(); err != nil {
+		logger.Debugf("setSlots error: %v", err)
 	}
+	s.startSetSlotsRefresh()
 
 	if !sendPub {
 		return nil
@@ -108,6 +109,42 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 	})
 	s.wsMu.Unlock()
 	return nil
+}
+
+func (s *Session) startSetSlotsRefresh() {
+	if !s.setSlotsRefreshStarted.CompareAndSwap(false, true) {
+		return
+	}
+
+	s.sessionMu.Lock()
+	sessionCloseCh := s.sessionCloseCh
+	s.sessionMu.Unlock()
+
+	if sessionCloseCh == nil {
+		s.setSlotsRefreshStarted.Store(false)
+		return
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(setSlotsRefreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-sessionCloseCh:
+				return
+			case <-ticker.C:
+				if s.closed.Load() {
+					return
+				}
+				if err := s.sendSetSlots(); err != nil {
+					logger.Debugf("setSlots refresh error: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 func (s *Session) handleSdpAnswer(answer map[string]any, uid string) {
@@ -188,6 +225,7 @@ func (s *Session) setupICEHandlers() {
 func (s *Session) sendSetSlots() error {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
+	key := s.setSlotsKey.Add(1)
 
 	// Goolom only forwards as many remote videos as the subscriber asks for via
 	// setSlots. Request a generous count so each subscriber sees every active
@@ -201,7 +239,7 @@ func (s *Session) sendSetSlots() error {
 		"setSlots": map[string]any{
 			"slots":              slots,
 			"audioSlotsCount":    0,
-			"key":                1,
+			"key":                key,
 			"shutdownAllVideo":   nil,
 			"withSelfView":       false,
 			"selfViewVisibility": "ON_LOADING_THEN_SHOW",
@@ -210,6 +248,7 @@ func (s *Session) sendSetSlots() error {
 	}); err != nil {
 		return fmt.Errorf("write set slots: %w", err)
 	}
+	logger.Infof("goolom setSlots sent key=%d slots=%d", key, len(slots))
 	return nil
 }
 

@@ -10,11 +10,25 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 )
 
 const defaultWSURL = "wss://rtc-el-02.wb.ru"
+
+const (
+	defaultUserAgent              = "Mozilla/5.0 (Linux x86_64)"
+	envWBStreamCookie             = "OLCRTC_WBSTREAM_COOKIE"
+	envWBStreamWBAUID             = "OLCRTC_WBSTREAM_WBAUID"
+	envWBStreamValidationKey      = "OLCRTC_WBSTREAM_VALIDATION_KEY"
+	envWBStreamXWBAASToken        = "OLCRTC_WBSTREAM_X_WBAAS_TOKEN"
+	envWBStreamUserAgent          = "OLCRTC_WBSTREAM_USER_AGENT"
+	headerWBStreamValidationKey   = "wbx-validation-key"
+	headerWBStreamXWBAASToken     = "x-wbaas-token"
+	cookieWBStreamAuthenticatedID = "_wbauid"
+)
 
 var apiBase = "https://stream.wb.ru" //nolint:gochecknoglobals // package-level state intentional
 
@@ -62,7 +76,7 @@ func registerGuest(ctx context.Context, displayName string) (string, error) {
 		return "", fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux x86_64)")
+	applyCommonHeaders(req)
 
 	client := protect.NewHTTPClient()
 	resp, err := client.Do(req)
@@ -90,7 +104,7 @@ func joinRoom(ctx context.Context, accessToken, roomID string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux x86_64)")
+	applyCommonHeaders(req)
 
 	client := protect.NewHTTPClient()
 	resp, err := client.Do(req)
@@ -118,7 +132,7 @@ func getToken(ctx context.Context, accessToken, roomID, displayName string) (tok
 	req.URL.RawQuery = q.Encode()
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux x86_64)")
+	applyCommonHeaders(req)
 
 	client := protect.NewHTTPClient()
 	resp, err := client.Do(req)
@@ -136,4 +150,32 @@ func getToken(ctx context.Context, accessToken, roomID, displayName string) (tok
 		return tokenResponse{}, fmt.Errorf("decode response: %w", err)
 	}
 	return res, nil
+}
+
+func applyCommonHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", wbStreamUserAgent())
+	applyOptionalAuthHeaders(req)
+}
+
+func wbStreamUserAgent() string {
+	if ua := strings.TrimSpace(os.Getenv(envWBStreamUserAgent)); ua != "" {
+		return ua
+	}
+	return defaultUserAgent
+}
+
+func applyOptionalAuthHeaders(req *http.Request) {
+	if cookie := strings.TrimSpace(os.Getenv(envWBStreamCookie)); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	} else if wbID := strings.TrimSpace(os.Getenv(envWBStreamWBAUID)); wbID != "" {
+		req.AddCookie(&http.Cookie{Name: cookieWBStreamAuthenticatedID, Value: wbID})
+	}
+	setHeaderFromEnv(req, headerWBStreamValidationKey, envWBStreamValidationKey)
+	setHeaderFromEnv(req, headerWBStreamXWBAASToken, envWBStreamXWBAASToken)
+}
+
+func setHeaderFromEnv(req *http.Request, headerName, envName string) {
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		req.Header.Set(headerName, value)
+	}
 }

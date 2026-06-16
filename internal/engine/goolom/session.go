@@ -112,11 +112,13 @@ type Session struct {
 	reconnectCount int
 	sessionMu      sync.Mutex
 
-	sendQueue       chan []byte
-	sendQueueClosed atomic.Bool
-	closed          atomic.Bool
-	reconnecting    atomic.Bool
-	telemetryActive atomic.Bool
+	sendQueue              chan []byte
+	sendQueueClosed        atomic.Bool
+	closed                 atomic.Bool
+	reconnecting           atomic.Bool
+	telemetryActive        atomic.Bool
+	setSlotsRefreshStarted atomic.Bool
+	setSlotsKey            atomic.Uint64
 
 	ackMu      sync.Mutex
 	ackWaiters map[string]chan struct{}

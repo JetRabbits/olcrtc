@@ -413,6 +413,8 @@ func (s *Session) stopSession() {
 func (s *Session) resetSession() (chan struct{}, chan struct{}) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	s.setSlotsRefreshStarted.Store(false)
+	s.setSlotsKey.Store(0)
 	s.keepAliveCh = make(chan struct{})
 	s.sessionCloseCh = make(chan struct{})
 	return s.keepAliveCh, s.sessionCloseCh

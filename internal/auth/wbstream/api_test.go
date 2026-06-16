@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/openlibrecommunity/olcrtc/internal/auth"
@@ -64,6 +65,57 @@ func TestWBStreamAPIHappyPath(t *testing.T) {
 	}
 	if tok.RoomToken != testToken {
 		t.Fatalf("getToken() = %q", tok.RoomToken)
+	}
+}
+
+func TestWBStreamOptionalAuthHeaders(t *testing.T) {
+	t.Setenv(envWBStreamWBAUID, "test-wbauid")
+	t.Setenv(envWBStreamValidationKey, "test-validation")
+	t.Setenv(envWBStreamXWBAASToken, "test-wbaas")
+	t.Setenv(envWBStreamUserAgent, "test-agent")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api-room-manager/v2/room/"+testRoomID+"/connection-details",
+		func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("User-Agent"); got != "test-agent" {
+				t.Fatalf("User-Agent = %q", got)
+			}
+			if got := r.Header.Get(headerWBStreamValidationKey); got != "test-validation" {
+				t.Fatalf("%s = %q", headerWBStreamValidationKey, got)
+			}
+			if got := r.Header.Get(headerWBStreamXWBAASToken); got != "test-wbaas" {
+				t.Fatalf("%s = %q", headerWBStreamXWBAASToken, got)
+			}
+			if got := r.Header.Get("Cookie"); !strings.Contains(got, cookieWBStreamAuthenticatedID+"=test-wbauid") {
+				t.Fatalf("Cookie = %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(tokenResponse{RoomToken: testToken})
+		})
+
+	withWBAPIServer(t, mux)
+
+	if _, err := getToken(context.Background(), testAccessToken, testRoomID, testPeerName); err != nil {
+		t.Fatalf("getToken() error = %v", err)
+	}
+}
+
+func TestWBStreamCookieHeaderOverridesIndividualCookie(t *testing.T) {
+	t.Setenv(envWBStreamCookie, "custom=cookie")
+	t.Setenv(envWBStreamWBAUID, "test-wbauid")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api-room-manager/v2/room/"+testRoomID+"/connection-details",
+		func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("Cookie"); got != "custom=cookie" {
+				t.Fatalf("Cookie = %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(tokenResponse{RoomToken: testToken})
+		})
+
+	withWBAPIServer(t, mux)
+
+	if _, err := getToken(context.Background(), testAccessToken, testRoomID, testPeerName); err != nil {
+		t.Fatalf("getToken() error = %v", err)
 	}
 }
 
