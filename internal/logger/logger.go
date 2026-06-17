@@ -154,7 +154,7 @@ type PionLeveledLogger struct {
 
 // Trace logs a trace message.
 func (l *PionLeveledLogger) Trace(msg string) {
-	if verboseEnabled.Load() {
+	if verboseEnabled.Load() && !shouldDropPionVerboseLog(l.scope, msg) {
 		log.Printf("[%s] TRACE: %s", l.scope, msg)
 	}
 }
@@ -162,13 +162,17 @@ func (l *PionLeveledLogger) Trace(msg string) {
 // Tracef logs a formatted trace message.
 func (l *PionLeveledLogger) Tracef(format string, args ...any) {
 	if verboseEnabled.Load() {
-		log.Printf("[%s] TRACE: %s", l.scope, fmt.Sprintf(format, args...))
+		msg := fmt.Sprintf(format, args...)
+		if shouldDropPionVerboseLog(l.scope, msg) {
+			return
+		}
+		log.Printf("[%s] TRACE: %s", l.scope, msg)
 	}
 }
 
 // Debug logs a debug message.
 func (l *PionLeveledLogger) Debug(msg string) {
-	if verboseEnabled.Load() {
+	if verboseEnabled.Load() && !shouldDropPionVerboseLog(l.scope, msg) {
 		log.Printf("[%s] DEBUG: %s", l.scope, msg)
 	}
 }
@@ -176,7 +180,11 @@ func (l *PionLeveledLogger) Debug(msg string) {
 // Debugf logs a formatted debug message.
 func (l *PionLeveledLogger) Debugf(format string, args ...any) {
 	if verboseEnabled.Load() {
-		log.Printf("[%s] DEBUG: %s", l.scope, fmt.Sprintf(format, args...))
+		msg := fmt.Sprintf(format, args...)
+		if shouldDropPionVerboseLog(l.scope, msg) {
+			return
+		}
+		log.Printf("[%s] DEBUG: %s", l.scope, msg)
 	}
 }
 
@@ -239,4 +247,8 @@ func shouldDropPionLog(scope, msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "refresh permissions") ||
 		strings.Contains(msg, "createpermission error response")
+}
+
+func shouldDropPionVerboseLog(scope, msg string) bool {
+	return true
 }

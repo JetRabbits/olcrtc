@@ -230,3 +230,71 @@ func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 		t.Fatalf("reconnect called on foreign frame: got %d want 0", got)
 	}
 }
+
+func TestSinglePeerConfirmsOnlyAfterKCPApplicationData(t *testing.T) {
+	token := bindingToken("client")
+	received := make(chan []byte, 1)
+
+	tr := &streamTransport{
+		outbound:     make(chan []byte, 16),
+		closeCh:      make(chan struct{}),
+		writerDone:   make(chan struct{}),
+		bindingToken: token,
+		localEpoch:   0x100,
+	}
+	tr.onData = func(data []byte) {
+		tr.peerConfirmed.Store(true)
+		received <- append([]byte(nil), data...)
+	}
+
+	rt, err := startKCP(tr.outbound, tr.onData, tr.epochHeader())
+	if err != nil {
+		t.Fatalf("startKCP receiver: %v", err)
+	}
+	defer rt.close()
+	tr.kcpMu.Lock()
+	tr.kcp = rt
+	tr.kcpMu.Unlock()
+
+	garbage := make([]byte, epochHdrLen+4)
+	garbageHdr := buildEpochHeader(token, 0x111)
+	copy(garbage, garbageHdr[:])
+	copy(garbage[epochHdrLen:], []byte{1, 2, 3, 4})
+	tr.handleIncomingFrame(garbage)
+	if tr.peerConfirmed.Load() {
+		t.Fatal("garbage KCP/control-looking bytes confirmed peer before app data")
+	}
+
+	senderOut := make(chan []byte, 16)
+	senderRT, err := startKCP(senderOut, nil, buildEpochHeader(token, 0x200))
+	if err != nil {
+		t.Fatalf("startKCP sender: %v", err)
+	}
+	defer senderRT.close()
+
+	want := []byte("SERVER_WELCOME")
+	if err := senderRT.send(want); err != nil {
+		t.Fatalf("sender send: %v", err)
+	}
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case frame := <-senderOut:
+			tr.handleIncomingFrame(frame)
+		case got := <-received:
+			if !bytes.Equal(got, want) {
+				t.Fatalf("received = %q, want %q", got, want)
+			}
+			if !tr.peerConfirmed.Load() {
+				t.Fatal("valid KCP application data did not confirm peer")
+			}
+			if gotEpoch := tr.peerEpoch.Load(); gotEpoch != 0x200 {
+				t.Fatalf("confirmed epoch = %#x, want 0x200", gotEpoch)
+			}
+			return
+		case <-timeout:
+			t.Fatal("timeout waiting for KCP application data")
+		}
+	}
+}

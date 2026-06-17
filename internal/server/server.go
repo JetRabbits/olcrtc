@@ -254,6 +254,17 @@ func (s *Server) bringUpLink(
 	cfg Config,
 	cancel context.CancelFunc,
 ) error {
+	onPeerData := s.onPeerData
+	// The vp8channel peer-routing path uses per-peer KCP sessions over one
+	// published VP8 track. Telemost currently delivers client→server reliably,
+	// but server→client packets written through that peer path never reach the
+	// Android client before the control handshake times out. For the mobile proxy
+	// deployment we use one client per room, so prefer the proven single-peer path
+	// where both directions are paced by the transport's main writerLoop.
+	if cfg.Transport == "vp8channel" {
+		onPeerData = nil
+	}
+
 	ln, err := transport.New(ctx, cfg.Transport, transport.Config{
 		Carrier:    cfg.Carrier,
 		RoomURL:    cfg.RoomURL,
@@ -264,7 +275,7 @@ func (s *Server) bringUpLink(
 		DeviceID:   "",
 		Name:       names.Generate(),
 		OnData:     s.onData,
-		OnPeerData: s.onPeerData,
+		OnPeerData: onPeerData,
 		DNSServer:  s.dnsServer,
 		ProxyAddr:  s.socksProxyAddr,
 		ProxyPort:  s.socksProxyPort,

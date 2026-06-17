@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +60,7 @@ func (s *Session) sendHello() error {
 
 func (s *Session) handleSignaling(ctx context.Context) {
 	pubSent := false
+	offerCount := 0
 
 	for {
 		var msg map[string]any
@@ -72,6 +74,16 @@ func (s *Session) handleSignaling(ctx context.Context) {
 
 		s.updateWSDeadline()
 
+		// Log all incoming signaling messages for debugging
+		msgKeys := make([]string, 0, len(msg))
+		for k := range msg {
+			if k != keyUID {
+				msgKeys = append(msgKeys, k)
+			}
+		}
+		sort.Strings(msgKeys)
+		logger.Infof("goolom ws msg keys: %v", msgKeys)
+
 		uid, _ := msg[keyUID].(string)
 		s.handleMessageEvents(ctx, msg, uid)
 
@@ -81,6 +93,8 @@ func (s *Session) handleSignaling(ctx context.Context) {
 		}
 
 		if offer, ok := msg["subscriberSdpOffer"].(map[string]any); ok {
+			offerCount++
+			logger.Infof("goolom subscriberSdpOffer #%d received pubSent=%v", offerCount, pubSent)
 			if err := s.handleSdpOffer(offer, uid, !pubSent); err != nil {
 				logger.Debugf("sdp offer error: %v", err)
 				continue
@@ -124,16 +138,30 @@ func (s *Session) updateWSDeadline() {
 }
 
 func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
-	if _, ok := msg["updateDescription"]; ok {
+	if payload, ok := msg["updateDescription"]; ok {
+		s.logSignalSummary("updateDescription", payload, 4)
 		s.sendAck(uid)
 	}
-	if _, ok := msg["slotsConfig"]; ok {
+	if payload, ok := msg["upsertDescription"]; ok {
+		s.logSignalSummary("upsertDescription", payload, 8)
 		s.sendAck(uid)
 	}
-	if _, ok := msg["slotsMeta"]; ok {
+	if payload, ok := msg["removeDescription"]; ok {
+		s.logSignalSummary("removeDescription", payload, 4)
+		s.sendAck(uid)
+	}
+	if payload, ok := msg["slotsConfig"]; ok {
+		s.logSignalSummary("slotsConfig", payload, 6)
+		s.sendAck(uid)
+	}
+	if payload, ok := msg["slotsMeta"]; ok {
+		s.logSignalSummary("slotsMeta", payload, 8)
 		s.sendAck(uid)
 	}
 	if _, ok := msg["vadActivity"]; ok {
+		s.sendAck(uid)
+	}
+	if _, ok := msg["selfQualityReport"]; ok {
 		s.sendAck(uid)
 	}
 	if _, ok := msg["ping"]; ok {
@@ -142,6 +170,21 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if _, ok := msg["pong"]; ok {
 		s.sendAck(uid)
 	}
+}
+
+func (s *Session) logSignalSummary(label string, payload any, maxCount int) {
+	s.signalSummaryMu.Lock()
+	if s.signalSummaryCounts == nil {
+		s.signalSummaryCounts = make(map[string]int)
+	}
+	s.signalSummaryCounts[label]++
+	count := s.signalSummaryCounts[label]
+	s.signalSummaryMu.Unlock()
+
+	if count > maxCount {
+		return
+	}
+	logSignalingPayloadSummary(label, count, payload)
 }
 
 func (s *Session) sendAck(uid string) {
@@ -162,8 +205,8 @@ func (s *Session) sendPong(uid string) {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	_ = s.ws.WriteJSON(map[string]any{
-		keyUID:  uid,
-		"pong":  map[string]any{},
+		keyUID: uid,
+		"pong": map[string]any{},
 	})
 }
 

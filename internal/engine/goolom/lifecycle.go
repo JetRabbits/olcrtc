@@ -87,13 +87,25 @@ func (s *Session) setupPeerConnections(config webrtc.Configuration) error {
 	if err != nil {
 		return fmt.Errorf("new sub pc: %w", err)
 	}
+	// Do NOT pre-create recvonly transceivers. Telemost MID binding uses the
+	// number of m=video sections in the subscriberSdpAnswer to determine slot
+	// count. Pre-creating 8 transceivers creates 8 m=video sections which
+	// confuses the SFU into binding the server participant with mid="" and
+	// limitationReason="UNSPECIFIED". Instead, let Pion create transceivers
+	// on-demand when the remote SDP arrives (standard WebRTC behavior).
+	//
+	// For the vp8channel proxy use case, the server publishes VP8 on a single
+	// track. The subscriberSdpAnswer will contain one m=video section, so
+	// Telemost binds the server participant to that single slot with a proper
+	// MID.
+	//
+	// Note: the Python PoC also does NOT pre-create transceivers, and works.
 	s.pcSub.OnConnectionStateChange(s.onSubscriberConnectionStateChange)
 	s.pcSub.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		if track.Kind() != webrtc.RTPCodecTypeVideo {
 			return
 		}
-		logger.Infof("goolom remote video track: codec=%s stream=%s track=%s",
-			track.Codec().MimeType, track.StreamID(), track.ID())
+		logRemoteTrack(track)
 		if cb := s.videoTrackHandler(); cb != nil {
 			cb(track, receiver)
 		}
@@ -413,7 +425,6 @@ func (s *Session) stopSession() {
 func (s *Session) resetSession() (chan struct{}, chan struct{}) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
-	s.setSlotsRefreshStarted.Store(false)
 	s.setSlotsKey.Store(0)
 	s.keepAliveCh = make(chan struct{})
 	s.sessionCloseCh = make(chan struct{})

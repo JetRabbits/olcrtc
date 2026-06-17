@@ -355,13 +355,22 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatal("filtered frames changed peer state")
 	}
 
-	// Keepalive (nil payload) latches peer immediately.
+	// Keepalive-only frames must not latch the peer; stale room participants can
+	// emit keepalives before the active tunnel peer sends data.
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 1, nil))
-	if !tr.peerConfirmed.Load() {
-		t.Fatal("first frame should confirm peer")
+	if tr.peerConfirmed.Load() {
+		t.Fatal("keepalive-only frame should not confirm peer")
+	}
+	if tr.peerEpoch.Load() != 0 {
+		t.Fatalf("keepalive stored peer epoch: got %d want 0", tr.peerEpoch.Load())
+	}
+
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 1, []byte("first-data")))
+	if tr.peerConfirmed.Load() {
+		t.Fatal("non-empty but invalid KCP frame should not confirm peer")
 	}
 	if tr.peerEpoch.Load() != 1 {
-		t.Fatalf("peer epoch not stored: got %d want 1", tr.peerEpoch.Load())
+		t.Fatalf("candidate peer epoch not stored: got %d want 1", tr.peerEpoch.Load())
 	}
 
 	reconnected := false
@@ -378,16 +387,17 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
 	}
 	reconnected = false
-	// After reconnect, peerConfirmed is reset so the next frame re-latches
-	// the peer epoch. This allows the server to restart with a new epoch.
+	// After reconnect, peerConfirmed is reset so the next valid KCP delivery can
+	// re-confirm the peer epoch. This allows the server to restart with a new
+	// epoch without latching onto priming garbage.
 	if tr.peerConfirmed.Load() {
 		t.Fatal("reconnect should reset peerConfirmed")
 	}
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("new-peer-after-reconnect")))
-	if !tr.peerConfirmed.Load() {
-		t.Fatal("frame after reconnect should re-latch peer")
+	if tr.peerConfirmed.Load() {
+		t.Fatal("invalid frame after reconnect should not re-confirm peer")
 	}
 	if tr.peerEpoch.Load() != 2 {
-		t.Fatalf("peer epoch not re-latched: got %d want 2", tr.peerEpoch.Load())
+		t.Fatalf("candidate peer epoch not stored after reconnect: got %d want 2", tr.peerEpoch.Load())
 	}
 }

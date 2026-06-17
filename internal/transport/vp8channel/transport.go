@@ -224,9 +224,12 @@ func newStreamTransport(
 		peerOut:       make(map[uint32]chan []byte),
 	}
 
-	// In single-peer mode, confirm the peer epoch on first successful KCP
-	// delivery. This ensures we latch on the server (which completes
-	// handshake) rather than another client whose frames arrive first.
+	// In single-peer mode, confirm the peer epoch only on first successful
+	// upper-layer KCP delivery. Telemost can forward priming/control/garbage
+	// VP8 frames before the actual tunnel peer produces application bytes; those
+	// packets may be non-empty KCP/control packets, so latching when we merely
+	// see a VP8 frame can pin the client to a peer that will never answer the
+	// handshake.
 	if cfg.OnData != nil && cfg.OnPeerData == nil {
 		inner := cfg.OnData
 		tr.onData = func(data []byte) {
@@ -539,6 +542,10 @@ func (p *streamTransport) writeSample(sample []byte) {
 }
 
 func (p *streamTransport) batchSample(first []byte, maxBytes int) []byte {
+	return p.batchSampleFrom(first, p.outbound, maxBytes)
+}
+
+func (p *streamTransport) batchSampleFrom(first []byte, out <-chan []byte, maxBytes int) []byte {
 	if maxBytes <= 0 || maxBytes > defaultMaxPayloadSize {
 		maxBytes = defaultMaxPayloadSize
 	}
@@ -553,7 +560,7 @@ func (p *streamTransport) batchSample(first []byte, maxBytes int) []byte {
 
 	for packets := 1; packets < p.batchSize; packets++ {
 		select {
-		case frame := <-p.outbound:
+		case frame := <-out:
 			if len(frame) <= epochHdrLen {
 				continue
 			}
@@ -702,12 +709,6 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	}
 }
 
-func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
-	p.peerEpoch.Store(peerEpoch)
-	p.peerConfirmed.Store(true)
-	logger.Infof("vp8channel: peer latched epoch=0x%08x", peerEpoch)
-}
-
 // handleIncomingFrame parses the epoch header and delivers KCP payload.
 func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	frameToken, peerEpoch, ok := parseEpochHeader(frame)
@@ -728,16 +729,20 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		return
 	}
 
-	// Single-peer mode: latch on first epoch seen, ignore all others.
-	if !p.peerConfirmed.Load() {
-		p.handleFirstPeer(peerEpoch)
-	} else if peerEpoch != p.peerEpoch.Load() {
-		return
-	}
-
+	// Single-peer mode: ignore pure VP8 keepalives, but do not confirm the peer
+	// just because a frame carries bytes. Those bytes can still be KCP ACK/control
+	// packets or stale priming/garbage from another room participant. We remember
+	// the latest candidate epoch before feeding KCP and let the onData wrapper
+	// above mark it confirmed only after KCP reconstructs real application data
+	// (for example SERVER_WELCOME).
 	if len(kcpPayload) == 0 {
 		return
 	}
+	if p.peerConfirmed.Load() && peerEpoch != p.peerEpoch.Load() {
+		return
+	}
+	p.peerEpoch.Store(peerEpoch)
+
 	p.kcpMu.RLock()
 	rt := p.kcp
 	p.kcpMu.RUnlock()
@@ -751,8 +756,9 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 // session so multiple clients can coexist in the same room.
 func (p *streamTransport) handlePeerFrame(peerEpoch uint32, kcpPayload []byte) {
 	if len(kcpPayload) == 0 {
-		// Keepalive - ensure peer is registered but nothing to deliver.
-		p.getOrCreatePeerKCP(peerEpoch)
+		// Keepalive-only frames do not prove that this is an active tunnel peer.
+		// Wait for actual KCP data before allocating a peer smux session; this
+		// avoids stale room participants creating idle peer sessions.
 		return
 	}
 
@@ -803,15 +809,22 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 // peerWriterPump drains a peer's outbound KCP queue and writes frames to the
 // shared video track. Stops when the channel is closed or transport shuts down.
 func (p *streamTransport) peerWriterPump(_ uint32, out chan []byte) {
+	ticker := time.NewTicker(p.frameInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-p.closeCh:
 			return
-		case frame, ok := <-out:
-			if !ok {
-				return
+		case <-ticker.C:
+			select {
+			case frame, ok := <-out:
+				if !ok {
+					return
+				}
+				p.writeSample(p.batchSampleFrom(frame, out, p.perTickBytes))
+			default:
 			}
-			p.writeSample(frame)
 		}
 	}
 }

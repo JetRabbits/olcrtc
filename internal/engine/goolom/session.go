@@ -112,16 +112,18 @@ type Session struct {
 	reconnectCount int
 	sessionMu      sync.Mutex
 
-	sendQueue              chan []byte
-	sendQueueClosed        atomic.Bool
-	closed                 atomic.Bool
-	reconnecting           atomic.Bool
-	telemetryActive        atomic.Bool
-	setSlotsRefreshStarted atomic.Bool
-	setSlotsKey            atomic.Uint64
+	sendQueue     chan []byte
+	sendQueueClosed atomic.Bool
+	closed        atomic.Bool
+	reconnecting  atomic.Bool
+	telemetryActive atomic.Bool
+	setSlotsKey   atomic.Uint64
 
 	ackMu      sync.Mutex
 	ackWaiters map[string]chan struct{}
+
+	signalSummaryMu     sync.Mutex
+	signalSummaryCounts map[string]int
 
 	trafficShape TrafficShape
 
@@ -185,6 +187,7 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 		telemetryCh:      make(chan struct{}, 1),
 		sendQueue:        make(chan []byte, defaultSendQueueSize),
 		ackWaiters:       make(map[string]chan struct{}),
+		signalSummaryCounts: make(map[string]int),
 		subscriberConn:   make(chan struct{}),
 		publisherConn:    make(chan struct{}),
 		trafficShape: TrafficShape{
@@ -192,7 +195,6 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 			MinDelay:       defaultSendDelayLow,
 			MaxDelay:       defaultSendDelayMax,
 		},
-		httpClient: nil,
 	}, nil
 }
 

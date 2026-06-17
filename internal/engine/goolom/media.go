@@ -10,7 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const setSlotsRefreshInterval = 2 * time.Second
+
 
 func (s *Session) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh chan struct{}) {
 	s.dc.OnOpen(func() {
@@ -50,6 +50,7 @@ func (s *Session) onDataChannelMessage(msg webrtc.DataChannelMessage) {
 func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool) error {
 	sdp, _ := offer["sdp"].(string)
 	pcSeq, _ := offer["pcSeq"].(float64)
+	logSDPSummary("subscriberSdpOffer", int(pcSeq), sdp)
 
 	if err := s.pcSub.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -79,11 +80,6 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 
 	s.sendAck(uid)
 
-	if err := s.sendSetSlots(); err != nil {
-		logger.Debugf("setSlots error: %v", err)
-	}
-	s.startSetSlotsRefresh()
-
 	if !sendPub {
 		return nil
 	}
@@ -94,9 +90,12 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 	if err != nil {
 		return fmt.Errorf("create pub offer: %w", err)
 	}
+	logSDPSummary("publisherSdpOffer", 1, pubOffer.SDP)
 	if err := s.pcPub.SetLocalDescription(pubOffer); err != nil {
 		return fmt.Errorf("set local pub desc: %w", err)
 	}
+	tracks := s.publisherTrackDescriptions()
+	logPublisherTrackDescriptions(tracks)
 
 	s.wsMu.Lock()
 	_ = s.ws.WriteJSON(map[string]any{
@@ -104,51 +103,18 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 		"publisherSdpOffer": map[string]any{
 			keyPcSeq: 1,
 			"sdp":    pubOffer.SDP,
-			"tracks": s.publisherTrackDescriptions(),
+			"tracks": tracks,
 		},
 	})
 	s.wsMu.Unlock()
 	return nil
 }
 
-func (s *Session) startSetSlotsRefresh() {
-	if !s.setSlotsRefreshStarted.CompareAndSwap(false, true) {
-		return
-	}
-
-	s.sessionMu.Lock()
-	sessionCloseCh := s.sessionCloseCh
-	s.sessionMu.Unlock()
-
-	if sessionCloseCh == nil {
-		s.setSlotsRefreshStarted.Store(false)
-		return
-	}
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ticker := time.NewTicker(setSlotsRefreshInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-sessionCloseCh:
-				return
-			case <-ticker.C:
-				if s.closed.Load() {
-					return
-				}
-				if err := s.sendSetSlots(); err != nil {
-					logger.Debugf("setSlots refresh error: %v", err)
-				}
-			}
-		}
-	}()
-}
 
 func (s *Session) handleSdpAnswer(answer map[string]any, uid string) {
 	sdp, _ := answer["sdp"].(string)
+	pcSeq, _ := answer["pcSeq"].(float64)
+	logSDPSummary("publisherSdpAnswer", int(pcSeq), sdp)
 	if err := s.pcPub.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,
@@ -156,6 +122,12 @@ func (s *Session) handleSdpAnswer(answer map[string]any, uid string) {
 		logger.Debugf("SetRemoteDescription error: %v", err)
 	}
 	s.sendAck(uid)
+
+	// After publisher SDP exchange completes, the server participant is published.
+	// Send setSlots so Telemost assigns the server participant to a subscriber slot.
+	if err := s.sendSetSlots(); err != nil {
+		logger.Debugf("setSlots after publisherSdpAnswer error: %v", err)
+	}
 }
 
 func (s *Session) handleICE(cand map[string]any) {
@@ -227,12 +199,14 @@ func (s *Session) sendSetSlots() error {
 	defer s.wsMu.Unlock()
 	key := s.setSlotsKey.Add(1)
 
-	// Goolom only forwards as many remote videos as the subscriber asks for via
-	// setSlots. Request a generous count so each subscriber sees every active
-	// publisher in the room.
-	slots := make([]map[string]int, 0, 8)
-	for range 8 {
-		slots = append(slots, map[string]int{"width": 1280, "height": 720})
+	// Match the Python PoC pattern exactly: setSlots with width/height per slot
+	// and all fields that the Python PoC (telemost_poc_videochannel.py) sends.
+	// The Python PoC works correctly with this format. Adding participantVideoByMid
+	// with mid="" causes Telemost to bind the slot with mid="" and
+	// limitationReason="UNSPECIFIED".
+	slots := []map[string]any{
+		{"width": 1280, "height": 720},
+		{"width": 640, "height": 360},
 	}
 	if err := s.ws.WriteJSON(map[string]any{
 		keyUID: uuid.New().String(),
@@ -270,12 +244,21 @@ func (s *Session) publisherTrackDescriptions() []map[string]any {
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			kind = "AUDIO"
 		}
+		// Telemost uses sourceId and streamId to correlate tracks with
+		// participant slots. Matching the browser SDK schema ensures the SFU
+		// binds the subscriber slot MID correctly.
+		streamID := track.StreamID()
+		if streamID == "" {
+			streamID = track.ID()
+		}
 		tracks = append(tracks, map[string]any{
 			"mid":            transceiver.Mid(),
 			"transceiverMid": transceiver.Mid(),
 			"kind":           kind,
 			"priority":       0,
 			"label":          track.ID(),
+			"sourceId":       streamID,
+			"streamId":       streamID,
 			"codecs":         map[string]any{},
 			"groupId":        1,
 			keyDescription:   "",
