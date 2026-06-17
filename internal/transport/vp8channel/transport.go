@@ -121,6 +121,12 @@ type streamTransport struct {
 	reconnectFn   func()
 	peerConfirmed atomic.Bool
 
+	// videoTrackReady is closed when the first remote VP8 track arrives
+	// (OnTrack fires). The Connect method waits for this signal to ensure
+	// the subscriber video MID is properly bound before starting KCP.
+	videoTrackReady chan struct{}
+	videoTrackOnce  sync.Once
+
 	// Multi-peer support: when onPeerData is set, each remote epoch gets
 	// its own KCP runtime and data is routed via onPeerData(peerID, ...).
 	peersMu sync.RWMutex
@@ -220,20 +226,21 @@ func newStreamTransport(
 	}
 
 	tr := &streamTransport{
-		stream:        stream,
-		track:         track,
-		onData:        cfg.OnData,
-		onPeerData:    cfg.OnPeerData,
-		outbound:      make(chan []byte, outboundQueueSize),
-		closeCh:       make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		frameInterval: time.Second / time.Duration(fps),
-		batchSize:     batchSize,
-		perTickBytes:  perTickBytes,
-		bindingToken:  bindingToken(cfg.RoomURL),
-		localEpoch:    randomEpoch(),
-		peers:         make(map[uint32]*kcpRuntime),
-		peerOut:       make(map[uint32]chan []byte),
+		stream:          stream,
+		track:           track,
+		onData:          cfg.OnData,
+		onPeerData:      cfg.OnPeerData,
+		outbound:        make(chan []byte, outboundQueueSize),
+		closeCh:         make(chan struct{}),
+		writerDone:      make(chan struct{}),
+		videoTrackReady: make(chan struct{}),
+		frameInterval:   time.Second / time.Duration(fps),
+		batchSize:       batchSize,
+		perTickBytes:    perTickBytes,
+		bindingToken:    bindingToken(cfg.RoomURL),
+		localEpoch:      randomEpoch(),
+		peers:           make(map[uint32]*kcpRuntime),
+		peerOut:         make(map[uint32]chan []byte),
 	}
 
 	// In single-peer mode, confirm the peer epoch only on first successful
@@ -264,6 +271,19 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 
 	if err := p.stream.Connect(connectCtx); err != nil {
 		return fmt.Errorf("connect stream: %w", err)
+	}
+
+	// Wait for the remote VP8 track to arrive (OnTrack fires) before
+	// starting KCP. Without this, the KCP handshake starts before
+	// Telemost has properly bound the subscriber video MID, which can
+	// cause the handshake to read garbage from a stale/unbound stream.
+	// The server-side reconnectOnNewParticipant ensures the MID binding
+	// resolves within ~5 seconds.
+	select {
+	case <-p.videoTrackReady:
+		logger.Infof("vp8channel: remote VP8 track ready, starting KCP")
+	case <-connectCtx.Done():
+		return fmt.Errorf("wait for remote video track: %w", connectCtx.Err())
 	}
 
 	// Start KCP eagerly so Send/CanSend work immediately after Connect.
@@ -627,6 +647,12 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc
 		go p.drainTrack(track)
 		return
 	}
+
+	// Signal that the remote VP8 track is available. This unblocks Connect
+	// which waits for the subscriber video MID to be properly bound.
+	p.videoTrackOnce.Do(func() {
+		close(p.videoTrackReady)
+	})
 
 	// We don't reset KCP here. Peer restarts are detected by the epoch
 	// header on incoming frames, which works even when the SFU keeps

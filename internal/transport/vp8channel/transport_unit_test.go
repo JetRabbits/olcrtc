@@ -122,6 +122,9 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	if !stream.trackAdded || stream.trackCB == nil {
 		t.Fatal("New() did not attach track and handler")
 	}
+	// Simulate remote VP8 track ready (in production, OnTrack fires when
+	// the subscriber receives video from the server participant).
+	close(tr.videoTrackReady)
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
