@@ -135,6 +135,13 @@ type Session struct {
 	// Uses CompareAndSwap to ensure only ONE reconnect per session lifetime.
 	reconnectOnNewParticipant atomic.Bool
 
+	// skipCredentialRefresh tells reconnect() to skip the s.refresh(ctx) call
+	// (HTTP round-trip to Telemost API) and reuse existing room credentials.
+	// Set by checkNewParticipant() since the room credentials don't change
+	// between reconnects for the same room. This reduces reconnect time from
+	// ~46s to ~5s, keeping it within the client's 20s handshake timeout.
+	skipCredentialRefresh atomic.Bool
+
 	videoTrackMu    sync.RWMutex
 	videoTracks     []webrtc.TrackLocal
 	onVideoTrack    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)

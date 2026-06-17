@@ -335,14 +335,23 @@ func (s *Session) reconnect(ctx context.Context) error {
 	}
 
 	time.Sleep(500 * time.Millisecond)
-	if s.refresh == nil {
+
+	// Skip credential refresh when triggered by checkNewParticipant.
+	// The room credentials don't change between reconnects for the same room,
+	// so we can reuse existing credentials. This reduces reconnect time from
+	// ~46s to ~5s, keeping it within the client's 20s handshake timeout.
+	skipRefresh := s.skipCredentialRefresh.Swap(false)
+	if skipRefresh {
+		logger.Infof("goolom reconnect: skipping credential refresh (reusing existing room credentials)")
+	} else if s.refresh == nil {
 		return ErrNoRefresh
+	} else {
+		creds, err := s.refresh(ctx)
+		if err != nil {
+			return fmt.Errorf("reconnect refresh: %w", err)
+		}
+		s.applyRefreshedCredentials(creds)
 	}
-	creds, err := s.refresh(ctx)
-	if err != nil {
-		return fmt.Errorf("reconnect refresh: %w", err)
-	}
-	s.applyRefreshedCredentials(creds)
 
 	if err := s.Connect(ctx); err != nil {
 		return err
