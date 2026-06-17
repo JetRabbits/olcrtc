@@ -334,7 +334,7 @@ func (s *Session) reconnect(ctx context.Context) error {
 		s.wsMu.Unlock()
 	}
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	if s.refresh == nil {
 		return ErrNoRefresh
 	}
