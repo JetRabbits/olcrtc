@@ -132,8 +132,8 @@ type Session struct {
 	// to ensure fresh SDP exchanges when a new client joins an existing room.
 	// Without this, Telemost's initial MID binding fails permanently when the
 	// publisher was already in the room before the subscriber connected.
+	// Uses CompareAndSwap to ensure only ONE reconnect per session lifetime.
 	reconnectOnNewParticipant atomic.Bool
-	knownParticipants         sync.Map // map[string]bool — participant IDs we've seen
 
 	videoTrackMu    sync.RWMutex
 	videoTracks     []webrtc.TrackLocal

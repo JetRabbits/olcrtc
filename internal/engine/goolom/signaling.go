@@ -360,13 +360,20 @@ func isEndedState(state string) bool {
 // checkNewParticipant inspects an updateDescription/upsertDescription payload
 // for new participants with sendVideo=true. If found, triggers a goolom
 // reconnect so both peers get fresh SDP exchanges.
+// Only triggers ONCE per session lifetime to avoid infinite reconnect loops
+// (each reconnect creates new participant IDs in Telemost).
 func (s *Session) checkNewParticipant(payload any) {
+	if !s.reconnectOnNewParticipant.CompareAndSwap(true, false) {
+		return // already triggered once
+	}
 	desc, ok := payload.(map[string]any)
 	if !ok {
+		s.reconnectOnNewParticipant.Store(true) // restore flag
 		return
 	}
 	descriptions, ok := desc["description"].([]any)
 	if !ok {
+		s.reconnectOnNewParticipant.Store(true) // restore flag
 		return
 	}
 	for _, rawEntry := range descriptions {
@@ -374,12 +381,8 @@ func (s *Session) checkNewParticipant(payload any) {
 		if !ok {
 			continue
 		}
-		id, _ := entry["id"].(string)
 		sendVideo, _ := entry["sendVideo"].(bool)
-		if id == "" || !sendVideo {
-			continue
-		}
-		if _, seen := s.knownParticipants.LoadOrStore(id, true); !seen {
+		if sendVideo {
 			logger.Infof("goolom: new video participant detected, reconnecting for fresh SDP exchange")
 			go func() {
 				time.Sleep(1 * time.Second)
@@ -390,4 +393,5 @@ func (s *Session) checkNewParticipant(payload any) {
 			return
 		}
 	}
+	s.reconnectOnNewParticipant.Store(true) // no video participant found, restore flag
 }
