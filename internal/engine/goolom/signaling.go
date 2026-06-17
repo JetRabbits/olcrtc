@@ -153,6 +153,22 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if payload, ok := msg["slotsConfig"]; ok {
 		s.logSignalSummary("slotsConfig", payload, 6)
 		s.sendAck(uid)
+		// When Telemost assigns a participant to a slot with mid="" (limitationReason
+		// "UNSPECIFIED"), the SFU failed to bind the subscriber video MID. This happens
+		// when the publisher was already in the room before setSlots was sent.
+		// Re-sending setSlots triggers Telemost to re-evaluate the MID binding.
+		if slotsConfigHasUnboundParticipant(payload) {
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				if s.closed.Load() {
+					return
+				}
+				logger.Infof("goolom re-sending setSlots: slotsConfig had unbound mid")
+				if err := s.sendSetSlots(); err != nil {
+					logger.Debugf("setSlots re-send error: %v", err)
+				}
+			}()
+		}
 	}
 	if payload, ok := msg["slotsMeta"]; ok {
 		s.logSignalSummary("slotsMeta", payload, 8)

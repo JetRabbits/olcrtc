@@ -257,3 +257,34 @@ func isSensitiveSignalPath(path string) bool {
 	}
 	return false
 }
+
+// slotsConfigHasUnboundParticipant checks if any slot in slotsConfig has a
+// participant assigned (participantVideoByMid with non-empty participantId)
+// but with an empty MID. This indicates Telemost failed to bind the
+// subscriber video MID for that participant.
+func slotsConfigHasUnboundParticipant(payload any) bool {
+	cfg, ok := payload.(map[string]any)
+	if !ok {
+		return false
+	}
+	slots, ok := cfg["slots"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawSlot := range slots {
+		slot, ok := rawSlot.(map[string]any)
+		if !ok {
+			continue
+		}
+		pvbm, ok := slot["participantVideoByMid"].(map[string]any)
+		if !ok {
+			continue
+		}
+		mid, _ := pvbm["mid"].(string)
+		participantID, _ := pvbm["participantId"].(string)
+		if participantID != "" && mid == "" {
+			return true
+		}
+	}
+	return false
+}
