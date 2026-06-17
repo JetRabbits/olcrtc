@@ -273,19 +273,6 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 		return fmt.Errorf("connect stream: %w", err)
 	}
 
-	// Wait for the remote VP8 track to arrive (OnTrack fires) before
-	// starting KCP. Without this, the KCP handshake starts before
-	// Telemost has properly bound the subscriber video MID, which can
-	// cause the handshake to read garbage from a stale/unbound stream.
-	// The server-side reconnectOnNewParticipant ensures the MID binding
-	// resolves within ~5 seconds.
-	select {
-	case <-p.videoTrackReady:
-		logger.Infof("vp8channel: remote VP8 track ready, starting KCP")
-	case <-connectCtx.Done():
-		return fmt.Errorf("wait for remote video track: %w", connectCtx.Err())
-	}
-
 	// Start KCP eagerly so Send/CanSend work immediately after Connect.
 	// Without this, the handshake round-trip that runs right after Connect
 	// would deadlock: muxconn.Write spins on CanSend (which checks kcp!=nil)
