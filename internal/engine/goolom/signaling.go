@@ -155,10 +155,16 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 		s.sendAck(uid)
 		// When Telemost assigns a participant to a slot with mid="" (limitationReason
 		// "UNSPECIFIED"), the SFU failed to bind the subscriber video MID. This happens
-		// when the publisher was already in the room before setSlots was sent.
-		// Re-sending setSlots triggers Telemost to re-evaluate the MID binding.
-		// Limit to 3 retries to avoid infinite loops.
-		if slotsConfigHasUnboundParticipant(payload) && s.setSlotsKey.Load() <= 4 {
+		// when the publisher was already in the room before this client subscribed.
+		// On the server side, the MID binding works because the client publishes AFTER
+		// the server subscribed (Telemost re-evaluates). But when the server is already
+		// published before the client connects, the initial binding fails permanently.
+		// A goolom-level reconnect forces a fresh SDP exchange where Telemost properly
+		// binds the MID.
+		if slotsConfigHasUnboundParticipant(payload) && s.setSlotsKey.Load() >= 2 {
+			logger.Infof("goolom: slotsConfig has unbound mid after %d setSlots attempts, reconnecting", s.setSlotsKey.Load())
+			s.queueReconnect()
+		} else if slotsConfigHasUnboundParticipant(payload) {
 			go func() {
 				time.Sleep(1 * time.Second)
 				if s.closed.Load() {
