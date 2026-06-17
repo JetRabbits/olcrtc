@@ -57,6 +57,10 @@ func (s *Session) Connect(ctx context.Context) error {
 		}
 	}
 
+	if s.skipMediaReady.Swap(false) {
+		logger.Infof("goolom connect: skipping waitForMediaReady (reconnectOnNewParticipant)")
+		return nil
+	}
 	return s.waitForMediaReady(ctx, 20*time.Second)
 }
 

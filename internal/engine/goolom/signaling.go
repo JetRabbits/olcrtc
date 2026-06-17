@@ -383,8 +383,9 @@ func (s *Session) checkNewParticipant(payload any) {
 		}
 		sendVideo, _ := entry["sendVideo"].(bool)
 		if sendVideo {
-			logger.Infof("goolom: new video participant detected, reconnecting for fresh SDP exchange (skipping credential refresh)")
+			logger.Infof("goolom: new video participant detected, reconnecting for fresh SDP exchange (skipping credential refresh and media-ready wait)")
 			s.skipCredentialRefresh.Store(true)
+			s.skipMediaReady.Store(true)
 			go func() {
 				time.Sleep(1 * time.Second)
 				if !s.closed.Load() {

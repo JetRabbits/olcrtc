@@ -142,6 +142,12 @@ type Session struct {
 	// ~46s to ~5s, keeping it within the client's 20s handshake timeout.
 	skipCredentialRefresh atomic.Bool
 
+	// skipMediaReady tells Connect() to skip waitForMediaReady(). During
+	// reconnectOnNewParticipant, the server just needs the subscriber PC
+	// ICE-connected (happens in ~1s) — it doesn't need to wait for the
+	// full 20s media-ready timeout. Set alongside skipCredentialRefresh.
+	skipMediaReady atomic.Bool
+
 	videoTrackMu    sync.RWMutex
 	videoTracks     []webrtc.TrackLocal
 	onVideoTrack    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
