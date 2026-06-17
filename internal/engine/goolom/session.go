@@ -112,12 +112,12 @@ type Session struct {
 	reconnectCount int
 	sessionMu      sync.Mutex
 
-	sendQueue     chan []byte
+	sendQueue       chan []byte
 	sendQueueClosed atomic.Bool
-	closed        atomic.Bool
-	reconnecting  atomic.Bool
+	closed          atomic.Bool
+	reconnecting    atomic.Bool
 	telemetryActive atomic.Bool
-	setSlotsKey   atomic.Uint64
+	setSlotsKey     atomic.Uint64
 
 	ackMu      sync.Mutex
 	ackWaiters map[string]chan struct{}
@@ -126,6 +126,14 @@ type Session struct {
 	signalSummaryCounts map[string]int
 
 	trafficShape TrafficShape
+
+	// reconnectOnNewParticipant causes the session to reconnect when a new
+	// participant with sendVideo=true joins. This is used by the OLCRTC server
+	// to ensure fresh SDP exchanges when a new client joins an existing room.
+	// Without this, Telemost's initial MID binding fails permanently when the
+	// publisher was already in the room before the subscriber connected.
+	reconnectOnNewParticipant atomic.Bool
+	knownParticipants         sync.Map // map[string]bool — participant IDs we've seen
 
 	videoTrackMu    sync.RWMutex
 	videoTracks     []webrtc.TrackLocal
@@ -171,25 +179,25 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 	}
 
 	return &Session{
-		name:             cfg.Name,
-		mediaServerURL:   cfg.URL,
-		peerID:           peerID,
-		roomID:           roomID,
-		credentials:      credentials,
-		roomURL:          roomURL,
-		telemetryReferer: telemetryReferer,
-		refresh:          cfg.Refresh,
-		onData:           cfg.OnData,
-		reconnectCh:      make(chan struct{}, 1),
-		closeCh:          make(chan struct{}),
-		keepAliveCh:      make(chan struct{}),
-		sessionCloseCh:   make(chan struct{}),
-		telemetryCh:      make(chan struct{}, 1),
-		sendQueue:        make(chan []byte, defaultSendQueueSize),
-		ackWaiters:       make(map[string]chan struct{}),
+		name:                cfg.Name,
+		mediaServerURL:      cfg.URL,
+		peerID:              peerID,
+		roomID:              roomID,
+		credentials:         credentials,
+		roomURL:             roomURL,
+		telemetryReferer:    telemetryReferer,
+		refresh:             cfg.Refresh,
+		onData:              cfg.OnData,
+		reconnectCh:         make(chan struct{}, 1),
+		closeCh:             make(chan struct{}),
+		keepAliveCh:         make(chan struct{}),
+		sessionCloseCh:      make(chan struct{}),
+		telemetryCh:         make(chan struct{}, 1),
+		sendQueue:           make(chan []byte, defaultSendQueueSize),
+		ackWaiters:          make(map[string]chan struct{}),
 		signalSummaryCounts: make(map[string]int),
-		subscriberConn:   make(chan struct{}),
-		publisherConn:    make(chan struct{}),
+		subscriberConn:      make(chan struct{}),
+		publisherConn:       make(chan struct{}),
 		trafficShape: TrafficShape{
 			MaxMessageSize: realDataChannelMessageLimit,
 			MinDelay:       defaultSendDelayLow,
@@ -249,6 +257,13 @@ func (s *Session) SetReconnectCallback(cb func(*webrtc.DataChannel)) { s.onRecon
 
 // SetShouldReconnect sets the policy for reconnection.
 func (s *Session) SetShouldReconnect(fn func() bool) { s.shouldReconnect = fn }
+
+// SetReconnectOnNewParticipant enables automatic reconnection when a new
+// participant with video joins. Used by the OLCRTC server to ensure Telemost
+// provides fresh SDP exchanges with proper MID binding.
+func (s *Session) SetReconnectOnNewParticipant(v bool) {
+	s.reconnectOnNewParticipant.Store(v)
+}
 
 // CanSend checks if data can be sent.
 func (s *Session) CanSend() bool {

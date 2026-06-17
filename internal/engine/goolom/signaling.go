@@ -141,10 +141,16 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if payload, ok := msg["updateDescription"]; ok {
 		s.logSignalSummary("updateDescription", payload, 4)
 		s.sendAck(uid)
+		if s.reconnectOnNewParticipant.Load() {
+			s.checkNewParticipant(payload)
+		}
 	}
 	if payload, ok := msg["upsertDescription"]; ok {
 		s.logSignalSummary("upsertDescription", payload, 8)
 		s.sendAck(uid)
+		if s.reconnectOnNewParticipant.Load() {
+			s.checkNewParticipant(payload)
+		}
 	}
 	if payload, ok := msg["removeDescription"]; ok {
 		s.logSignalSummary("removeDescription", payload, 4)
@@ -153,29 +159,6 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if payload, ok := msg["slotsConfig"]; ok {
 		s.logSignalSummary("slotsConfig", payload, 6)
 		s.sendAck(uid)
-		// When Telemost assigns a participant to a slot with mid="" (limitationReason
-		// "UNSPECIFIED"), the SFU failed to bind the subscriber video MID. This happens
-		// when the publisher was already in the room before this client subscribed.
-		// On the server side, the MID binding works because the client publishes AFTER
-		// the server subscribed (Telemost re-evaluates). But when the server is already
-		// published before the client connects, the initial binding fails permanently.
-		// A goolom-level reconnect forces a fresh SDP exchange where Telemost properly
-		// binds the MID.
-		if slotsConfigHasUnboundParticipant(payload) && s.setSlotsKey.Load() >= 2 {
-			logger.Infof("goolom: slotsConfig has unbound mid after %d setSlots attempts, reconnecting", s.setSlotsKey.Load())
-			s.queueReconnect()
-		} else if slotsConfigHasUnboundParticipant(payload) {
-			go func() {
-				time.Sleep(1 * time.Second)
-				if s.closed.Load() {
-					return
-				}
-				logger.Infof("goolom re-sending setSlots: slotsConfig had unbound mid")
-				if err := s.sendSetSlots(); err != nil {
-					logger.Debugf("setSlots re-send error: %v", err)
-				}
-			}()
-		}
 	}
 	if payload, ok := msg["slotsMeta"]; ok {
 		s.logSignalSummary("slotsMeta", payload, 8)
@@ -371,5 +354,40 @@ func isEndedState(state string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// checkNewParticipant inspects an updateDescription/upsertDescription payload
+// for new participants with sendVideo=true. If found, triggers a goolom
+// reconnect so both peers get fresh SDP exchanges.
+func (s *Session) checkNewParticipant(payload any) {
+	desc, ok := payload.(map[string]any)
+	if !ok {
+		return
+	}
+	descriptions, ok := desc["description"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawEntry := range descriptions {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := entry["id"].(string)
+		sendVideo, _ := entry["sendVideo"].(bool)
+		if id == "" || !sendVideo {
+			continue
+		}
+		if _, seen := s.knownParticipants.LoadOrStore(id, true); !seen {
+			logger.Infof("goolom: new video participant detected, reconnecting for fresh SDP exchange")
+			go func() {
+				time.Sleep(1 * time.Second)
+				if !s.closed.Load() {
+					s.queueReconnect()
+				}
+			}()
+			return
+		}
 	}
 }

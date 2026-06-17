@@ -157,6 +157,18 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	}
 	stream := &engineVideoSession{session: session, vt: vt}
 
+	// Enable server-side reconnect on new participant if configured.
+	// This ensures Telemost provides fresh SDP exchanges with proper MID binding
+	// when a new client joins an existing room.
+	if opts.ReconnectOnNewParticipant {
+		type reconnectOnNewParticipantSetter interface {
+			SetReconnectOnNewParticipant(bool)
+		}
+		if rp, ok := session.(reconnectOnNewParticipantSetter); ok {
+			rp.SetReconnectOnNewParticipant(true)
+		}
+	}
+
 	// Stream/track IDs must be unique per peer - Jitsi rejects session-accept
 	// when msid collides with another participant in the conference.
 	track, err := webrtc.NewTrackLocalStaticSample(

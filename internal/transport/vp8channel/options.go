@@ -23,6 +23,10 @@ type Options struct {
 	// MaxBytesPerSec caps the wire byte-rate fed to the video track. Zero
 	// falls back to defaultMaxBytesPerSec.
 	MaxBytesPerSec int
+	// ReconnectOnNewParticipant causes the goolom session to reconnect when
+	// a new participant with video joins. Used by the OLCRTC server to ensure
+	// Telemost provides fresh SDP exchanges with proper MID binding.
+	ReconnectOnNewParticipant bool
 }
 
 // TransportOptions marks Options as belonging to the transport options family.
