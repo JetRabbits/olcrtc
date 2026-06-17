@@ -10,8 +10,6 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-
-
 func (s *Session) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh chan struct{}) {
 	s.dc.OnOpen(func() {
 		numWorkers := 4
@@ -80,6 +78,17 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 
 	s.sendAck(uid)
 
+	// Send setSlots right after subscriberSdpAnswer (before publisher exchange).
+	// This matches the Python PoC ordering exactly. Telemost needs to know the
+	// subscriber wants video slots BEFORE the publisher advertises its track.
+	// Previous experiments sent setSlots after publisherSdpAnswer (Exp #17) and
+	// got mid="" — the reversed order is the likely root cause.
+	if sendPub {
+		if err := s.sendSetSlots(); err != nil {
+			logger.Debugf("setSlots after subscriberSdpAnswer error: %v", err)
+		}
+	}
+
 	if !sendPub {
 		return nil
 	}
@@ -110,7 +119,6 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 	return nil
 }
 
-
 func (s *Session) handleSdpAnswer(answer map[string]any, uid string) {
 	sdp, _ := answer["sdp"].(string)
 	pcSeq, _ := answer["pcSeq"].(float64)
@@ -122,12 +130,6 @@ func (s *Session) handleSdpAnswer(answer map[string]any, uid string) {
 		logger.Debugf("SetRemoteDescription error: %v", err)
 	}
 	s.sendAck(uid)
-
-	// After publisher SDP exchange completes, the server participant is published.
-	// Send setSlots so Telemost assigns the server participant to a subscriber slot.
-	if err := s.sendSetSlots(); err != nil {
-		logger.Debugf("setSlots after publisherSdpAnswer error: %v", err)
-	}
 }
 
 func (s *Session) handleICE(cand map[string]any) {
@@ -244,21 +246,17 @@ func (s *Session) publisherTrackDescriptions() []map[string]any {
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			kind = "AUDIO"
 		}
-		// Telemost uses sourceId and streamId to correlate tracks with
-		// participant slots. Matching the browser SDK schema ensures the SFU
-		// binds the subscriber slot MID correctly.
-		streamID := track.StreamID()
-		if streamID == "" {
-			streamID = track.ID()
-		}
+		// Match the Python PoC track schema exactly:
+		//   mid, transceiverMid, kind, priority, label, codecs, groupId, description
+		// The Python PoC does NOT include sourceId or streamId.
+		// Previous experiments (Exp #17) with sourceId/streamId still got mid="" —
+		// the extra fields may cause Telemost to use a different binding path.
 		tracks = append(tracks, map[string]any{
 			"mid":            transceiver.Mid(),
 			"transceiverMid": transceiver.Mid(),
 			"kind":           kind,
 			"priority":       0,
 			"label":          track.ID(),
-			"sourceId":       streamID,
-			"streamId":       streamID,
 			"codecs":         map[string]any{},
 			"groupId":        1,
 			keyDescription:   "",
