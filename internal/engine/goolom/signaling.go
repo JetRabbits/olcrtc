@@ -157,9 +157,10 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 		// "UNSPECIFIED"), the SFU failed to bind the subscriber video MID. This happens
 		// when the publisher was already in the room before setSlots was sent.
 		// Re-sending setSlots triggers Telemost to re-evaluate the MID binding.
-		if slotsConfigHasUnboundParticipant(payload) {
+		// Limit to 3 retries to avoid infinite loops.
+		if slotsConfigHasUnboundParticipant(payload) && s.setSlotsKey.Load() <= 4 {
 			go func() {
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(1 * time.Second)
 				if s.closed.Load() {
 					return
 				}

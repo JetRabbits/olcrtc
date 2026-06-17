@@ -65,6 +65,7 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 	if err := s.pcSub.SetLocalDescription(answer); err != nil {
 		return fmt.Errorf("set local desc: %w", err)
 	}
+	logSDPSummary("subscriberSdpAnswer", int(pcSeq), answer.SDP)
 
 	s.wsMu.Lock()
 	_ = s.ws.WriteJSON(map[string]any{

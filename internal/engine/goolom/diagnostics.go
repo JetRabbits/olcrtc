@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	maxSDPSummaryLines       = 96
+	maxSDPSummaryLines       = 200
 	maxSignalSummaryParts    = 96
 	maxSignalSummaryDepth    = 4
 	maxSignalSummaryArrayLen = 4
