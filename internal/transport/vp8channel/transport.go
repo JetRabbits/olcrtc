@@ -788,15 +788,19 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		return
 	}
 	if p.peerConfirmed.Load() && peerEpoch != p.peerEpoch.Load() {
+		logger.Debugf("vp8channel: handleIncomingFrame: dropping frame epoch=0x%08x (confirmed epoch=0x%08x)", peerEpoch, p.peerEpoch.Load())
 		return
 	}
 	p.peerEpoch.Store(peerEpoch)
+	logger.Debugf("vp8channel: handleIncomingFrame: delivering %d bytes KCP payload epoch=0x%08x confirmed=%v", len(kcpPayload), peerEpoch, p.peerConfirmed.Load())
 
 	p.kcpMu.RLock()
 	rt := p.kcp
 	p.kcpMu.RUnlock()
 	if rt != nil {
 		deliverKCPPayload(rt, kcpPayload)
+	} else {
+		logger.Debugf("vp8channel: handleIncomingFrame: no KCP runtime, dropping %d bytes", len(kcpPayload))
 	}
 }
 
