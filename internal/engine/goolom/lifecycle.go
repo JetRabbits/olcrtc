@@ -449,12 +449,6 @@ func (s *Session) resetSession() (chan struct{}, chan struct{}) {
 	s.keepAliveCh = make(chan struct{})
 	s.sessionCloseCh = make(chan struct{})
 	s.deferredReconnectCh = make(chan struct{})
-	// Re-arm reconnect-on-new-participant for the next session so that a
-	// fresh client connection after the server reconnects can again trigger
-	// the deferred SDP-rebinding reconnect.
-	if s.reconnectOnNewParticipant.Load() == false {
-		s.reconnectOnNewParticipant.Store(true)
-	}
 	return s.keepAliveCh, s.sessionCloseCh
 }
 
