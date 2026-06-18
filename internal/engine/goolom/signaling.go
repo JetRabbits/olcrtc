@@ -403,6 +403,11 @@ func (s *Session) checkNewParticipant(payload any) {
 		if !ok {
 			continue
 		}
+		// Skip disconnected participants — they carry sendVideo=true from
+		// their last active state but are no longer in the room.
+		if _, hasDisconnectedAt := entry["disconnectedAt"]; hasDisconnectedAt {
+			continue
+		}
 		sendVideo, _ := entry["sendVideo"].(bool)
 		if sendVideo {
 			logger.Infof("goolom: new video participant detected, deferring reconnect until client handshake completes")
