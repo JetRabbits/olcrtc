@@ -64,33 +64,33 @@ type HealthFunc func(control.Status)
 
 // Server handles incoming tunnel connections and proxies their traffic.
 type Server struct {
-	ln             transport.Transport
-	peerLn         transport.PeerTransport
-	cipher         *crypto.Cipher
-	conn           *muxconn.Conn
-	session        *smux.Session
-	controlStrm    *smux.Stream
-	controlStop    context.CancelFunc
-	sessMu         sync.RWMutex
-	peerSessions   map[string]*peerSession
-	peersMu        sync.Mutex
-	peerStats      map[string]peerStat
-	reinstallMu    sync.Mutex
-	wg             sync.WaitGroup
-	authHook       handshake.AuthFunc
-	onOpen         SessionOpenFunc
-	onClose        SessionCloseFunc
-	onTraffic      TrafficFunc
-	deviceID       string
-	sessionID      string
-	dnsServer      string
-	resolver       *net.Resolver
-	socksProxyAddr string
-	socksProxyPort int
-	socksProxyUser string
-	socksProxyPass string
-	liveness       control.Config
-	health         *runtime.HealthTracker
+	ln                      transport.Transport
+	peerLn                  transport.PeerTransport
+	cipher                  *crypto.Cipher
+	conn                    *muxconn.Conn
+	session                 *smux.Session
+	controlStrm             *smux.Stream
+	controlStop             context.CancelFunc
+	sessMu                  sync.RWMutex
+	peerSessions            map[string]*peerSession
+	peersMu                 sync.Mutex
+	peerStats               map[string]peerStat
+	reinstallMu             sync.Mutex
+	wg                      sync.WaitGroup
+	authHook                handshake.AuthFunc
+	onOpen                  SessionOpenFunc
+	onClose                 SessionCloseFunc
+	onTraffic               TrafficFunc
+	deviceID                string
+	sessionID               string
+	dnsServer               string
+	resolver                *net.Resolver
+	socksProxyAddr          string
+	socksProxyPort          int
+	socksProxyUser          string
+	socksProxyPass          string
+	liveness                control.Config
+	health                  *runtime.HealthTracker
 	done                    chan struct{}
 	doneOnce                sync.Once
 	signalHandshakeComplete func()
@@ -980,11 +980,13 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 			header = append(header, tmp[:n]...)
 			if req, headerLen, ok := parseStreamRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
+				logger.Infof("sid=%d handleStream cmd=%s addr=%s port=%d", stream.ID(), req.Cmd, req.Addr, req.Port)
 				s.dispatch(stream, req, sessionID, header[headerLen:])
 				return
 			}
 		}
 		if err != nil {
+			logger.Debugf("sid=%d handleStream read error after %d bytes: %v", stream.ID(), len(header), err)
 			return
 		}
 		if len(header) > maxConnReq {
