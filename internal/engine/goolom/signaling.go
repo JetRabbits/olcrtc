@@ -420,9 +420,15 @@ func (s *Session) checkNewParticipant(payload any) {
 				// briefly broken.
 				select {
 				case <-s.deferredReconnectCh:
-					// Client handshake completed, wait for WireGuard to establish
-					logger.Infof("goolom: client handshake complete, waiting 5s for WireGuard before reconnect")
-					time.Sleep(5 * time.Second)
+					// Client handshake completed, wait for WireGuard to establish.
+					// 30s is needed because:
+					//   - VPN permission dialog may take up to 30s to accept
+					//   - VPN service setup (TUN fd handoff) takes 2-40s
+					//   - WireGuard AmneziaWG sends Jc=12 junk packets before
+					//     the real HandshakeInitiation (~163 bytes)
+					//   - HandshakeInitiation + Response takes 1-5 round trips
+					logger.Infof("goolom: client handshake complete, waiting 30s for WireGuard before reconnect")
+					time.Sleep(30 * time.Second)
 				case <-time.After(30 * time.Second):
 					logger.Warnf("goolom: deferred reconnect timeout (client may not have connected)")
 				case <-s.closeCh:
