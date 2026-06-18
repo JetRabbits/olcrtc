@@ -643,6 +643,7 @@ func (s *Server) serveSingle(ctx context.Context) {
 			}
 		}
 
+		logger.Debugf("serveSingle: waiting for AcceptStream (session=%s)", s.currentSessionID())
 		stream, err := sess.AcceptStream()
 		if err != nil {
 			if s.handleAcceptError(ctx, sess) {
@@ -650,6 +651,7 @@ func (s *Server) serveSingle(ctx context.Context) {
 			}
 			continue
 		}
+		logger.Infof("serveSingle: accepted stream sid=%d (session=%s)", stream.ID(), s.currentSessionID())
 
 		s.wg.Add(1)
 		go func() {
