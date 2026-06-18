@@ -152,12 +152,15 @@ func (c *Conn) Push(ciphertext []byte) {
 	*bufPtr = pt
 	if c.closed.Load() {
 		releaseFrameBuf(bufPtr)
+		logger.Debugf("muxconn.Push: %d bytes DROPPED (conn closed)", len(pt))
 		return
 	}
+	logger.Debugf("muxconn.Push: %d bytes → in-chan (len=%d)", len(pt), len(c.in))
 	select {
 	case c.in <- bufPtr:
 	case <-c.closeCh:
 		releaseFrameBuf(bufPtr)
+		logger.Debugf("muxconn.Push: %d bytes DROPPED (closeCh)", len(pt))
 	}
 }
 
