@@ -155,6 +155,13 @@ type Session struct {
 	// full 20s media-ready timeout. Set alongside skipCredentialRefresh.
 	skipMediaReady atomic.Bool
 
+	// lastHandshakeAt is set to the current time (Unix ns) when
+	// SignalHandshakeComplete is called. checkNewParticipant uses this to
+	// suppress additional deferred reconnects for 60s after a client
+	// handshake, ensuring WireGuard has time to establish before the
+	// tunnel is briefly broken again.
+	lastHandshakeAt atomic.Int64
+
 	videoTrackMu    sync.RWMutex
 	videoTracks     []webrtc.TrackLocal
 	onVideoTrack    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
@@ -299,8 +306,10 @@ func (s *Session) SetOnReconnecting(cb func()) {
 // SignalHandshakeComplete closes the deferredReconnectCh, unblocking the
 // reconnectOnNewParticipant goroutine which will trigger the reconnect after
 // a delay. The OLCRTC server calls this after the client's control handshake
-// completes.
+// completes. Also records the handshake timestamp to suppress follow-up
+// deferred reconnects for 60s while WireGuard establishes.
 func (s *Session) SignalHandshakeComplete() {
+	s.lastHandshakeAt.Store(time.Now().UnixNano())
 	closeSignal(s.deferredReconnectCh)
 }
 

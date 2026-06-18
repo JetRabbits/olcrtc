@@ -367,9 +367,26 @@ func isEndedState(state string) bool {
 // (signaled by deferredReconnectCh being closed), plus an additional 5s delay
 // to allow WireGuard to establish its handshake over the tunnel before the
 // tunnel is briefly broken during the reconnect.
+//
+// If a handshake completed within the last 75s, the reconnect is suppressed
+// entirely: the client is likely actively using WireGuard and reconnecting
+// would kill in-flight UDP streams.
 func (s *Session) checkNewParticipant(payload any) {
 	if !s.reconnectOnNewParticipant.CompareAndSwap(true, false) {
 		return // already triggered once
+	}
+	// Suppress reconnect if a client handshake was recent — WireGuard may
+	// still be establishing and a reconnect would kill its UDP streams.
+	const handshakeProtectWindow = 75 * time.Second
+	if ts := s.lastHandshakeAt.Load(); ts != 0 {
+		elapsed := time.Since(time.Unix(0, ts))
+		if elapsed < handshakeProtectWindow {
+			logger.Infof("goolom: skipping reconnect-on-new-participant: handshake was %s ago (protect window %s)",
+				elapsed.Truncate(time.Second), handshakeProtectWindow)
+			// Do not restore the flag: we consumed it. The next session cycle
+			// (after the next reconnect) will re-arm it via resetSession().
+			return
+		}
 	}
 	desc, ok := payload.(map[string]any)
 	if !ok {
