@@ -1498,6 +1498,12 @@ func (s *Session) WatchConnection(ctx context.Context) {
 // carrier dead before jitsi has noticed.
 func (s *Session) Reconnect(reason string) { s.requestReconnect(reason) }
 
+// SetOnReconnecting is a no-op for Jitsi (only used by Goolom/Telemost).
+func (s *Session) SetOnReconnecting(_ func()) {}
+
+// SignalHandshakeComplete is a no-op for Jitsi (only used by Goolom/Telemost).
+func (s *Session) SignalHandshakeComplete() {}
+
 func (s *Session) requestReconnect(reason string) {
 	s.bridgeReady.Store(false)
 	if s.closed.Load() || s.reconnecting.Load() {

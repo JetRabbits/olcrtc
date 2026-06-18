@@ -362,6 +362,11 @@ func isEndedState(state string) bool {
 // reconnect so both peers get fresh SDP exchanges.
 // Only triggers ONCE per session lifetime to avoid infinite reconnect loops
 // (each reconnect creates new participant IDs in Telemost).
+//
+// The reconnect is deferred until after the client's control handshake completes
+// (signaled by deferredReconnectCh being closed), plus an additional 5s delay
+// to allow WireGuard to establish its handshake over the tunnel before the
+// tunnel is briefly broken during the reconnect.
 func (s *Session) checkNewParticipant(payload any) {
 	if !s.reconnectOnNewParticipant.CompareAndSwap(true, false) {
 		return // already triggered once
@@ -383,12 +388,26 @@ func (s *Session) checkNewParticipant(payload any) {
 		}
 		sendVideo, _ := entry["sendVideo"].(bool)
 		if sendVideo {
-			logger.Infof("goolom: new video participant detected, reconnecting for fresh SDP exchange (skipping credential refresh and media-ready wait)")
+			logger.Infof("goolom: new video participant detected, deferring reconnect until client handshake completes")
 			s.skipCredentialRefresh.Store(true)
 			s.skipMediaReady.Store(true)
 			go func() {
-				time.Sleep(1 * time.Second)
+				// Wait for the client's control handshake to complete before
+				// triggering the reconnect. This ensures the client has time
+				// to connect and establish WireGuard before the tunnel is
+				// briefly broken.
+				select {
+				case <-s.deferredReconnectCh:
+					// Client handshake completed, wait for WireGuard to establish
+					logger.Infof("goolom: client handshake complete, waiting 5s for WireGuard before reconnect")
+					time.Sleep(5 * time.Second)
+				case <-time.After(30 * time.Second):
+					logger.Warnf("goolom: deferred reconnect timeout (client may not have connected)")
+				case <-s.closeCh:
+					return
+				}
 				if !s.closed.Load() {
+					logger.Infof("goolom: triggering deferred reconnect for fresh SDP exchange")
 					s.queueReconnect()
 				}
 			}()

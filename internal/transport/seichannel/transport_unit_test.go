@@ -81,6 +81,8 @@ func (s *fakeEngineSession) CanSend() bool                            { return s
 func (s *fakeEngineSession) GetSendQueue() chan []byte                { return nil }
 func (s *fakeEngineSession) GetBufferedAmount() uint64                { return 0 }
 func (s *fakeEngineSession) Reconnect(string)                         {}
+func (s *fakeEngineSession) SetOnReconnecting(func())                 {}
+func (s *fakeEngineSession) SignalHandshakeComplete()                  {}
 func (s *fakeEngineSession) AddVideoTrack(t webrtc.TrackLocal) error  { return s.stream.AddTrack(t) }
 func (s *fakeEngineSession) SetVideoTrackHandler(cb func(*webrtc.TrackRemote, *webrtc.RTPReceiver)) {
 	s.stream.SetTrackHandler(cb)

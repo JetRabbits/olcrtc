@@ -316,6 +316,13 @@ func (s *Session) reconnect(ctx context.Context) error {
 	s.reconnecting.Store(true)
 	defer s.reconnecting.Store(false)
 
+	// Notify upper layers before tearing down WS/PC. The server uses this
+	// to close its smux session proactively, preventing the client from
+	// connecting to a dying session during the reconnect window.
+	if s.onReconnecting != nil {
+		s.onReconnecting()
+	}
+
 	s.sendLeave(uuid.New().String())
 	time.Sleep(500 * time.Millisecond)
 	s.stopSession()
@@ -441,6 +448,7 @@ func (s *Session) resetSession() (chan struct{}, chan struct{}) {
 	s.setSlotsKey.Store(0)
 	s.keepAliveCh = make(chan struct{})
 	s.sessionCloseCh = make(chan struct{})
+	s.deferredReconnectCh = make(chan struct{})
 	return s.keepAliveCh, s.sessionCloseCh
 }
 

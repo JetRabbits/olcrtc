@@ -38,6 +38,8 @@ func (s *stubSession) CanSend() bool                                    { return
 func (s *stubSession) GetSendQueue() chan []byte                        { return nil }
 func (s *stubSession) GetBufferedAmount() uint64                        { return 0 }
 func (s *stubSession) Reconnect(_ string)                               {}
+func (s *stubSession) SetOnReconnecting(func())                         {}
+func (s *stubSession) SignalHandshakeComplete()                          {}
 func (s *stubSession) Capabilities() engine.Capabilities               { return engine.Capabilities{ByteStream: true} }
 
 // Compile-time check: stubSession must satisfy engine.Session.

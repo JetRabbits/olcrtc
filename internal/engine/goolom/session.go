@@ -100,6 +100,7 @@ type Session struct {
 
 	onData          func([]byte)
 	onReconnect     func(*webrtc.DataChannel)
+	onReconnecting  func() // called at the start of reconnect(), before WS/PC teardown
 	shouldReconnect func() bool
 	onEnded         func(string)
 
@@ -134,6 +135,12 @@ type Session struct {
 	// publisher was already in the room before the subscriber connected.
 	// Uses CompareAndSwap to ensure only ONE reconnect per session lifetime.
 	reconnectOnNewParticipant atomic.Bool
+
+	// deferredReconnectCh is closed by the server after the client handshake
+	// completes, triggering the reconnectOnNewParticipant reconnect with a
+	// delay. This ensures the client has time to connect and WireGuard has
+	// time to establish before the tunnel is briefly broken.
+	deferredReconnectCh chan struct{}
 
 	// skipCredentialRefresh tells reconnect() to skip the s.refresh(ctx) call
 	// (HTTP round-trip to Telemost API) and reuse existing room credentials.
@@ -216,6 +223,7 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 			MinDelay:       defaultSendDelayLow,
 			MaxDelay:       defaultSendDelayMax,
 		},
+		deferredReconnectCh: make(chan struct{}),
 	}, nil
 }
 
@@ -276,6 +284,24 @@ func (s *Session) SetShouldReconnect(fn func() bool) { s.shouldReconnect = fn }
 // provides fresh SDP exchanges with proper MID binding.
 func (s *Session) SetReconnectOnNewParticipant(v bool) {
 	s.reconnectOnNewParticipant.Store(v)
+}
+
+// SetOnReconnecting registers a callback that fires at the start of reconnect(),
+// before WebSocket and PeerConnection teardown. The OLCRTC server uses this
+// to close its smux session proactively, preventing the client from connecting
+// to a dying session during the reconnect window.
+func (s *Session) SetOnReconnecting(cb func()) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	s.onReconnecting = cb
+}
+
+// SignalHandshakeComplete closes the deferredReconnectCh, unblocking the
+// reconnectOnNewParticipant goroutine which will trigger the reconnect after
+// a delay. The OLCRTC server calls this after the client's control handshake
+// completes.
+func (s *Session) SignalHandshakeComplete() {
+	closeSignal(s.deferredReconnectCh)
 }
 
 // CanSend checks if data can be sent.

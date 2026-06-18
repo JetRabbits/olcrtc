@@ -87,6 +87,14 @@ type Session interface {
 	// a video track). Implementations should be best-effort and idempotent;
 	// reason is logged for diagnostics.
 	Reconnect(reason string)
+	// SetOnReconnecting registers a callback that fires at the start of
+	// reconnect(), before WebSocket and PeerConnection teardown. Used by the
+	// OLCRTC server to close its smux session proactively.
+	SetOnReconnecting(cb func())
+	// SignalHandshakeComplete closes the deferred reconnect channel, unblocking
+	// the reconnectOnNewParticipant goroutine. Used by the OLCRTC server after
+	// the client's control handshake completes.
+	SignalHandshakeComplete()
 }
 
 // PeerSession is implemented by engines that can address byte payloads to a

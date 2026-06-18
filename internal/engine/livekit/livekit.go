@@ -443,6 +443,12 @@ func (s *Session) Reconnect(reason string) {
 	s.queueReconnect()
 }
 
+// SetOnReconnecting is a no-op for LiveKit (only used by Goolom/Telemost).
+func (s *Session) SetOnReconnecting(_ func()) {}
+
+// SignalHandshakeComplete is a no-op for LiveKit (only used by Goolom/Telemost).
+func (s *Session) SignalHandshakeComplete() {}
+
 func (s *Session) drainReconnectQueue() {
 	for {
 		select {

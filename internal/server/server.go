@@ -91,8 +91,9 @@ type Server struct {
 	socksProxyPass string
 	liveness       control.Config
 	health         *runtime.HealthTracker
-	done           chan struct{}
-	doneOnce       sync.Once
+	done                    chan struct{}
+	doneOnce                sync.Once
+	signalHandshakeComplete func()
 }
 
 // peerStat holds the per-session info needed to report the live peer count
@@ -302,6 +303,9 @@ func (s *Server) bringUpLink(
 		s.handleReconnect()
 	})
 
+	// Wire up engine-level reconnect callbacks for goolom.
+	s.setupEngineCallbacks(ctx, cfg, cancel)
+
 	logger.Infof("Connecting transport=%s carrier=%s ...", cfg.Transport, cfg.Carrier)
 	if s.peerLn == nil {
 		s.installSession()
@@ -319,6 +323,36 @@ func (s *Server) bringUpLink(
 		ln.WatchConnection(ctx)
 	}()
 	return nil
+}
+
+// setupEngineCallbacks configures engine-level hooks for goolom reconnect
+// coordination. The goolom session's reconnectOnNewParticipant defers the
+// reconnect until after the client handshake completes (signaled by
+// SignalHandshakeComplete). The OnReconnecting callback closes the smux
+// session proactively before goolom tears down its WebRTC peers.
+func (s *Server) setupEngineCallbacks(ctx context.Context, cfg Config, cancel context.CancelFunc) {
+	if s.ln == nil {
+		return
+	}
+	// The engine must be accessible through the transport. Check if the
+	// transport exposes the engine session for callback configuration.
+	if engineCfg, ok := s.ln.(interface{ SetReconnectOnNewParticipant(bool) }); ok {
+		engineCfg.SetReconnectOnNewParticipant(true)
+	}
+	if engineCfg, ok := s.ln.(interface{ SetOnReconnecting(func()) }); ok {
+		engineCfg.SetOnReconnecting(func() {
+			logger.Infof("server: engine reconnecting - closing smux session proactively")
+			s.sessMu.RLock()
+			current := s.session
+			s.sessMu.RUnlock()
+			s.reinstallSession(current)
+		})
+	}
+	if engineCfg, ok := s.ln.(interface{ SignalHandshakeComplete() }); ok {
+		s.signalHandshakeComplete = func() {
+			engineCfg.SignalHandshakeComplete()
+		}
+	}
 }
 
 func (s *Server) installSession() {
@@ -706,6 +740,13 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 		s.trackPeerOpen(sid, hello.DeviceID)
 		logger.Infof("session %s opened (device=%s)", sid, hello.DeviceID)
 		s.startControlLoop(ctx, sess, stream)
+		// Signal that the client handshake completed. The goolom engine's
+		// reconnectOnNewParticipant goroutine waits on this signal before
+		// triggering the reconnect, ensuring the client has time to connect
+		// and WireGuard has time to establish before the tunnel is broken.
+		if s.signalHandshakeComplete != nil {
+			s.signalHandshakeComplete()
+		}
 		return true
 	}
 	return false

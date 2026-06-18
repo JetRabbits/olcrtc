@@ -46,6 +46,20 @@ func (v *engineVideoSession) CanSend() bool { return v.session.CanSend() }
 
 func (v *engineVideoSession) Reconnect(reason string) { v.session.Reconnect(reason) }
 
+func (v *engineVideoSession) SetReconnectOnNewParticipant(enabled bool) {
+	if setter, ok := v.session.(interface{ SetReconnectOnNewParticipant(bool) }); ok {
+		setter.SetReconnectOnNewParticipant(enabled)
+	}
+}
+
+func (v *engineVideoSession) SetOnReconnecting(cb func()) {
+	v.session.SetOnReconnecting(cb)
+}
+
+func (v *engineVideoSession) SignalHandshakeComplete() {
+	v.session.SignalHandshakeComplete()
+}
+
 func (v *engineVideoSession) AddTrack(track webrtc.TrackLocal) error {
 	if err := v.vt.AddVideoTrack(track); err != nil {
 		return fmt.Errorf("add track: %w", err)

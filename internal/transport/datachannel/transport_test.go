@@ -47,6 +47,8 @@ func (s *stubSession) CanSend() bool                                           {
 func (s *stubSession) GetSendQueue() chan []byte                               { return nil }
 func (s *stubSession) GetBufferedAmount() uint64                               { return 0 }
 func (s *stubSession) Reconnect(string)                                        {}
+func (s *stubSession) SetOnReconnecting(func())                                {}
+func (s *stubSession) SignalHandshakeComplete()                                {}
 
 func registerCarrier(name string, sess engine.Session, err error) {
 	enginebuiltin.Register(name, func(context.Context, enginebuiltin.Config) (engine.Session, error) {

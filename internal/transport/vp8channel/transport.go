@@ -86,6 +86,9 @@ type videoSession interface {
 	WatchConnection(ctx context.Context)
 	CanSend() bool
 	Reconnect(reason string)
+	SetReconnectOnNewParticipant(enabled bool)
+	SetOnReconnecting(cb func())
+	SignalHandshakeComplete()
 	AddTrack(track webrtc.TrackLocal) error
 	SetTrackHandler(cb func(*webrtc.TrackRemote, *webrtc.RTPReceiver))
 }
@@ -466,6 +469,27 @@ func (p *streamTransport) ResetPeer() {
 // Reconnect forwards to the underlying engine session.
 func (p *streamTransport) Reconnect(reason string) {
 	p.stream.Reconnect(reason)
+}
+
+// SetReconnectOnNewParticipant enables the goolom engine's reconnect-on-new-participant
+// feature. This ensures Telemost provides fresh SDP exchanges with proper MID binding
+// when a new client joins an existing room. The reconnect is deferred until after
+// the client's control handshake completes.
+func (p *streamTransport) SetReconnectOnNewParticipant(v bool) {
+	p.stream.SetReconnectOnNewParticipant(v)
+}
+
+// SetOnReconnecting registers a callback that fires at the start of engine reconnect(),
+// before WebSocket and PeerConnection teardown. The OLCRTC server uses this to close
+// its smux session proactively, preventing the client from connecting to a dying session.
+func (p *streamTransport) SetOnReconnecting(cb func()) {
+	p.stream.SetOnReconnecting(cb)
+}
+
+// SignalHandshakeComplete closes the deferred reconnect channel, unblocking the
+// reconnectOnNewParticipant goroutine which will trigger the reconnect after a delay.
+func (p *streamTransport) SignalHandshakeComplete() {
+	p.stream.SignalHandshakeComplete()
 }
 
 func (p *streamTransport) SetReconnectCallback(cb func()) {

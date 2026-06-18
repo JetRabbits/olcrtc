@@ -360,6 +360,8 @@ func (s *memoryStream) Reconnect(string)          {}
 func (s *memoryStream) Capabilities() engine.Capabilities {
 	return engine.Capabilities{ByteStream: true, VideoTrack: true}
 }
+func (s *memoryStream) SetOnReconnecting(func())              {}
+func (s *memoryStream) SignalHandshakeComplete()               {}
 
 func (s *memoryStream) AddVideoTrack(track webrtc.TrackLocal) error {
 	s.mu.Lock()
