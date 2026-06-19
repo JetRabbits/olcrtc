@@ -83,3 +83,39 @@ func TestWaitForAckTimeoutAndClose(t *testing.T) {
 		t.Fatal("waitForAck(closeCh) = true")
 	}
 }
+
+func TestRemoveDescriptionRearmsReconnectOnNewParticipant(t *testing.T) {
+	s := &Session{
+		closeCh:             make(chan struct{}),
+		signalSummaryCounts: make(map[string]int),
+	}
+
+	s.handleCommonMessages(map[string]any{"removeDescription": map[string]any{
+		"descriptionId": []any{"leaving-participant"},
+	}}, "")
+
+	if s.reconnectOnNewParticipant.Load() {
+		t.Fatal("removeDescription re-armed reconnectOnNewParticipant while feature disabled")
+	}
+
+	s.SetReconnectOnNewParticipant(true)
+	s.reconnectOnNewParticipant.Store(false)
+
+	s.handleCommonMessages(map[string]any{"removeDescription": map[string]any{
+		"descriptionId": []any{"leaving-participant"},
+	}}, "")
+
+	if !s.reconnectOnNewParticipant.Load() {
+		t.Fatal("removeDescription did not re-arm reconnectOnNewParticipant")
+	}
+
+	s.reconnectOnNewParticipant.Store(false)
+	s.closed.Store(true)
+	s.handleCommonMessages(map[string]any{"removeDescription": map[string]any{
+		"descriptionId": []any{"leaving-participant"},
+	}}, "")
+
+	if s.reconnectOnNewParticipant.Load() {
+		t.Fatal("removeDescription re-armed reconnectOnNewParticipant after session closed")
+	}
+}

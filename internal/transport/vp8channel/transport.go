@@ -486,8 +486,8 @@ func (p *streamTransport) SetOnReconnecting(cb func()) {
 	p.stream.SetOnReconnecting(cb)
 }
 
-// SignalHandshakeComplete closes the deferred reconnect channel, unblocking the
-// reconnectOnNewParticipant goroutine which will trigger the reconnect after a delay.
+// SignalHandshakeComplete closes the deferred reconnect channel once upper
+// layers have proved the control path is alive.
 func (p *streamTransport) SignalHandshakeComplete() {
 	p.stream.SignalHandshakeComplete()
 }
@@ -788,8 +788,29 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		return
 	}
 	if p.peerConfirmed.Load() && peerEpoch != p.peerEpoch.Load() {
-		logger.Debugf("vp8channel: handleIncomingFrame: dropping frame epoch=0x%08x (confirmed epoch=0x%08x)", peerEpoch, p.peerEpoch.Load())
-		return
+		// A peer epoch change after confirmation means the remote client
+		// restarted (e.g. retry after handshake timeout). Accept the new epoch
+		// by resetting peerConfirmed and restarting KCP without changing localEpoch.
+		// Without this, all frames from the restarted client are silently dropped
+		// and the retry always fails with a handshake timeout.
+		// We reset peerConfirmed but do NOT call restartKCP (which would rotate
+		// localEpoch and trigger a reconnect cascade on the remote side).
+		logger.Infof("vp8channel: handleIncomingFrame: peer epoch changed 0x%08x→0x%08x, resetting confirmation", p.peerEpoch.Load(), peerEpoch)
+		p.peerConfirmed.Store(false)
+		p.drainOutbound()
+		p.kcpMu.Lock()
+		old := p.kcp
+		p.kcp = nil
+		p.kcpMu.Unlock()
+		if old != nil {
+			old.close()
+		}
+		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+		if err == nil {
+			p.kcpMu.Lock()
+			p.kcp = rt
+			p.kcpMu.Unlock()
+		}
 	}
 	p.peerEpoch.Store(peerEpoch)
 	logger.Debugf("vp8channel: handleIncomingFrame: delivering %d bytes KCP payload epoch=0x%08x confirmed=%v", len(kcpPayload), peerEpoch, p.peerConfirmed.Load())

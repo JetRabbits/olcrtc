@@ -33,6 +33,7 @@ const (
 	socksCommandUDPAssociate = 3
 	udpDialCommand           = "udp-dial"
 	maxUDPPacketSize         = 65535
+	socksSessionWait         = 3 * time.Second
 )
 
 var (
@@ -646,9 +647,7 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	c.sessMu.RLock()
-	sess := c.session
-	c.sessMu.RUnlock()
+	sess := c.waitForActiveSession(ctx, socksSessionWait)
 	if sess == nil || sess.IsClosed() {
 		_, _ = conn.Write(replyHostUnreachable())
 		return
@@ -659,6 +658,30 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		c.tunnel(conn, sess, req.addr, req.port)
 	case socksCommandUDPAssociate:
 		c.udpAssociate(ctx, conn, sess)
+	}
+}
+
+func (c *Client) waitForActiveSession(ctx context.Context, timeout time.Duration) *smux.Session {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		c.sessMu.RLock()
+		sess := c.session
+		c.sessMu.RUnlock()
+		if sess != nil && !sess.IsClosed() {
+			return sess
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-deadline.C:
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 

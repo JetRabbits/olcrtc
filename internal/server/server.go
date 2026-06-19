@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -94,6 +95,7 @@ type Server struct {
 	done                    chan struct{}
 	doneOnce                sync.Once
 	signalHandshakeComplete func()
+	sessionOpenedAt         atomic.Pointer[time.Time]
 }
 
 // peerStat holds the per-session info needed to report the live peer count
@@ -326,10 +328,11 @@ func (s *Server) bringUpLink(
 }
 
 // setupEngineCallbacks configures engine-level hooks for goolom reconnect
-// coordination. The goolom session's reconnectOnNewParticipant defers the
-// reconnect until after the client handshake completes (signaled by
-// SignalHandshakeComplete). The OnReconnecting callback closes the smux
-// session proactively before goolom tears down its WebRTC peers.
+// coordination. The goolom session's reconnectOnNewParticipant defers a
+// repair reconnect until the client proves the reverse path is alive
+// (SignalHandshakeComplete is called from the first CONTROL_PONG). The
+// OnReconnecting callback closes the smux session proactively before goolom
+// tears down its WebRTC peers.
 func (s *Server) setupEngineCallbacks(ctx context.Context, cfg Config, cancel context.CancelFunc) {
 	if s.ln == nil {
 		return
@@ -666,12 +669,14 @@ func (s *Server) handleAcceptError(ctx context.Context, sess *smux.Session) bool
 	if contextDone(ctx) {
 		return true
 	}
-	hadSession := s.handshakeReady()
 	logger.Debugf("AcceptStream returned error - reinstalling session")
 	s.reinstallSession(sess)
-	if hadSession && s.ln != nil {
-		s.ln.Reconnect("liveness")
-	}
+	// Do NOT trigger carrier reconnect here. The smux session can close for
+	// many benign reasons: the deferred reconnect closed it intentionally,
+	// a client disconnected cleanly, or the session timed out waiting for
+	// a new client. Triggering a carrier reconnect on every AcceptStream
+	// error causes a Telemost ICE rebuild on each client reconnect, which
+	// breaks MID binding and forces clients to wait for a new SDP exchange.
 	return false
 }
 
@@ -737,18 +742,13 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 		s.deviceID = hello.DeviceID
 		s.sessionID = sid
 		s.sessMu.Unlock()
+		now := time.Now()
+		s.sessionOpenedAt.Store(&now)
 		s.recordSession(sid)
 		s.onOpen(sid, hello.DeviceID, hello.Claims)
 		s.trackPeerOpen(sid, hello.DeviceID)
 		logger.Infof("session %s opened (device=%s)", sid, hello.DeviceID)
 		s.startControlLoop(ctx, sess, stream)
-		// Signal that the client handshake completed. The goolom engine's
-		// reconnectOnNewParticipant goroutine waits on this signal before
-		// triggering the reconnect, ensuring the client has time to connect
-		// and WireGuard has time to establish before the tunnel is broken.
-		if s.signalHandshakeComplete != nil {
-			s.signalHandshakeComplete()
-		}
 		return true
 	}
 	return false
@@ -840,6 +840,13 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 		sid := s.sessionID
 		s.sessMu.RUnlock()
 		s.recordPong(h)
+		// A server-side handshake only proves that SERVER_WELCOME was written.
+		// The first CONTROL_PONG proves the Android client received the welcome
+		// and can send data back on the same control stream. Use that stronger
+		// signal to suppress reconnect-on-new-participant repair reconnects.
+		if s.signalHandshakeComplete != nil {
+			s.signalHandshakeComplete()
+		}
 		logger.Debugf("control alive session=%s rtt=%v seq=%d", sid, h.RTT, h.Seq)
 		if onPong != nil {
 			onPong(h)
@@ -875,12 +882,20 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 		logger.Infof("server reconnect reason=liveness - reinstalling smux session")
 		s.resetLinkPeer()
 		s.reinstallSession(sess)
-		// Tell the carrier to rebuild itself too. Without this the SFU side
-		// keeps its dead PC around and the client's reconnect handshakes
-		// keep landing in the void until the carrier eventually notices on
-		// its own (which observationally takes ~40s on a Telemost room).
-		if s.ln != nil {
-			s.ln.Reconnect("liveness")
+		// Only tell the carrier to rebuild if the session was stable for a
+		// while. If the session just opened (< 120s ago), the client may be
+		// blocked on the Android VPN consent dialog. In that case the client
+		// will reconnect on its own after the dialog is dismissed, and we
+		// should keep the Telemost channel alive so it can do so without
+		// waiting for a full ICE/WebRTC renegotiation.
+		const carrierReconnectGrace = 120 * time.Second
+		if openedAt := s.sessionOpenedAt.Load(); openedAt == nil || time.Since(*openedAt) >= carrierReconnectGrace {
+			if s.ln != nil {
+				logger.Infof("server liveness: triggering carrier reconnect (session age >= %s)", carrierReconnectGrace)
+				s.ln.Reconnect("liveness")
+			}
+		} else {
+			logger.Infof("server liveness: skipping carrier reconnect (session age = %s < %s)", time.Since(*openedAt).Round(time.Second), carrierReconnectGrace)
 		}
 	}()
 }

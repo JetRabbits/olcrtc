@@ -134,12 +134,13 @@ type Session struct {
 	// Without this, Telemost's initial MID binding fails permanently when the
 	// publisher was already in the room before the subscriber connected.
 	// Uses CompareAndSwap to ensure only ONE reconnect per session lifetime.
-	reconnectOnNewParticipant atomic.Bool
+	reconnectOnNewParticipantEnabled atomic.Bool
+	reconnectOnNewParticipant        atomic.Bool
 
-	// deferredReconnectCh is closed by the server after the client handshake
-	// completes, triggering the reconnectOnNewParticipant reconnect with a
-	// delay. This ensures the client has time to connect and WireGuard has
-	// time to establish before the tunnel is briefly broken.
+	// deferredReconnectCh is closed by the server after the first control pong,
+	// proving the client received SERVER_WELCOME and the reverse VP8/KCP path is
+	// alive. reconnectOnNewParticipant uses this to avoid repair reconnects while
+	// the client is actually live.
 	deferredReconnectCh chan struct{}
 
 	// skipCredentialRefresh tells reconnect() to skip the s.refresh(ctx) call
@@ -156,10 +157,8 @@ type Session struct {
 	skipMediaReady atomic.Bool
 
 	// lastHandshakeAt is set to the current time (Unix ns) when
-	// SignalHandshakeComplete is called. checkNewParticipant uses this to
-	// suppress additional deferred reconnects for 60s after a client
-	// handshake, ensuring WireGuard has time to establish before the
-	// tunnel is briefly broken again.
+	// SignalHandshakeComplete is called. In the OLCRTC server this is now the
+	// first control-pong time, not merely the SERVER_WELCOME write time.
 	lastHandshakeAt atomic.Int64
 
 	videoTrackMu    sync.RWMutex
@@ -290,6 +289,7 @@ func (s *Session) SetShouldReconnect(fn func() bool) { s.shouldReconnect = fn }
 // participant with video joins. Used by the OLCRTC server to ensure Telemost
 // provides fresh SDP exchanges with proper MID binding.
 func (s *Session) SetReconnectOnNewParticipant(v bool) {
+	s.reconnectOnNewParticipantEnabled.Store(v)
 	s.reconnectOnNewParticipant.Store(v)
 }
 
@@ -304,10 +304,9 @@ func (s *Session) SetOnReconnecting(cb func()) {
 }
 
 // SignalHandshakeComplete closes the deferredReconnectCh, unblocking the
-// reconnectOnNewParticipant goroutine which will trigger the reconnect after
-// a delay. The OLCRTC server calls this after the client's control handshake
-// completes. Also records the handshake timestamp to suppress follow-up
-// deferred reconnects for 60s while WireGuard establishes.
+// reconnectOnNewParticipant goroutine. The OLCRTC server calls this after the
+// first CONTROL_PONG, which proves SERVER_WELCOME reached the client and the
+// control stream is usable in both directions.
 func (s *Session) SignalHandshakeComplete() {
 	s.lastHandshakeAt.Store(time.Now().UnixNano())
 	closeSignal(s.deferredReconnectCh)

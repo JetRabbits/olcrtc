@@ -155,6 +155,7 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if payload, ok := msg["removeDescription"]; ok {
 		s.logSignalSummary("removeDescription", payload, 4)
 		s.sendAck(uid)
+		s.rearmReconnectOnParticipantLeave()
 	}
 	if payload, ok := msg["slotsConfig"]; ok {
 		s.logSignalSummary("slotsConfig", payload, 6)
@@ -363,19 +364,19 @@ func isEndedState(state string) bool {
 // Only triggers ONCE per session lifetime to avoid infinite reconnect loops
 // (each reconnect creates new participant IDs in Telemost).
 //
-// The reconnect is deferred until after the client's control handshake completes
-// (signaled by deferredReconnectCh being closed), plus an additional 5s delay
-// to allow WireGuard to establish its handshake over the tunnel before the
-// tunnel is briefly broken during the reconnect.
+// The repair reconnect is skipped only after the client proves the reverse path
+// is alive (the server receives a CONTROL_PONG and closes deferredReconnectCh).
+// If no proof arrives quickly, the server reconnects so the still-waiting
+// Android subscriber can receive a fresh Telemost SDP/MID binding.
 //
-// If a handshake completed within the last 75s, the reconnect is suppressed
-// entirely: the client is likely actively using WireGuard and reconnecting
-// would kill in-flight UDP streams.
+// If a control pong was seen within the last 75s, the reconnect is suppressed:
+// the client is likely actively using WireGuard and reconnecting would kill
+// in-flight UDP streams.
 func (s *Session) checkNewParticipant(payload any) {
 	if !s.reconnectOnNewParticipant.CompareAndSwap(true, false) {
 		return // already triggered once
 	}
-	// Suppress reconnect if a client handshake was recent — WireGuard may
+	// Suppress reconnect if a client control pong was recent — WireGuard may
 	// still be establishing and a reconnect would kill its UDP streams.
 	const handshakeProtectWindow = 75 * time.Second
 	if ts := s.lastHandshakeAt.Load(); ts != 0 {
@@ -410,27 +411,24 @@ func (s *Session) checkNewParticipant(payload any) {
 		}
 		sendVideo, _ := entry["sendVideo"].(bool)
 		if sendVideo {
-			logger.Infof("goolom: new video participant detected, deferring reconnect until client handshake completes")
+			logger.Infof("goolom: new video participant detected, waiting for control-path proof before repair reconnect")
 			s.skipCredentialRefresh.Store(true)
 			s.skipMediaReady.Store(true)
 			go func() {
-				// Wait for the client's control handshake to complete before
-				// triggering the reconnect. This ensures the client has time
-				// to connect and establish WireGuard before the tunnel is
-				// briefly broken.
+				// Wait for proof that the client's control path is alive.
+				// - If the first CONTROL_PONG arrives: SERVER_WELCOME reached Android,
+				//   so do NOT reconnect. Reconnecting here would break WireGuard.
+				// - If no proof arrives within 5s: mid="" (Telemost MID binding
+				//   is likely broken). Reconnect so this/next retry gets proper binding.
 				select {
 				case <-s.deferredReconnectCh:
-					// Client handshake completed, wait for WireGuard to establish.
-					// 30s is needed because:
-					//   - VPN permission dialog may take up to 30s to accept
-					//   - VPN service setup (TUN fd handoff) takes 2-40s
-					//   - WireGuard AmneziaWG sends Jc=12 junk packets before
-					//     the real HandshakeInitiation (~163 bytes)
-					//   - HandshakeInitiation + Response takes 1-5 round trips
-					logger.Infof("goolom: client handshake complete, waiting 30s for WireGuard before reconnect")
-					time.Sleep(30 * time.Second)
-				case <-time.After(30 * time.Second):
-					logger.Warnf("goolom: deferred reconnect timeout (client may not have connected)")
+					logger.Infof("goolom: control path alive, skipping deferred reconnect")
+					return // Do NOT reconnect — client is live, WireGuard is establishing
+				case <-time.After(5 * time.Second):
+					// Client did not prove control liveness within 5s — likely the
+					// Telemost MID binding is empty (mid=""). Reconnect immediately
+					// so the waiting client or next retry gets proper MID binding.
+					logger.Infof("goolom: deferred reconnect timeout (no control pong in 5s — reconnecting for MID binding)")
 				case <-s.closeCh:
 					return
 				}
@@ -443,4 +441,20 @@ func (s *Session) checkNewParticipant(payload any) {
 		}
 	}
 	s.reconnectOnNewParticipant.Store(true) // no video participant found, restore flag
+}
+
+func (s *Session) rearmReconnectOnParticipantLeave() {
+	if s.closed.Load() || !s.reconnectOnNewParticipantEnabled.Load() {
+		return
+	}
+	// The one-shot flag is intentionally consumed by checkNewParticipant so an
+	// active client cannot be disrupted by repeated Telemost upserts. Once a
+	// participant leaves, re-arm it for the next Android join even if the engine
+	// is currently reconnecting. removeDescription commonly arrives during the
+	// reconnect/error cleanup window; skipping it there leaves the long-lived
+	// server permanently disarmed and every later client again sees the server
+	// publisher as pre-existing (mid="" / UNSPECIFIED).
+	if !s.reconnectOnNewParticipant.Swap(true) {
+		logger.Infof("goolom: participant removed, re-arming reconnect-on-new-participant for next join")
+	}
 }

@@ -214,6 +214,16 @@ func (s *state) enqueuePong(ctx context.Context, ping Message) error {
 }
 
 func (s *state) probeLoop(ctx context.Context) error {
+	// Send the first probe immediately instead of waiting one full interval.
+	// For OLCRTC over Telemost this is more than a liveness optimization: the
+	// server uses the first CONTROL_PONG as proof that SERVER_WELCOME actually
+	// reached the Android client over the reverse VP8/KCP path. Waiting 10s for
+	// the first probe leaves too little time to repair a missing MID binding
+	// before the client's handshake timeout expires.
+	if err := s.sendProbe(ctx); err != nil {
+		return err
+	}
+
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
 
