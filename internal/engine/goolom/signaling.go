@@ -414,6 +414,13 @@ func (s *Session) checkNewParticipant(payload any) {
 			logger.Infof("goolom: new video participant detected, waiting for control-path proof before repair reconnect")
 			s.skipCredentialRefresh.Store(true)
 			s.skipMediaReady.Store(true)
+			// Reset the deferred channel so this goroutine waits for a NEW
+			// CONTROL_PONG from the CURRENT client, not an old one.
+			// The previous channel may already be closed (from the last session).
+			s.sessionMu.Lock()
+			s.deferredReconnectCh = make(chan struct{})
+			deferredCh := s.deferredReconnectCh
+			s.sessionMu.Unlock()
 			go func() {
 				// Wait for proof that the client's control path is alive.
 				// - If the first CONTROL_PONG arrives: SERVER_WELCOME reached Android,
@@ -421,7 +428,7 @@ func (s *Session) checkNewParticipant(payload any) {
 				// - If no proof arrives within 5s: mid="" (Telemost MID binding
 				//   is likely broken). Reconnect so this/next retry gets proper binding.
 				select {
-				case <-s.deferredReconnectCh:
+				case <-deferredCh:
 					logger.Infof("goolom: control path alive, skipping deferred reconnect")
 					return // Do NOT reconnect — client is live, WireGuard is establishing
 				case <-time.After(5 * time.Second):

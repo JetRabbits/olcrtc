@@ -309,7 +309,10 @@ func (s *Session) SetOnReconnecting(cb func()) {
 // control stream is usable in both directions.
 func (s *Session) SignalHandshakeComplete() {
 	s.lastHandshakeAt.Store(time.Now().UnixNano())
-	closeSignal(s.deferredReconnectCh)
+	s.sessionMu.Lock()
+	ch := s.deferredReconnectCh
+	s.sessionMu.Unlock()
+	closeSignal(ch)
 }
 
 // CanSend checks if data can be sent.
