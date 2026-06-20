@@ -425,17 +425,22 @@ func (s *Session) checkNewParticipant(payload any) {
 				// Wait for proof that the client's control path is alive.
 				// - If the first CONTROL_PONG arrives: SERVER_WELCOME reached Android,
 				//   so do NOT reconnect. Reconnecting here would break WireGuard.
-				// - If no proof arrives within 5s: mid="" (Telemost MID binding
+				// - If no proof arrives within 20s: mid="" (Telemost MID binding
 				//   is likely broken). Reconnect so this/next retry gets proper binding.
+				// 20s gives the client enough time for: SDP exchange (~2s) + ICE
+				// connection (~3s) + smux handshake (~1s) + SERVER_WELCOME delivery
+				// + first CONTROL_PING/CONTROL_PONG round-trip (~2s) + SignalHandshakeComplete
+				// closing deferredReconnectCh. Total ~10-12s worst case, so 20s
+				// provides sufficient headroom without excessive delay.
 				select {
 				case <-deferredCh:
 					logger.Infof("goolom: control path alive, skipping deferred reconnect")
 					return // Do NOT reconnect — client is live, WireGuard is establishing
-				case <-time.After(5 * time.Second):
-					// Client did not prove control liveness within 5s — likely the
+				case <-time.After(20 * time.Second):
+					// Client did not prove control liveness within 20s — likely the
 					// Telemost MID binding is empty (mid=""). Reconnect immediately
 					// so the waiting client or next retry gets proper MID binding.
-					logger.Infof("goolom: deferred reconnect timeout (no control pong in 5s — reconnecting for MID binding)")
+					logger.Infof("goolom: deferred reconnect timeout (no control pong in 20s — reconnecting for MID binding)")
 				case <-s.closeCh:
 					return
 				}

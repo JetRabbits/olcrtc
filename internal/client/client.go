@@ -685,6 +685,15 @@ func (c *Client) waitForActiveSession(ctx context.Context, timeout time.Duration
 	}
 }
 
+func (c *Client) currentActiveSession() *smux.Session {
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	if c.session == nil || c.session.IsClosed() {
+		return nil
+	}
+	return c.session
+}
+
 func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
 	stream, err := sess.OpenStream()
 	if err != nil {
@@ -773,11 +782,13 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 	var (
 		streamMu      sync.Mutex
 		stream        *smux.Stream
+		streamSess    *smux.Session
 		targetAddr    string
 		targetPort    int
 		udpClientMu   sync.RWMutex
 		udpClientAddr *net.UDPAddr
 	)
+	streamSess = sess
 
 	closeStream := func() {
 		streamMu.Lock()
@@ -828,14 +839,27 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		udpClientMu.Unlock()
 
 		streamMu.Lock()
-		if stream == nil || targetAddr != datagram.addr || targetPort != datagram.port {
+		activeSess := c.currentActiveSession()
+		if activeSess == nil {
+			activeSess = c.waitForActiveSession(ctx, socksSessionWait)
+		}
+		needsNewStream := stream == nil || targetAddr != datagram.addr || targetPort != datagram.port || streamSess != activeSess
+		if needsNewStream {
 			if stream != nil {
 				_ = stream.Close()
+				stream = nil
 			}
-			stream, err = sess.OpenStream()
+			streamSess = activeSess
+			if streamSess == nil || streamSess.IsClosed() {
+				logger.Debugf("UDP ASSOCIATE no active smux session for target %s:%d", datagram.addr, datagram.port)
+				err = ErrRemoteNotReady
+			} else {
+				stream, err = streamSess.OpenStream()
+			}
 			if err == nil {
 				targetAddr = datagram.addr
 				targetPort = datagram.port
+				logger.Infof("UDP ASSOCIATE opening stream sid=%d target=%s:%d payload=%d bytes", stream.ID(), targetAddr, targetPort, len(datagram.payload))
 				err = c.sendUDPDialRequest(stream, targetAddr, targetPort)
 			}
 			if err == nil {

@@ -372,6 +372,14 @@ func (s *Server) installSession() {
 }
 
 func (s *Server) handleReconnect() {
+	const carrierReconnectSessionGrace = 30 * time.Second
+	if openedAt := s.sessionOpenedAt.Load(); openedAt != nil {
+		age := time.Since(*openedAt)
+		if age < carrierReconnectSessionGrace {
+			logger.Infof("server reconnect reason=carrier - skipping smux reinstall (session age = %s < %s)", age.Round(time.Second), carrierReconnectSessionGrace)
+			return
+		}
+	}
 	s.recordReconnect()
 	logger.Infof("server reconnect reason=carrier - tearing down smux session")
 	s.sessMu.RLock()
@@ -695,6 +703,21 @@ func contextDone(ctx context.Context) bool {
 	}
 }
 
+func isBenignWelcomeWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "send welcome") && isPeerConsumedMoreThanSent(err)
+}
+
+func isPeerConsumedMoreThanSent(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "peer consumed more than sent")
+}
+
 // handshakeReady reports whether the current session has completed its
 // handshake. The session is reset on reconnect, so this is recomputed.
 func (s *Server) handshakeReady() bool {
@@ -728,15 +751,24 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 		hello, sid, err := handshake.Server(stream, s.authHook)
 		_ = stream.SetDeadline(time.Time{})
 		if err != nil {
-			_ = stream.Close()
-			if errors.Is(err, framing.ErrFrameTooLarge) && retry < maxStaleRetries {
-				logger.Debugf("handshake: discarding stale stream (attempt %d): %v", retry+1, err)
-				continue
+			if sid == "" || !isBenignWelcomeWriteError(err) {
+				_ = stream.Close()
+				if errors.Is(err, framing.ErrFrameTooLarge) && retry < maxStaleRetries {
+					logger.Debugf("handshake: discarding stale stream (attempt %d): %v", retry+1, err)
+					continue
+				}
+				logger.Warnf("handshake failed: %v", err)
+				s.resetLinkPeer()
+				s.reinstallSession(sess)
+				return false
 			}
-			logger.Warnf("handshake failed: %v", err)
-			s.resetLinkPeer()
-			s.reinstallSession(sess)
-			return false
+			// smux can report "peer consumed more than sent" after the welcome
+			// frame was already delivered to the client. Treat this specific
+			// post-write error as a soft success and let the immediate control
+			// ping/pong prove whether the reverse path is actually alive. If the
+			// client did not receive SERVER_WELCOME, no CONTROL_PONG will arrive
+			// and the normal liveness/deferred-reconnect path will repair it.
+			logger.Warnf("handshake welcome write returned benign smux error; proceeding: %v", err)
 		}
 		s.sessMu.Lock()
 		s.deviceID = hello.DeviceID
@@ -877,6 +909,10 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 		}
 		if err != nil {
 			logger.Warnf("server control stream ended: %v", err)
+		}
+		if isPeerConsumedMoreThanSent(err) {
+			logger.Warnf("server control stream ended with benign smux write accounting error; keeping smux session for data streams")
+			return
 		}
 		s.recordReconnect()
 		logger.Infof("server reconnect reason=liveness - reinstalling smux session")
@@ -1112,6 +1148,7 @@ func (s *Server) dispatchUDPDial(stream *smux.Stream, req ConnectRequest, initia
 	if len(initial) > 0 {
 		reader = io.MultiReader(bytes.NewReader(initial), stream)
 	}
+	var packetsIn uint64
 	for {
 		packet, err := framing.ReadBytes(reader, maxUDPPacketSize)
 		if err != nil {
@@ -1123,6 +1160,10 @@ func (s *Server) dispatchUDPDial(stream *smux.Stream, req ConnectRequest, initia
 		if len(packet) == 0 {
 			continue
 		}
+		packetsIn++
+		if packetsIn <= 10 || packetsIn%100 == 0 {
+			logger.Infof("sid=%d udp-dial recv #%d len=%d -> %s", stream.ID(), packetsIn, len(packet), addr)
+		}
 		if _, err := conn.Write(packet); err != nil {
 			logger.Debugf("sid=%d udp-dial write failed: %v", stream.ID(), err)
 			return
@@ -1132,10 +1173,15 @@ func (s *Server) dispatchUDPDial(stream *smux.Stream, req ConnectRequest, initia
 
 func (s *Server) frameUDPReplies(stream *smux.Stream, conn net.Conn) {
 	buf := make([]byte, maxUDPPacketSize)
+	var packetsOut uint64
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
+		}
+		packetsOut++
+		if packetsOut <= 10 || packetsOut%100 == 0 {
+			logger.Infof("sid=%d udp-dial reply #%d len=%d", stream.ID(), packetsOut, n)
 		}
 		if err := framing.WriteBytes(stream, buf[:n], maxUDPPacketSize); err != nil {
 			_ = stream.Close()
