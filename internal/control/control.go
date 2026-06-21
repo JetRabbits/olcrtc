@@ -214,12 +214,23 @@ func (s *state) enqueuePong(ctx context.Context, ping Message) error {
 }
 
 func (s *state) probeLoop(ctx context.Context) error {
-	// Send the first probe immediately instead of waiting one full interval.
-	// For OLCRTC over Telemost this is more than a liveness optimization: the
-	// server uses the first CONTROL_PONG as proof that SERVER_WELCOME actually
-	// reached the Android client over the reverse VP8/KCP path. Waiting 10s for
-	// the first probe leaves too little time to repair a missing MID binding
-	// before the client's handshake timeout expires.
+	// Delay the first probe to let the client's control readLoop start.
+	// After handshake.Server() returns, the server spawns control.Run() which
+	// immediately starts probeLoop. However, the client may still be:
+	// - Parsing SERVER_WELCOME (handshake.Client)
+	// - Starting its own control.Run() goroutine
+	// - Initializing the readLoop
+	// If the PING arrives before the client's readLoop is ready, the bytes
+	// sit buffered in the smux/KCP/VP8 pipeline. Under congestion this can
+	// cause the PING to be delayed beyond the deferred reconnect window.
+	// A 500ms delay is enough for the client goroutine to start without
+	// meaningfully impacting the 20s deferred reconnect budget.
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("probe loop canceled: %w", ctx.Err())
+	case <-time.After(500 * time.Millisecond):
+	}
+
 	if err := s.sendProbe(ctx); err != nil {
 		return err
 	}
