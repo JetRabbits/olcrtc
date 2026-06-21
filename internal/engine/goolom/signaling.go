@@ -409,6 +409,9 @@ func (s *Session) checkNewParticipant(payload any) {
 		if _, hasDisconnectedAt := entry["disconnectedAt"]; hasDisconnectedAt {
 			continue
 		}
+		if s.isOwnDescription(entry) {
+			continue
+		}
 		sendVideo, _ := entry["sendVideo"].(bool)
 		if sendVideo {
 			logger.Infof("goolom: new video participant detected, waiting for control-path proof before repair reconnect")
@@ -453,6 +456,28 @@ func (s *Session) checkNewParticipant(payload any) {
 		}
 	}
 	s.reconnectOnNewParticipant.Store(true) // no video participant found, restore flag
+}
+
+func (s *Session) isOwnDescription(entry map[string]any) bool {
+	if id, _ := entry["id"].(string); id != "" && id == s.peerID {
+		return true
+	}
+	if hasName(entry["meta"], s.name) || hasName(entry["participantAttributes"], s.name) {
+		return true
+	}
+	return false
+}
+
+func hasName(raw any, name string) bool {
+	if name == "" {
+		return false
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	got, _ := m[keyName].(string)
+	return got == name
 }
 
 func (s *Session) rearmReconnectOnParticipantLeave() {

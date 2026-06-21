@@ -49,15 +49,15 @@ func TestSetupCipherRejectsBadInput(t *testing.T) {
 }
 
 func TestSmuxConfig(t *testing.T) {
-	cfg := smuxConfig(0)
+	cfg := runtime.SmuxConfig(0)
 	if cfg.Version != 2 || cfg.KeepAliveDisabled || cfg.MaxFrameSize != 32768 ||
 		cfg.MaxReceiveBuffer != 8*1024*1024 || cfg.MaxStreamBuffer != 512*1024 {
-		t.Fatalf("smuxConfig(0) = %+v", cfg)
+		t.Fatalf("runtime.SmuxConfig(0) = %+v", cfg)
 	}
-	capped := smuxConfig(4096)
+	capped := runtime.SmuxConfig(4096)
 	want := 4096 - runtime.SmuxWireOverhead
 	if capped.MaxFrameSize != want {
-		t.Fatalf("smuxConfig(4096).MaxFrameSize = %d, want %d",
+		t.Fatalf("runtime.SmuxConfig(4096).MaxFrameSize = %d, want %d",
 			capped.MaxFrameSize, want)
 	}
 }
@@ -365,12 +365,12 @@ func TestHandleStreamDispatchAfterConnect(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig(0))
+	serverSess, err := smux.Server(a, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig(0))
+	clientSess, err := smux.Client(b, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -433,12 +433,12 @@ func TestHandleStreamUDPDialBridgeRoundTrip(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig(0))
+	serverSess, err := smux.Server(a, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig(0))
+	clientSess, err := smux.Client(b, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -527,12 +527,12 @@ func TestStartControlLoopReportsPong(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig(0))
+	serverSess, err := smux.Server(a, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig(0))
+	clientSess, err := smux.Client(b, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -607,11 +607,11 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig(0))
+	serverSess, err := smux.Server(a, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
-	clientSess, err := smux.Client(b, smuxConfig(0))
+	clientSess, err := smux.Client(b, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -711,12 +711,12 @@ func TestDispatchFiresOnTraffic(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig(0))
+	serverSess, err := smux.Server(a, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig(0))
+	clientSess, err := smux.Client(b, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -804,7 +804,7 @@ func TestReinstallSessionClosesOldConnBeforeSwap(t *testing.T) {
 	}
 	ln := &serverLinkStub{}
 	conn := muxconn.New(ln, cipher)
-	sess, err := smux.Server(conn, smuxConfig(0))
+	sess, err := smux.Server(conn, runtime.SmuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}

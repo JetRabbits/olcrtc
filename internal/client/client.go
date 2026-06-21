@@ -62,6 +62,7 @@ var (
 type Client struct {
 	ln          transport.Transport
 	cipher      *crypto.Cipher
+	plaintext   bool
 	conn        *muxconn.Conn
 	session     *smux.Session
 	controlStrm *smux.Stream
@@ -99,6 +100,7 @@ type Config struct {
 	RoomURL          string
 	ChannelID        string
 	KeyHex           string
+	Plaintext        bool // skip AEAD encryption (e.g. when WireGuard already encrypts)
 	LocalAddr        string
 	DNSServer        string
 	SOCKSUser        string
@@ -137,9 +139,13 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cipher, err := setupCipher(cfg.KeyHex)
-	if err != nil {
-		return fmt.Errorf("setupCipher failed: %w", err)
+	var cipher *crypto.Cipher
+	if !cfg.Plaintext {
+		var err error
+		cipher, err = setupCipher(cfg.KeyHex)
+		if err != nil {
+			return fmt.Errorf("setupCipher failed: %w", err)
+		}
 	}
 
 	deviceID, err := resolveDeviceID(cfg.DeviceID, cfg.DeviceIDPath)
@@ -149,6 +155,7 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 
 	c := &Client{
 		cipher:    cipher,
+		plaintext: cfg.Plaintext,
 		deviceID:  deviceID,
 		claims:    cfg.Claims,
 		dnsServer: cfg.DNSServer,
@@ -235,17 +242,84 @@ func (c *Client) bringUpLink(
 		return fmt.Errorf("failed to connect link: %w", err)
 	}
 
-	c.conn = muxconn.New(ln, c.cipher)
-	sess, err := smux.Client(c.conn, smuxConfig(linkMaxPayload(ln)))
+	if err := c.openInitialSession(ctx, cfg, cancel); err != nil {
+		return err
+	}
+
+	go ln.WatchConnection(ctx)
+	return nil
+}
+
+func (c *Client) openInitialSession(ctx context.Context, cfg Config, cancel context.CancelFunc) error {
+	const (
+		startupHandshakeWindow = 80 * time.Second
+		initialDelay           = 300 * time.Millisecond
+		maxDelay               = 5 * time.Second
+	)
+	deadline := time.Now().Add(startupHandshakeWindow)
+	delay := initialDelay
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return fmt.Errorf("handshake: %w", ctx.Err())
+		}
+		if attempt > 1 {
+			logger.Infof("initial handshake retry attempt=%d", attempt)
+		}
+		if err := c.tryOpenInitialSession(ctx, cfg, cancel, attempt); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		c.resetLinkPeer()
+
+		if time.Now().Add(delay).After(deadline) {
+			return fmt.Errorf("handshake: %w", lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("handshake: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
+
+func (c *Client) tryOpenInitialSession(
+	ctx context.Context,
+	cfg Config,
+	cancel context.CancelFunc,
+	attempt int,
+) error {
+	conn := muxconn.New(c.ln, c.cipher)
+
+	c.sessMu.Lock()
+	old := c.conn
+	c.conn = conn
+	c.sessMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+
+	sess, err := smux.Client(conn, c.smuxConfig(linkMaxPayload(c.ln)))
 	if err != nil {
+		_ = conn.Close()
+		logger.Warnf("initial smux init failed (attempt %d): %v", attempt, err)
 		return fmt.Errorf("smux client: %w", err)
 	}
 
-	control, sid, err := openControlStream(ctx, sess, c.deviceID, c.claims)
+	control, sid, err := openControlStreamTimeout(ctx, sess, c.deviceID, c.claims, 3*time.Second)
 	if err != nil {
+		logger.Warnf("initial handshake failed (attempt %d): %v", attempt, err)
 		_ = sess.Close()
-		_ = c.conn.Close()
-		return fmt.Errorf("handshake: %w", err)
+		_ = conn.Close()
+		return fmt.Errorf("open control stream: %w", err)
 	}
 	logger.Infof("session %s opened (device=%s)", sid, c.deviceID)
 
@@ -256,8 +330,6 @@ func (c *Client) bringUpLink(
 	c.sessMu.Unlock()
 	c.recordSession(sid)
 	c.startControlLoop(ctx, cfg, cancel, control)
-
-	go ln.WatchConnection(ctx)
 	return nil
 }
 
@@ -340,12 +412,12 @@ func resolveDeviceID(deviceID, path string) (string, error) {
 	return id, nil
 }
 
-func smuxConfig(maxWirePayload int) *smux.Config {
-	return runtime.SmuxConfig(maxWirePayload)
-}
-
 func linkMaxPayload(tr transport.Transport) int {
 	return runtime.MaxPayload(tr)
+}
+
+func (c *Client) smuxConfig(maxWirePayload int) *smux.Config {
+	return runtime.SmuxConfigEx(maxWirePayload, c.plaintext)
 }
 
 func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
@@ -473,7 +545,7 @@ func (c *Client) tryReopenSession(
 		_ = old.Close()
 	}
 
-	sess, err := smux.Client(conn, smuxConfig(linkMaxPayload(c.ln)))
+	sess, err := smux.Client(conn, c.smuxConfig(linkMaxPayload(c.ln)))
 	if err != nil {
 		logger.Warnf("smux re-init failed (attempt %d): %v", attempt, err)
 		return false

@@ -65,6 +65,23 @@ func NewDialer() *net.Dialer {
 	}
 }
 
+// NewListenConfig returns a net.ListenConfig that calls Protector on sockets it
+// opens. This is required for UDP ICE sockets on Android: Pion creates UDP
+// PacketConns via ListenPacket, not via the proxy dialer path.
+func NewListenConfig() net.ListenConfig {
+	return net.ListenConfig{Control: controlFunc}
+}
+
+// ListenPacket opens a protected PacketConn.
+func ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	listenConfig := NewListenConfig()
+	conn, err := listenConfig.ListenPacket(ctx, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("listen packet failed: %w", err)
+	}
+	return conn, nil
+}
+
 // NewTLSConfig returns the shared TLS policy for provider HTTP/WebSocket clients.
 func NewTLSConfig() *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12}

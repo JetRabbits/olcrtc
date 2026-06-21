@@ -8,6 +8,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
 )
 
 func fakeUDPAddr() *net.UDPAddr {
@@ -109,8 +111,13 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		timerC = t.C
 	}
 
+	start := time.Now()
 	select {
 	case c.out <- buf:
+		elapsed := time.Since(start)
+		if elapsed > 50*time.Millisecond {
+			logger.Infof("vp8channel: kcpConn.WriteTo: %d bytes → outbound (len=%d, dur=%v)", len(buf), len(c.out), elapsed)
+		}
 		return len(p), nil
 	case <-c.closed:
 		return 0, net.ErrClosed

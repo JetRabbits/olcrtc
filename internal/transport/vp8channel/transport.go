@@ -166,17 +166,10 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	}
 	stream := &engineVideoSession{session: session, vt: vt}
 
-	// Enable server-side reconnect on new participant if configured.
-	// This ensures Telemost provides fresh SDP exchanges with proper MID binding
-	// when a new client joins an existing room.
-	if opts.ReconnectOnNewParticipant {
-		type reconnectOnNewParticipantSetter interface {
-			SetReconnectOnNewParticipant(bool)
-		}
-		if rp, ok := session.(reconnectOnNewParticipantSetter); ok {
-			rp.SetReconnectOnNewParticipant(true)
-		}
-	}
+	// Do not arm reconnect-on-new-participant here. The server enables it only
+	// after the initial carrier Connect() succeeds; arming during construction
+	// lets Telemost startup/self description replays trigger premature repair
+	// reconnects before any Android client control path can exist.
 
 	// Stream/track IDs must be unique per peer - Jitsi rejects session-accept
 	// when msid collides with another participant in the conference.
@@ -518,13 +511,26 @@ func (p *streamTransport) WatchConnection(ctx context.Context) {
 
 func (p *streamTransport) CanSend() bool {
 	if p.closed.Load() {
+		logger.Debugf("vp8channel.CanSend=false: transport closed")
 		return false
 	}
 	p.kcpMu.RLock()
 	hasKCP := p.kcp != nil
 	p.kcpMu.RUnlock()
-	return hasKCP && p.stream.CanSend() &&
-		len(p.outbound) < cap(p.outbound)*canSendHighWatermark/100
+	if !hasKCP {
+		logger.Debugf("vp8channel.CanSend=false: kcp=nil")
+		return false
+	}
+	streamOk := p.stream.CanSend()
+	queueLen := len(p.outbound)
+	queueCap := cap(p.outbound)
+	queueOk := queueLen < queueCap*canSendHighWatermark/100
+	if !streamOk || !queueOk {
+		logger.Debugf("vp8channel.CanSend=false: stream=%v queue=%d/%d (cap=%d watermark=%d%%)",
+			streamOk, queueLen, queueCap, queueCap, canSendHighWatermark)
+		return false
+	}
+	return true
 }
 
 // Features advertises reliable+ordered semantics now that KCP guarantees
@@ -547,6 +553,7 @@ func (p *streamTransport) writerLoop() {
 
 	keepaliveEvery := max(int(keepaliveIdlePeriod/p.frameInterval), 1)
 	idleTicks := 0
+	outboundSeq := 0
 
 	for {
 		select {
@@ -554,10 +561,12 @@ func (p *streamTransport) writerLoop() {
 			return
 		case <-ticker.C:
 			var sample []byte
+			isKeepalive := false
 			select {
 			case frame := <-p.outbound:
 				sample = p.batchSample(frame, p.perTickBytes)
 				idleTicks = 0
+				outboundSeq++
 			default:
 				idleTicks++
 				if idleTicks < keepaliveEvery {
@@ -566,8 +575,12 @@ func (p *streamTransport) writerLoop() {
 				idleTicks = 0
 				hdr := p.epochHeader()
 				sample = hdr[:]
+				isKeepalive = true
 			}
 
+			if !isKeepalive {
+				logger.Infof("vp8channel: writerLoop: outbound #%d, %d bytes (outbound_q=%d)", outboundSeq, len(sample), len(p.outbound))
+			}
 			p.writeSample(sample)
 		}
 	}
@@ -580,7 +593,7 @@ func (p *streamTransport) writeSample(sample []byte) {
 		Data:     sample,
 		Duration: p.frameInterval,
 	}); err != nil && !p.closed.Load() {
-		logger.Debugf("vp8channel: write sample failed: %v", err)
+		logger.Warnf("vp8channel: writeSample: track.WriteSample FAILED: %v", err)
 	}
 }
 

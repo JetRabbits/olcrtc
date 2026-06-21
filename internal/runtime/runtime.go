@@ -25,9 +25,14 @@ const (
 	// SmuxWireOverhead is the non-payload overhead added around each smux
 	// frame before it reaches the transport payload limit.
 	SmuxWireOverhead = crypto.WireOverhead + SmuxFrameOverhead
+	// SmuxWireOverheadPlaintext is the overhead when AEAD is disabled
+	// (e.g. WireGuard already encrypts the payload). Only smux header remains.
+	SmuxWireOverheadPlaintext = SmuxFrameOverhead
 	// MinSmuxWirePayload is the smallest useful encrypted transport payload
 	// cap that can still carry a non-empty smux frame.
 	MinSmuxWirePayload = SmuxWireOverhead + 1
+	// MinSmuxWirePayloadPlaintext is the minimum when AEAD is disabled.
+	MinSmuxWirePayloadPlaintext = SmuxWireOverheadPlaintext + 1
 
 	smuxMaxFrameSize     = 32 * 1024
 	smuxMaxReceiveBuffer = 8 * 1024 * 1024
@@ -64,12 +69,29 @@ func SetupCipher(keyHex string) (*crypto.Cipher, error) {
 // constrains the smux payload size so the encrypted whole smux frame fits
 // under the transport's per-message payload cap.
 func SmuxConfig(maxWirePayload int) *smux.Config {
+	return SmuxConfigEx(maxWirePayload, false)
+}
+
+// SmuxConfigEx is like SmuxConfig but accepts a plaintext flag to skip
+// AEAD overhead when the tunnel traffic is already encrypted (e.g. WireGuard).
+func SmuxConfigEx(maxWirePayload int, plaintext bool) *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = smuxMaxFrameSize
-	if maxWirePayload >= MinSmuxWirePayload {
-		maxFrameSize := maxWirePayload - SmuxWireOverhead
+
+	var wireOverhead int
+	var minPayload int
+	if plaintext {
+		wireOverhead = SmuxWireOverheadPlaintext
+		minPayload = MinSmuxWirePayloadPlaintext
+	} else {
+		wireOverhead = SmuxWireOverhead
+		minPayload = MinSmuxWirePayload
+	}
+
+	if maxWirePayload >= minPayload {
+		maxFrameSize := maxWirePayload - wireOverhead
 		if maxFrameSize < cfg.MaxFrameSize {
 			cfg.MaxFrameSize = maxFrameSize
 		}

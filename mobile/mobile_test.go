@@ -142,23 +142,23 @@ func TestNormalizeBuildRoomAndClamp(t *testing.T) {
 func TestStartValidation(t *testing.T) {
 	resetMobileGlobals(t)
 
-	if err := startWithConfig("", dataTransport, testRoomID, "client", "key", 1080, "", "", mobileConfig{}); !errors.Is(err, errCarrierRequired) { //nolint:lll // long test description
+	if err := startWithConfig("", dataTransport, testRoomID, "client", "key", 1080, "", "", mobileConfig{}, false); !errors.Is(err, errCarrierRequired) { //nolint:lll // long test description
 		t.Fatalf("startWithConfig(missing carrier) = %v", err)
 	}
-	if err := startWithConfig("telemost", dataTransport, "", "client", "key", 1080, "", "", mobileConfig{}); !errors.Is(err, errRoomIDRequired) { //nolint:lll // long test description
+	if err := startWithConfig("telemost", dataTransport, "", "client", "key", 1080, "", "", mobileConfig{}, false); !errors.Is(err, errRoomIDRequired) { //nolint:lll // long test description
 		t.Fatalf("startWithConfig(missing room) = %v", err)
 	}
-	if err := startWithConfig("jitsi", dataTransport, testRoomID, "", "key", 1080, "", "", mobileConfig{}); !errors.Is(err, errClientIDRequired) { //nolint:lll // long test description
+	if err := startWithConfig("jitsi", dataTransport, testRoomID, "", "key", 1080, "", "", mobileConfig{}, false); !errors.Is(err, errClientIDRequired) { //nolint:lll // long test description
 		t.Fatalf("startWithConfig(missing client) = %v", err)
 	}
-	if err := startWithConfig("jitsi", dataTransport, testRoomID, "client", "", 1080, "", "", mobileConfig{}); !errors.Is(err, errKeyHexRequired) { //nolint:lll // long test description
+	if err := startWithConfig("jitsi", dataTransport, testRoomID, "client", "", 1080, "", "", mobileConfig{}, false); !errors.Is(err, errKeyHexRequired) { //nolint:lll // long test description
 		t.Fatalf("startWithConfig(missing key) = %v", err)
 	}
 
 	mu.Lock()
 	cancel = func() {}
 	mu.Unlock()
-	if err := startWithConfig("jitsi", dataTransport, testRoomID, "client", "key", 1080, "", "", mobileConfig{}); !errors.Is(err, errAlreadyRunning) { //nolint:lll // long test description
+	if err := startWithConfig("jitsi", dataTransport, testRoomID, "client", "key", 1080, "", "", mobileConfig{}, false); !errors.Is(err, errAlreadyRunning) { //nolint:lll // long test description
 		t.Fatalf("startWithConfig(running) = %v", err)
 	}
 	resetMobileGlobals(t)
@@ -193,7 +193,7 @@ func TestStartWithInjectedRunnerLifecycle(t *testing.T) {
 		return ctx.Err()
 	}
 
-	if err := StartWithTransport("jitsi", "dc", testRoomID, "client", "key", 1080, "", ""); err != nil {
+	if err := StartWithTransport("jitsi", "dc", testRoomID, "client", "key", 1080, "", "", false); err != nil {
 		t.Fatalf("StartWithTransport() error = %v", err)
 	}
 	if !IsRunning() {
@@ -251,7 +251,7 @@ func TestStartUsesDefaultsAndCheckWithInjectedRunner(t *testing.T) {
 		<-ctx.Done()
 		return nil
 	}
-	elapsed, err := Check("jitsi", "dc", testRoomID, "client", "key", 1082, 100, -1, 999)
+	elapsed, err := Check("jitsi", "dc", testRoomID, "client", "key", 1082, 100, -1, 999, false)
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
 	}
@@ -296,7 +296,7 @@ func TestCheckTimeoutAndRunError(t *testing.T) {
 		<-ctx.Done()
 		return nil
 	}
-	if _, err := Check("telemost", defaultTransport, testRoomID, "client", "key", 1083, 1, 30, 1); !errors.Is(err, errStartTimedOut) { //nolint:lll // long test description
+	if _, err := Check("telemost", defaultTransport, testRoomID, "client", "key", 1083, 1, 30, 1, false); !errors.Is(err, errStartTimedOut) { //nolint:lll // long test description
 		t.Fatalf("Check(timeout) error = %v, want %v", err, errStartTimedOut)
 	}
 
@@ -305,7 +305,7 @@ func TestCheckTimeoutAndRunError(t *testing.T) {
 		return want
 	}
 	if _, err := Check(
-		"telemost", defaultTransport, testRoomID, "client", "key", 1084, 100, 30, 1,
+		"telemost", defaultTransport, testRoomID, "client", "key", 1084, 100, 30, 1, false,
 	); !errors.Is(err, want) {
 		t.Fatalf("Check(run error) = %v, want %v", err, want)
 	}

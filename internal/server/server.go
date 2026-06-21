@@ -68,6 +68,7 @@ type Server struct {
 	ln                      transport.Transport
 	peerLn                  transport.PeerTransport
 	cipher                  *crypto.Cipher
+	plaintext               bool
 	conn                    *muxconn.Conn
 	session                 *smux.Session
 	controlStrm             *smux.Stream
@@ -129,6 +130,7 @@ type Config struct {
 	RoomURL          string
 	ChannelID        string
 	KeyHex           string
+	Plaintext        bool // skip AEAD encryption (e.g. when WireGuard already encrypts)
 	DNSServer        string
 	SOCKSProxyAddr   string
 	SOCKSProxyPort   int
@@ -160,9 +162,13 @@ func Run(ctx context.Context, cfg Config) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cipher, err := setupCipher(cfg.KeyHex)
-	if err != nil {
-		return fmt.Errorf("setupCipher failed: %w", err)
+	var cipher *crypto.Cipher
+	if !cfg.Plaintext {
+		var err error
+		cipher, err = setupCipher(cfg.KeyHex)
+		if err != nil {
+			return fmt.Errorf("setupCipher failed: %w", err)
+		}
 	}
 
 	hook := cfg.AuthHook
@@ -183,6 +189,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	s := &Server{
 		cipher:         cipher,
+		plaintext:      cfg.Plaintext,
 		authHook:       hook,
 		onOpen:         onOpen,
 		onClose:        onClose,
@@ -199,6 +206,7 @@ func Run(ctx context.Context, cfg Config) error {
 		done:           make(chan struct{}),
 	}
 	s.setupResolver()
+	logger.Infof("server crypto: plaintext=%v", cfg.Plaintext)
 
 	// Register shutdown BEFORE bringUpLink so a partial setup (e.g.
 	// link.New succeeded but ln.Connect timed out) still tears the
@@ -244,8 +252,8 @@ func (s *Server) setupResolver() {
 	}
 }
 
-func smuxConfig(maxWirePayload int) *smux.Config {
-	return runtime.SmuxConfig(maxWirePayload)
+func (s *Server) smuxConfig(maxWirePayload int) *smux.Config {
+	return runtime.SmuxConfigEx(maxWirePayload, s.plaintext)
 }
 
 func linkMaxPayload(tr transport.Transport) int {
@@ -305,7 +313,11 @@ func (s *Server) bringUpLink(
 		s.handleReconnect()
 	})
 
-	// Wire up engine-level reconnect callbacks for goolom.
+	// Wire up engine-level reconnect callbacks for goolom. Do not arm
+	// reconnect-on-new-participant until after the initial carrier Connect()
+	// succeeds: Telemost can replay existing/self descriptions during startup,
+	// and treating those as a new Android join causes an immediate repair
+	// reconnect loop before any client control path can be proven.
 	s.setupEngineCallbacks(ctx, cfg, cancel)
 
 	logger.Infof("Connecting transport=%s carrier=%s ...", cfg.Transport, cfg.Carrier)
@@ -317,6 +329,7 @@ func (s *Server) bringUpLink(
 		return fmt.Errorf("failed to connect link: %w", err)
 	}
 	logger.Infof("Link connected")
+	s.armReconnectOnNewParticipant()
 	s.logPeersLine()
 
 	s.wg.Add(1)
@@ -339,9 +352,6 @@ func (s *Server) setupEngineCallbacks(ctx context.Context, cfg Config, cancel co
 	}
 	// The engine must be accessible through the transport. Check if the
 	// transport exposes the engine session for callback configuration.
-	if engineCfg, ok := s.ln.(interface{ SetReconnectOnNewParticipant(bool) }); ok {
-		engineCfg.SetReconnectOnNewParticipant(true)
-	}
 	if engineCfg, ok := s.ln.(interface{ SetOnReconnecting(func()) }); ok {
 		engineCfg.SetOnReconnecting(func() {
 			logger.Infof("server: engine reconnecting - closing smux session proactively")
@@ -358,9 +368,16 @@ func (s *Server) setupEngineCallbacks(ctx context.Context, cfg Config, cancel co
 	}
 }
 
+func (s *Server) armReconnectOnNewParticipant() {
+	if engineCfg, ok := s.ln.(interface{ SetReconnectOnNewParticipant(bool) }); ok {
+		logger.Infof("server: arming reconnect-on-new-participant after initial link connect")
+		engineCfg.SetReconnectOnNewParticipant(true)
+	}
+}
+
 func (s *Server) installSession() {
 	conn := muxconn.New(s.ln, s.cipher)
-	sess, err := smux.Server(conn, smuxConfig(linkMaxPayload(s.ln)))
+	sess, err := smux.Server(conn, s.smuxConfig(linkMaxPayload(s.ln)))
 	if err != nil {
 		logger.Warnf("smux server init failed: %v", err)
 		return
@@ -407,7 +424,7 @@ func (s *Server) reinstallSession(dead *smux.Session) {
 
 	// Pre-build the replacement so we can swap atomically below.
 	newConn := muxconn.New(s.ln, s.cipher)
-	newSess, err := smux.Server(newConn, smuxConfig(linkMaxPayload(s.ln)))
+	newSess, err := smux.Server(newConn, s.smuxConfig(linkMaxPayload(s.ln)))
 	if err != nil {
 		logger.Warnf("smux server init failed: %v", err)
 		_ = newConn.Close()
@@ -600,7 +617,7 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 		return ps
 	}
 	conn := muxconn.NewPeer(s.peerLn, s.cipher, peerID)
-	sess, err := smux.Server(conn, smuxConfig(linkMaxPayload(s.ln)))
+	sess, err := smux.Server(conn, s.smuxConfig(linkMaxPayload(s.ln)))
 	if err != nil {
 		s.sessMu.Unlock()
 		logger.Warnf("smux server init failed for peer %s: %v", peerID, err)

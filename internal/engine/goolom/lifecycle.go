@@ -10,6 +10,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -81,7 +82,16 @@ func (s *Session) waitForMediaReady(ctx context.Context, timeout time.Duration) 
 func (s *Session) setupPeerConnections(config webrtc.Configuration) error {
 	settingEngine := webrtc.SettingEngine{}
 	if protect.Protector != nil {
+		s.closeICEUDPMux()
 		settingEngine.SetICEProxyDialer(protect.NewProxyDialer())
+		udpConn, err := protect.ListenPacket(context.Background(), "udp4", "0.0.0.0:0")
+		if err != nil {
+			return fmt.Errorf("create protected ice udp mux: %w", err)
+		}
+		udpMux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: udpConn})
+		s.iceUDPMux = udpMux
+		settingEngine.SetICEUDPMux(udpMux)
+		logger.Infof("goolom: installed protected ICE UDP mux addr=%s", udpConn.LocalAddr())
 	}
 	settingEngine.LoggerFactory = logger.NewPionLoggerFactory()
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
@@ -234,6 +244,7 @@ func (s *Session) Close() error {
 	if s.pcSub != nil {
 		_ = s.pcSub.Close()
 	}
+	s.closeICEUDPMux()
 	if s.ws != nil {
 		s.wsMu.Lock()
 		_ = s.ws.WriteControl(websocket.CloseMessage,
@@ -336,6 +347,7 @@ func (s *Session) reconnect(ctx context.Context) error {
 	if s.pcSub != nil {
 		_ = s.pcSub.Close()
 	}
+	s.closeICEUDPMux()
 	if s.ws != nil {
 		s.wsMu.Lock()
 		_ = s.ws.WriteControl(websocket.CloseMessage,
@@ -372,6 +384,14 @@ func (s *Session) reconnect(ctx context.Context) error {
 	}
 	s.drainReconnectQueue()
 	return nil
+}
+
+func (s *Session) closeICEUDPMux() {
+	if s.iceUDPMux == nil {
+		return
+	}
+	_ = s.iceUDPMux.Close()
+	s.iceUDPMux = nil
 }
 
 func (s *Session) applyRefreshedCredentials(creds engine.Credentials) {

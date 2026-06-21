@@ -68,6 +68,7 @@ func Check(
 		goInt(timeoutMillis),
 		goInt(vp8FPS),
 		goInt(vp8BatchSize),
+		false, // plaintext
 	)
 	if err != nil {
 		return errorResult

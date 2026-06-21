@@ -89,6 +89,10 @@ func releaseFrameBuf(bp *[]byte) {
 // callback) and a single consumer (smux's read loop) communicate via a
 // buffered channel without any cond/mutex ping-pong.
 //
+// When cipher is nil, AEAD is skipped entirely (plaintext passthrough mode).
+// This is used when the tunnel traffic is already encrypted by an outer
+// layer (e.g. WireGuard) and the AEAD overhead is unnecessary.
+//
 // Plaintext buffers are recycled through frameBufPool: Push borrows a
 // buffer to decrypt into, ships it through the channel, and Read returns
 // the buffer to the pool once its caller has consumed all the bytes.
@@ -134,21 +138,46 @@ func NewPeer(ln transport.PeerTransport, cipher *crypto.Cipher, peerID string) *
 	}
 }
 
-// Push hands an encrypted wire payload (one OnData event) to the conn.
+// Push hands a wire payload (one OnData event) to the conn.
+//
+// When cipher is set, the payload is decrypted before delivery.
+// When cipher is nil, the payload is passed through unchanged.
 //
 // On the producer side: borrow a pooled plaintext buffer, decrypt into
-// it, then either deliver via the inbound channel or, if the caller has
-// Close'd, return the buffer to the pool. Blocking forever on a wedged
-// reader would wedge the transport callback and trip its watchdog, so we
-// also bail on closeCh.
-func (c *Conn) Push(ciphertext []byte) {
-	bufPtr := acquireFrameBuf()
-	pt, err := c.cipher.DecryptInto(*bufPtr, ciphertext)
-	if err != nil {
-		releaseFrameBuf(bufPtr)
-		logger.Debugf("muxconn: decrypt failed, dropping frame: %v", err)
+// it (or copy for passthrough), then either deliver via the inbound
+// channel or, if the caller has Close'd, return the buffer to the pool.
+// Blocking forever on a wedged reader would wedge the transport callback
+// and trip its watchdog, so we also bail on closeCh.
+func (c *Conn) Push(data []byte) {
+	var pt []byte
+	if c.cipher != nil {
+		bufPtr := acquireFrameBuf()
+		var err error
+		pt, err = c.cipher.DecryptInto(*bufPtr, data)
+		if err != nil {
+			releaseFrameBuf(bufPtr)
+			logger.Debugf("muxconn: decrypt failed, dropping frame: %v", err)
+			return
+		}
+		*bufPtr = pt
+		if c.closed.Load() {
+			releaseFrameBuf(bufPtr)
+			logger.Debugf("muxconn.Push: %d bytes DROPPED (conn closed)", len(pt))
+			return
+		}
+		logger.Debugf("muxconn.Push: %d bytes → in-chan (len=%d)", len(pt), len(c.in))
+		select {
+		case c.in <- bufPtr:
+		case <-c.closeCh:
+			releaseFrameBuf(bufPtr)
+			logger.Debugf("muxconn.Push: %d bytes DROPPED (closeCh)", len(pt))
+		}
 		return
 	}
+	// Plaintext passthrough — no cipher configured.
+	pt = make([]byte, len(data))
+	copy(pt, data)
+	bufPtr := acquireFrameBuf()
 	*bufPtr = pt
 	if c.closed.Load() {
 		releaseFrameBuf(bufPtr)
@@ -241,8 +270,11 @@ func (c *Conn) recycleIfDrained() {
 	}
 }
 
-// Write encrypts p and ships it to the link as a single message. Blocks while
-// the link signals back-pressure.
+// Write ships p to the link as a single message. Blocks while the link
+// signals back-pressure.
+//
+// When cipher is set, p is AEAD-encrypted before sending.
+// When cipher is nil, p is sent as-is (plaintext passthrough).
 func (c *Conn) Write(p []byte) (int, error) {
 	// Spin briefly first - on a healthy link CanSend usually clears within
 	// well under a millisecond, so a 10ms sleep adds visible per-frame
@@ -252,25 +284,51 @@ func (c *Conn) Write(p []byte) (int, error) {
 		fastSpinAttempts = 16
 		slowPollDelay    = 2 * time.Millisecond
 	)
+	spinStart := time.Now()
+	canSendBlocked := false
 	for attempt := 0; ; attempt++ {
 		if c.closed.Load() {
+			if canSendBlocked {
+				logger.Debugf("muxconn.Write: CanSend spin aborted (conn closed) after %d attempts, %v",
+					attempt, time.Since(spinStart))
+			}
 			return 0, ErrClosed
 		}
 		if c.ln.CanSend() {
+			elapsed := time.Since(spinStart)
+			if elapsed > 100*time.Millisecond {
+				logger.Warnf("muxconn.Write: CanSend cleared after %d attempts, %v (blocked!)", attempt, elapsed)
+			} else if canSendBlocked {
+				logger.Debugf("muxconn.Write: CanSend cleared after %d attempts, %v", attempt, elapsed)
+			}
 			break
+		}
+		if !canSendBlocked {
+			canSendBlocked = true
+			logger.Debugf("muxconn.Write: CanSend=false, entering spin loop")
 		}
 		if attempt < fastSpinAttempts {
 			runtime.Gosched()
 			continue
 		}
+		if attempt == fastSpinAttempts {
+			logger.Warnf("muxconn.Write: CanSend=false, starting slow poll (attempt=%d, elapsed=%v)", attempt, time.Since(spinStart))
+		}
 		time.Sleep(slowPollDelay)
 	}
 
-	enc, err := c.cipher.Encrypt(p)
-	if err != nil {
-		return 0, fmt.Errorf("encrypt: %w", err)
+	if c.cipher != nil {
+		enc, err := c.cipher.Encrypt(p)
+		if err != nil {
+			return 0, fmt.Errorf("encrypt: %w", err)
+		}
+		if err := c.send(enc); err != nil {
+			return 0, fmt.Errorf("send: %w", err)
+		}
+		return len(p), nil
 	}
-	if err := c.send(enc); err != nil {
+	// Plaintext passthrough — no cipher configured.
+	if err := c.send(p); err != nil {
 		return 0, fmt.Errorf("send: %w", err)
 	}
 	return len(p), nil

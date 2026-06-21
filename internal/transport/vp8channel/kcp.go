@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	kcp "github.com/xtaci/kcp-go/v5"
 )
 
@@ -145,12 +146,14 @@ func (r *kcpRuntime) send(msg []byte) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
+	logger.Infof("vp8channel: KCP.send: queuing %d bytes", len(msg))
 	if _, err := r.sess.Write(hdr[:]); err != nil {
 		return fmt.Errorf("kcp write header: %w", err)
 	}
 	if _, err := r.sess.Write(msg); err != nil {
 		return fmt.Errorf("kcp write payload: %w", err)
 	}
+	logger.Infof("vp8channel: KCP.send: flushed %d bytes to UDPSession", len(msg))
 	return nil
 }
 

@@ -240,3 +240,40 @@ func TestCloseMakesReadReturnEOF(t *testing.T) {
 		t.Fatal("Read() did not unblock after Close")
 	}
 }
+
+func TestPlaintextPushAndReadRoundTrip(t *testing.T) {
+	// nil cipher = plaintext passthrough mode
+	conn := New(&stubLink{canSend: true}, nil)
+
+	conn.Push([]byte("hello "))
+	conn.Push([]byte("world"))
+
+	buf := make([]byte, 11)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := string(buf[:n]); got != "hello world" {
+		t.Fatalf("Read() = %q, want %q", got, "hello world")
+	}
+}
+
+func TestPlaintextWritePassthrough(t *testing.T) {
+	ln := &stubLink{canSend: true}
+	conn := New(ln, nil)
+
+	n, err := conn.Write([]byte("payload"))
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if n != len("payload") {
+		t.Fatalf("Write() n = %d, want %d", n, len("payload"))
+	}
+	if len(ln.sent) != 1 {
+		t.Fatalf("sent packets = %d, want 1", len(ln.sent))
+	}
+	// No AEAD overhead — raw bytes sent as-is
+	if !bytes.Equal(ln.sent[0], []byte("payload")) {
+		t.Fatalf("sent = %q, want %q", ln.sent[0], "payload")
+	}
+}

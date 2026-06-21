@@ -182,6 +182,7 @@ type Config struct {
 	RoomID                string
 	ChannelID             string
 	KeyHex                string
+	Plaintext             bool // skip AEAD encryption (e.g. when WireGuard already encrypts)
 	SOCKSHost             string
 	SOCKSPort             int
 	SOCKSUser             string
@@ -384,7 +385,7 @@ func validateCommon(cfg Config) error {
 	if cfg.RoomID == "" && cfg.Auth != authNone {
 		return ErrRoomIDRequired
 	}
-	if cfg.KeyHex == "" {
+	if cfg.KeyHex == "" && !cfg.Plaintext {
 		return ErrKeyRequired
 	}
 	if cfg.DNSServer == "" {
@@ -651,6 +652,7 @@ func runOnce(
 			RoomURL:          roomURL,
 			ChannelID:        cfg.ChannelID,
 			KeyHex:           cfg.KeyHex,
+			Plaintext:        cfg.Plaintext,
 			DNSServer:        cfg.DNSServer,
 			SOCKSProxyAddr:   cfg.SOCKSProxyAddr,
 			SOCKSProxyPort:   cfg.SOCKSProxyPort,
@@ -682,6 +684,7 @@ func runOnce(
 			RoomURL:          roomURL,
 			ChannelID:        cfg.ChannelID,
 			KeyHex:           cfg.KeyHex,
+			Plaintext:        cfg.Plaintext,
 			LocalAddr:        fmt.Sprintf("%s:%d", cfg.SOCKSHost, cfg.SOCKSPort),
 			DNSServer:        cfg.DNSServer,
 			SOCKSUser:        cfg.SOCKSUser,

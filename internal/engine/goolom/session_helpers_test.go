@@ -119,3 +119,52 @@ func TestRemoveDescriptionRearmsReconnectOnNewParticipant(t *testing.T) {
 		t.Fatal("removeDescription re-armed reconnectOnNewParticipant after session closed")
 	}
 }
+
+func TestIsOwnDescription(t *testing.T) {
+	s := &Session{peerID: "server-peer", name: "server-name"}
+
+	tests := []struct {
+		name  string
+		entry map[string]any
+		want  bool
+	}{
+		{
+			name:  "peer id matches",
+			entry: map[string]any{"id": "server-peer"},
+			want:  true,
+		},
+		{
+			name: "meta name matches",
+			entry: map[string]any{
+				"id":   "telemost-description-id",
+				"meta": map[string]any{keyName: "server-name"},
+			},
+			want: true,
+		},
+		{
+			name: "participant attributes name matches",
+			entry: map[string]any{
+				"id":                    "telemost-description-id",
+				"participantAttributes": map[string]any{keyName: "server-name"},
+			},
+			want: true,
+		},
+		{
+			name: "remote participant",
+			entry: map[string]any{
+				"id":        "remote-description-id",
+				"sendVideo": true,
+				"meta":      map[string]any{keyName: "remote-name"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := s.isOwnDescription(tt.entry); got != tt.want {
+				t.Fatalf("isOwnDescription() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

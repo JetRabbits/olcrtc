@@ -189,7 +189,7 @@ func Start(carrierName, roomID, clientID, keyHex string, socksPort int, socksUse
 	cfg := defaults
 	mu.Unlock()
 
-	return startWithConfig(carrierName, cfg.transport, roomID, clientID, keyHex, socksPort, socksUser, socksPass, cfg)
+	return startWithConfig(carrierName, cfg.transport, roomID, clientID, keyHex, socksPort, socksUser, socksPass, cfg, false)
 }
 
 // StartWithTransport launches the client with an explicit transport for this start.
@@ -197,6 +197,7 @@ func StartWithTransport(
 	carrierName, transportName, roomID, clientID, keyHex string,
 	socksPort int,
 	socksUser, socksPass string,
+	plaintext bool,
 ) error {
 	mu.Lock()
 	ensureDefaultConfigLocked()
@@ -204,7 +205,7 @@ func StartWithTransport(
 	cfg.transport = transportName
 	mu.Unlock()
 
-	return startWithConfig(carrierName, transportName, roomID, clientID, keyHex, socksPort, socksUser, socksPass, cfg)
+	return startWithConfig(carrierName, transportName, roomID, clientID, keyHex, socksPort, socksUser, socksPass, cfg, plaintext)
 }
 
 // Check starts an isolated short-lived client and returns elapsed milliseconds once ready.
@@ -215,6 +216,7 @@ func Check(
 	timeoutMillis int,
 	vp8FPS int,
 	vp8BatchSize int,
+	plaintext bool,
 ) (int64, error) {
 	registerDefaults()
 	mu.Lock()
@@ -248,6 +250,7 @@ func Check(
 				Carrier:   carrierName,
 				RoomURL:   buildRoomURL(carrierName, roomID),
 				KeyHex:    keyHex,
+				Plaintext: plaintext,
 				DeviceID:  clientID,
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
@@ -338,6 +341,7 @@ func Ping(
 				Carrier:   carrierName,
 				RoomURL:   buildRoomURL(carrierName, roomID),
 				KeyHex:    keyHex,
+				Plaintext: false, // Ping doesn't use plaintext
 				DeviceID:  clientID,
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
@@ -548,6 +552,7 @@ func startWithConfig(
 	socksPort int,
 	socksUser, socksPass string,
 	cfg mobileConfig,
+	plaintext bool,
 ) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -585,6 +590,7 @@ func startWithConfig(
 				Carrier:   carrierName,
 				RoomURL:   roomURL,
 				KeyHex:    keyHex,
+				Plaintext: plaintext,
 				DeviceID:  clientID,
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: cfg.dnsServer,

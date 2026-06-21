@@ -89,8 +89,9 @@ type Room struct {
 
 // Crypto holds the shared secret used to authenticate and encrypt the tunnel.
 type Crypto struct {
-	Key     string `yaml:"key"`      // 64-char hex (32 bytes)
-	KeyFile string `yaml:"key_file"` // path to a file containing crypto.key
+	Key       string `yaml:"key"`       // 64-char hex (32 bytes)
+	KeyFile   string `yaml:"key_file"`  // path to a file containing crypto.key
+	Plaintext bool   `yaml:"plaintext"` // skip AEAD encryption (e.g. when WireGuard already encrypts)
 }
 
 // Net groups network and transport selection.
@@ -256,6 +257,7 @@ func Apply(dst session.Config, f File) session.Config {
 	dst.RoomID = pickString(dst.RoomID, f.Room.ID)
 	dst.ChannelID = pickString(dst.ChannelID, f.Room.Channel)
 	dst.KeyHex = pickString(dst.KeyHex, f.Crypto.Key)
+	dst.Plaintext = f.Crypto.Plaintext
 	dst.SOCKSHost = pickString(dst.SOCKSHost, f.SOCKS.Host)
 	dst.SOCKSPort = pickInt(dst.SOCKSPort, f.SOCKS.Port)
 	dst.SOCKSUser = pickString(dst.SOCKSUser, f.SOCKS.User)
@@ -303,6 +305,7 @@ func ApplyProfile(base session.Config, p Profile) session.Config {
 	dst.RoomID = overlayString(dst.RoomID, p.Room.ID)
 	dst.ChannelID = overlayString(dst.ChannelID, p.Room.Channel)
 	dst.KeyHex = overlayString(dst.KeyHex, p.Crypto.Key)
+	dst.Plaintext = overlayBool(dst.Plaintext, p.Crypto.Plaintext)
 	dst.SOCKSHost = overlayString(dst.SOCKSHost, p.SOCKS.Host)
 	dst.SOCKSPort = overlayInt(dst.SOCKSPort, p.SOCKS.Port)
 	dst.SOCKSUser = overlayString(dst.SOCKSUser, p.SOCKS.User)
@@ -361,6 +364,13 @@ func overlayString(base, override string) string {
 
 func overlayInt(base, override int) int {
 	if override != 0 {
+		return override
+	}
+	return base
+}
+
+func overlayBool(base, override bool) bool {
+	if override {
 		return override
 	}
 	return base

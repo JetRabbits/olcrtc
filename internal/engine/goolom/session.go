@@ -20,6 +20,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -92,11 +93,12 @@ type Session struct {
 	telemetryReferer string
 	refresh          func(ctx context.Context) (engine.Credentials, error)
 
-	ws    *websocket.Conn
-	wsMu  sync.Mutex
-	pcSub *webrtc.PeerConnection
-	pcPub *webrtc.PeerConnection
-	dc    *webrtc.DataChannel
+	ws        *websocket.Conn
+	wsMu      sync.Mutex
+	pcSub     *webrtc.PeerConnection
+	pcPub     *webrtc.PeerConnection
+	dc        *webrtc.DataChannel
+	iceUDPMux ice.UDPMux
 
 	onData          func([]byte)
 	onReconnect     func(*webrtc.DataChannel)
