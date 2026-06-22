@@ -533,19 +533,22 @@ func (p *streamTransport) CanSend() bool {
 		logger.Debugf("vp8channel.CanSend=false: kcp=nil")
 		return false
 	}
-	streamOk := p.stream.CanSend()
+	// Once KCP is established we rely on queue depth alone:
+	//   - goolom session subscriberReady/publisherReady can flicker during SFU
+	//     renegotiation, causing 100+ stream=false events per second during an
+	//     active bulk transfer (observed 355× in 5s at ~0.06 MiB/s).
+	//   - KCP itself handles temporary carrier hiccups via retransmit + send
+	//     window back-pressure. If the carrier is truly dead, the send buffer
+	//     fills and muxconn.Write() backs up → queue fills → queueOk blocks it.
+	//   - The stream.CanSend() gate is only needed *before* KCP exists; once
+	//     the tunnel is up, it does more harm than good.
 	queueLen := len(p.outbound)
 	queueCap := cap(p.outbound)
 	queueOk := queueLen < queueCap*canSendHighWatermark/100
-	if !streamOk || !queueOk {
-		if !streamOk {
-			p.canSendFalseStream.Add(1)
-		}
-		if !queueOk {
-			p.canSendFalseQueue.Add(1)
-		}
-		logger.Debugf("vp8channel.CanSend=false: stream=%v queue=%d/%d (cap=%d watermark=%d%%)",
-			streamOk, queueLen, queueCap, queueCap, canSendHighWatermark)
+	if !queueOk {
+		p.canSendFalseQueue.Add(1)
+		logger.Debugf("vp8channel.CanSend=false: queue=%d/%d (cap=%d watermark=%d%%)",
+			queueLen, queueCap, queueCap, canSendHighWatermark)
 		return false
 	}
 	return true
