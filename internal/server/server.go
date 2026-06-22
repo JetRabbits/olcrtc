@@ -1170,7 +1170,9 @@ func (s *Server) dispatchUDPDial(stream *smux.Stream, req ConnectRequest, initia
 		packet, err := framing.ReadBytes(reader, maxUDPPacketSize)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				logger.Debugf("sid=%d udp-dial read frame failed: %v", stream.ID(), err)
+				logger.Infof("sid=%d udp-dial read frame failed after recv=%d: %v", stream.ID(), packetsIn, err)
+			} else if packetsIn > 0 {
+				logger.Infof("sid=%d udp-dial stream ended after recv=%d", stream.ID(), packetsIn)
 			}
 			return
 		}
@@ -1194,6 +1196,9 @@ func (s *Server) frameUDPReplies(stream *smux.Stream, conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
+			if packetsOut > 0 {
+				logger.Infof("sid=%d udp-dial remote UDP read ended after replies=%d: %v", stream.ID(), packetsOut, err)
+			}
 			return
 		}
 		packetsOut++
@@ -1201,6 +1206,7 @@ func (s *Server) frameUDPReplies(stream *smux.Stream, conn net.Conn) {
 			logger.Infof("sid=%d udp-dial reply #%d len=%d", stream.ID(), packetsOut, n)
 		}
 		if err := framing.WriteBytes(stream, buf[:n], maxUDPPacketSize); err != nil {
+			logger.Infof("sid=%d udp-dial reply write failed after replies=%d: %v", stream.ID(), packetsOut, err)
 			_ = stream.Close()
 			return
 		}

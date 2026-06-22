@@ -889,6 +889,8 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 	}()
 
 	buf := make([]byte, maxUDPPacketSize)
+	var packetsIn uint64
+	var packetsWritten uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -904,6 +906,10 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		if err != nil {
 			logger.Debugf("UDP ASSOCIATE parse failed: %v", err)
 			continue
+		}
+		packetsIn++
+		if packetsIn <= 10 || packetsIn%100 == 0 {
+			logger.Infof("UDP ASSOCIATE recv #%d target=%s:%d payload=%d bytes", packetsIn, datagram.addr, datagram.port, len(datagram.payload))
 		}
 
 		udpClientMu.Lock()
@@ -941,6 +947,12 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		current := stream
 		if err == nil && current != nil {
 			err = framing.WriteBytes(current, datagram.payload, maxUDPPacketSize)
+			if err == nil {
+				packetsWritten++
+				if packetsWritten <= 10 || packetsWritten%100 == 0 {
+					logger.Infof("UDP ASSOCIATE wrote #%d sid=%d target=%s:%d payload=%d bytes", packetsWritten, current.ID(), datagram.addr, datagram.port, len(datagram.payload))
+				}
+			}
 		}
 		streamMu.Unlock()
 
@@ -971,13 +983,22 @@ func (c *Client) forwardUDPReplies(
 	udpClientMu *sync.RWMutex,
 	udpClientAddr **net.UDPAddr,
 ) {
+	var packetsOut uint64
 	for {
 		packet, err := framing.ReadBytes(stream, maxUDPPacketSize)
 		if err != nil {
+			if packetsOut > 0 {
+				logger.Infof("UDP ASSOCIATE reply stream ended sid=%d replies=%d: %v", stream.ID(), packetsOut, err)
+			}
 			return
+		}
+		packetsOut++
+		if packetsOut <= 10 || packetsOut%100 == 0 {
+			logger.Infof("UDP ASSOCIATE reply #%d sid=%d target=%s:%d payload=%d bytes", packetsOut, stream.ID(), targetAddr, targetPort, len(packet))
 		}
 		out, err := marshalSocks5UDPDatagram(targetAddr, targetPort, packet)
 		if err != nil {
+			logger.Debugf("UDP ASSOCIATE marshal reply failed: %v", err)
 			return
 		}
 
@@ -987,7 +1008,10 @@ func (c *Client) forwardUDPReplies(
 		if addr == nil {
 			continue
 		}
-		_, _ = udpConn.WriteToUDP(out, addr)
+		if _, err := udpConn.WriteToUDP(out, addr); err != nil {
+			logger.Debugf("UDP ASSOCIATE write reply to local UDP failed: %v", err)
+			return
+		}
 	}
 }
 

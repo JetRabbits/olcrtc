@@ -160,6 +160,9 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 	if payload, ok := msg["slotsConfig"]; ok {
 		s.logSignalSummary("slotsConfig", payload, 6)
 		s.sendAck(uid)
+		if slotsConfigHasUnboundParticipant(payload) {
+			s.triggerDeferredReconnect("slotsConfig has participantVideoByMid with empty mid")
+		}
 	}
 	if payload, ok := msg["slotsMeta"]; ok {
 		s.logSignalSummary("slotsMeta", payload, 8)
@@ -417,6 +420,7 @@ func (s *Session) checkNewParticipant(payload any) {
 			logger.Infof("goolom: new video participant detected, waiting for control-path proof before repair reconnect")
 			s.skipCredentialRefresh.Store(true)
 			s.skipMediaReady.Store(true)
+			s.deferredReconnectPending.Store(true)
 			// Reset the deferred channel so this goroutine waits for a NEW
 			// CONTROL_PONG from the CURRENT client, not an old one.
 			// The previous channel may already be closed (from the last session).
@@ -428,34 +432,46 @@ func (s *Session) checkNewParticipant(payload any) {
 				// Wait for proof that the client's control path is alive.
 				// - If the first CONTROL_PONG arrives: SERVER_WELCOME reached Android,
 				//   so do NOT reconnect. Reconnecting here would break WireGuard.
-				// - If no proof arrives within 20s: mid="" (Telemost MID binding
-				//   is likely broken). Reconnect so this/next retry gets proper binding.
-				// 20s gives the client enough time for: SDP exchange (~2s) + ICE
+				// - If slotsConfig explicitly reports participantVideoByMid.mid="":
+				//   reconnect immediately; Telemost has already confirmed broken MID
+				//   binding, so waiting only slows mobile startup.
+				// - If no proof arrives within the fallback window: MID binding may be
+				//   broken. Reconnect so this/next retry gets proper binding.
+				// 12s gives the client enough time for: SDP exchange (~2s) + ICE
 				// connection (~3s) + smux handshake (~1s) + SERVER_WELCOME delivery
 				// + first CONTROL_PING/CONTROL_PONG round-trip (~2s) + SignalHandshakeComplete
-				// closing deferredReconnectCh. Total ~10-12s worst case, so 20s
-				// provides sufficient headroom without excessive delay.
+				// closing deferredReconnectCh. The slotsConfig fast-path usually fires
+				// much sooner when MID binding is definitely empty.
 				select {
 				case <-deferredCh:
+					s.deferredReconnectPending.Store(false)
 					logger.Infof("goolom: control path alive, skipping deferred reconnect")
 					return // Do NOT reconnect — client is live, WireGuard is establishing
-				case <-time.After(20 * time.Second):
-					// Client did not prove control liveness within 20s — likely the
+				case <-time.After(12 * time.Second):
+					// Client did not prove control liveness within 12s — likely the
 					// Telemost MID binding is empty (mid=""). Reconnect immediately
 					// so the waiting client or next retry gets proper MID binding.
-					logger.Infof("goolom: deferred reconnect timeout (no control pong in 20s — reconnecting for MID binding)")
+					s.triggerDeferredReconnect("no control pong in 12s")
 				case <-s.closeCh:
+					s.deferredReconnectPending.Store(false)
 					return
-				}
-				if !s.closed.Load() {
-					logger.Infof("goolom: triggering deferred reconnect for fresh SDP exchange")
-					s.queueReconnect()
 				}
 			}()
 			return
 		}
 	}
 	s.reconnectOnNewParticipant.Store(true) // no video participant found, restore flag
+}
+
+func (s *Session) triggerDeferredReconnect(reason string) {
+	if !s.deferredReconnectPending.CompareAndSwap(true, false) {
+		return
+	}
+	if s.closed.Load() {
+		return
+	}
+	logger.Infof("goolom: triggering deferred reconnect for fresh SDP exchange (%s)", reason)
+	s.queueReconnect()
 }
 
 func (s *Session) isOwnDescription(entry map[string]any) bool {

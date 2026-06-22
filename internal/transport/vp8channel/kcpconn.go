@@ -1,12 +1,10 @@
 // Package vp8channel provides byte transport over VP8 video frames using KCP.
-/*
-ЯНДЕКС ПИДОРАС СОСИ МОЙ ЖИРНЫЙ ХУЙ БЛЯТЬ
-*/
 package vp8channel
 
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -38,6 +36,16 @@ type kcpConn struct {
 	mu        sync.Mutex
 	rDeadline time.Time
 	wDeadline time.Time
+
+	inPackets       atomic.Uint64
+	inBytes         atomic.Uint64
+	inDrops         atomic.Uint64
+	outPackets      atomic.Uint64
+	outBytes        atomic.Uint64
+	writeBlocks     atomic.Uint64
+	maxInQueue      atomic.Uint64
+	maxOutQueue     atomic.Uint64
+	maxWriteDelayMS atomic.Uint64
 }
 
 func newKCPConn(out chan<- []byte, inboundCap int, epochHdr [epochHdrLen]byte) *kcpConn {
@@ -59,8 +67,12 @@ func (c *kcpConn) deliver(payload []byte) {
 	copy(cp, payload)
 	select {
 	case c.in <- cp:
+		c.inPackets.Add(1)
+		c.inBytes.Add(uint64(len(cp)))
+		updateMaxUint64(&c.maxInQueue, uint64(len(c.in)))
 	case <-c.closed:
 	default:
+		c.inDrops.Add(1)
 	}
 }
 
@@ -115,7 +127,12 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	select {
 	case c.out <- buf:
 		elapsed := time.Since(start)
+		c.outPackets.Add(1)
+		c.outBytes.Add(uint64(len(buf)))
+		updateMaxUint64(&c.maxOutQueue, uint64(len(c.out)))
 		if elapsed > 50*time.Millisecond {
+			c.writeBlocks.Add(1)
+			updateMaxUint64(&c.maxWriteDelayMS, uint64(elapsed.Milliseconds()))
 			logger.Infof("vp8channel: kcpConn.WriteTo: %d bytes → outbound (len=%d, dur=%v)", len(buf), len(c.out), elapsed)
 		}
 		return len(p), nil
@@ -163,3 +180,46 @@ func (TimeoutError) Timeout() bool { return true }
 
 // Temporary reports that this error is temporary.
 func (TimeoutError) Temporary() bool { return true }
+
+type kcpConnStats struct {
+	InPackets       uint64
+	InBytes         uint64
+	InDrops         uint64
+	OutPackets      uint64
+	OutBytes        uint64
+	WriteBlocks     uint64
+	MaxInQueue      uint64
+	MaxOutQueue     uint64
+	MaxWriteDelayMS uint64
+	InQueue         int
+	InQueueCap      int
+	OutQueue        int
+	OutQueueCap     int
+}
+
+func (c *kcpConn) stats() kcpConnStats {
+	return kcpConnStats{
+		InPackets:       c.inPackets.Load(),
+		InBytes:         c.inBytes.Load(),
+		InDrops:         c.inDrops.Load(),
+		OutPackets:      c.outPackets.Load(),
+		OutBytes:        c.outBytes.Load(),
+		WriteBlocks:     c.writeBlocks.Load(),
+		MaxInQueue:      c.maxInQueue.Load(),
+		MaxOutQueue:     c.maxOutQueue.Load(),
+		MaxWriteDelayMS: c.maxWriteDelayMS.Load(),
+		InQueue:         len(c.in),
+		InQueueCap:      cap(c.in),
+		OutQueue:        len(c.out),
+		OutQueueCap:     cap(c.out),
+	}
+}
+
+func updateMaxUint64(dst *atomic.Uint64, v uint64) {
+	for {
+		old := dst.Load()
+		if v <= old || dst.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}

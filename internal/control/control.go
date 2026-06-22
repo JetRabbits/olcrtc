@@ -27,15 +27,19 @@ const (
 	ProtoVersion = 1
 	// MaxMessageSize caps one control frame.
 	MaxMessageSize = 16 * 1024
-	// DefaultInterval is the default interval between ping probes.
-	DefaultInterval = 10 * time.Second
+	// DefaultInterval is the default interval between ping probes. Keep this
+	// intentionally low-frequency: the control stream shares the same
+	// smux/KCP/VP8 path as bulk UDP payloads, so overly frequent probes compete
+	// with real traffic and can cause false liveness reconnects under sustained
+	// download/upload load.
+	DefaultInterval = 30 * time.Second
 	// DefaultTimeout is the default time to wait for a pong. Generous because
 	// the ping shares the bulk smux/KCP stream: under a heavy transfer the
 	// ping byte can be head-of-line blocked behind queued data for several
-	// seconds, which is liveness-OK, not a dead link.
-	// Increased to 30s for real-device deployments where VP8/KCP uplink
-	// congestion on mobile carriers can delay PONG delivery beyond 15s.
-	DefaultTimeout = 30 * time.Second
+	// seconds, which is liveness-OK, not a dead link. Use a timeout longer than
+	// one probe interval so a single congested 30s window does not tear down an
+	// otherwise active tunnel.
+	DefaultTimeout = 90 * time.Second
 	// DefaultFailures is the default number of consecutive missed pongs before
 	// the stream is marked unhealthy.
 	DefaultFailures = 4

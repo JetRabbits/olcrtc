@@ -163,3 +163,43 @@ func (r *kcpRuntime) close() {
 		_ = r.conn.Close()
 	})
 }
+
+type kcpRuntimeStats struct {
+	SRTTMS int32
+	RTOMS  uint32
+	Conn   kcpConnStats
+
+	KCPBytesSent     uint64
+	KCPBytesReceived uint64
+	KCPInSegs        uint64
+	KCPOutSegs       uint64
+	KCPRetransSegs   uint64
+	KCPFastRetrans   uint64
+	KCPEarlyRetrans  uint64
+	KCPLostSegs      uint64
+	KCPRepeatSegs    uint64
+	KCPSndQueue      uint64
+	KCPSndBuffer     uint64
+	KCPRcvQueue      uint64
+}
+
+func (r *kcpRuntime) stats() kcpRuntimeStats {
+	snmp := kcp.DefaultSnmp.Copy()
+	return kcpRuntimeStats{
+		SRTTMS:           r.sess.GetSRTT(),
+		RTOMS:            r.sess.GetRTO(),
+		Conn:             r.conn.stats(),
+		KCPBytesSent:     snmp.BytesSent,
+		KCPBytesReceived: snmp.BytesReceived,
+		KCPInSegs:        snmp.InSegs,
+		KCPOutSegs:       snmp.OutSegs,
+		KCPRetransSegs:   snmp.RetransSegs,
+		KCPFastRetrans:   snmp.FastRetransSegs,
+		KCPEarlyRetrans:  snmp.EarlyRetransSegs,
+		KCPLostSegs:      snmp.LostSegs,
+		KCPRepeatSegs:    snmp.RepeatSegs,
+		KCPSndQueue:      snmp.RingBufferSndQueue,
+		KCPSndBuffer:     snmp.RingBufferSndBuffer,
+		KCPRcvQueue:      snmp.RingBufferRcvQueue,
+	}
+}

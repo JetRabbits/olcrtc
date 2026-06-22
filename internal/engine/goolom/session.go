@@ -144,6 +144,11 @@ type Session struct {
 	// alive. reconnectOnNewParticipant uses this to avoid repair reconnects while
 	// the client is actually live.
 	deferredReconnectCh chan struct{}
+	// deferredReconnectPending is true while reconnectOnNewParticipant is waiting
+	// for either control-path proof or positive Telemost evidence that MID binding
+	// is broken. It lets slotsConfig fast-path trigger the repair reconnect before
+	// the fallback timer expires.
+	deferredReconnectPending atomic.Bool
 
 	// skipCredentialRefresh tells reconnect() to skip the s.refresh(ctx) call
 	// (HTTP round-trip to Telemost API) and reuse existing room credentials.

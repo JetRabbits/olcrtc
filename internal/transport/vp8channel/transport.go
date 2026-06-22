@@ -41,6 +41,8 @@ const (
 	inboundQueueSize     = 4096
 	canSendHighWatermark = 90 // percent
 	keepaliveIdlePeriod  = 100 * time.Millisecond
+	diagnosticsInterval  = 5 * time.Second
+	slowWriteThreshold   = 50 * time.Millisecond
 )
 
 var (
@@ -135,6 +137,14 @@ type streamTransport struct {
 	peersMu sync.RWMutex
 	peers   map[uint32]*kcpRuntime // epoch → KCP runtime
 	peerOut map[uint32]chan []byte // epoch → outbound queue
+
+	canSendFalseClosed atomic.Uint64
+	canSendFalseNoKCP  atomic.Uint64
+	canSendFalseStream atomic.Uint64
+	canSendFalseQueue  atomic.Uint64
+	writeSampleErrors  atomic.Uint64
+	writeSampleSlow    atomic.Uint64
+	maxOutboundQueue   atomic.Uint64
 }
 
 // New creates a vp8channel transport backed by a carrier engine.
@@ -511,6 +521,7 @@ func (p *streamTransport) WatchConnection(ctx context.Context) {
 
 func (p *streamTransport) CanSend() bool {
 	if p.closed.Load() {
+		p.canSendFalseClosed.Add(1)
 		logger.Debugf("vp8channel.CanSend=false: transport closed")
 		return false
 	}
@@ -518,6 +529,7 @@ func (p *streamTransport) CanSend() bool {
 	hasKCP := p.kcp != nil
 	p.kcpMu.RUnlock()
 	if !hasKCP {
+		p.canSendFalseNoKCP.Add(1)
 		logger.Debugf("vp8channel.CanSend=false: kcp=nil")
 		return false
 	}
@@ -526,6 +538,12 @@ func (p *streamTransport) CanSend() bool {
 	queueCap := cap(p.outbound)
 	queueOk := queueLen < queueCap*canSendHighWatermark/100
 	if !streamOk || !queueOk {
+		if !streamOk {
+			p.canSendFalseStream.Add(1)
+		}
+		if !queueOk {
+			p.canSendFalseQueue.Add(1)
+		}
 		logger.Debugf("vp8channel.CanSend=false: stream=%v queue=%d/%d (cap=%d watermark=%d%%)",
 			streamOk, queueLen, queueCap, queueCap, canSendHighWatermark)
 		return false
@@ -554,12 +572,17 @@ func (p *streamTransport) writerLoop() {
 	keepaliveEvery := max(int(keepaliveIdlePeriod/p.frameInterval), 1)
 	idleTicks := 0
 	outboundSeq := 0
+	lastDiag := time.Now()
+	diagOutboundSamples := uint64(0)
+	diagOutboundBytes := uint64(0)
+	diagKeepalives := uint64(0)
 
 	for {
 		select {
 		case <-p.closeCh:
 			return
 		case <-ticker.C:
+			now := time.Now()
 			var sample []byte
 			isKeepalive := false
 			select {
@@ -567,21 +590,39 @@ func (p *streamTransport) writerLoop() {
 				sample = p.batchSample(frame, p.perTickBytes)
 				idleTicks = 0
 				outboundSeq++
+				diagOutboundSamples++
+				diagOutboundBytes += uint64(len(sample))
+				updateMaxUint64(&p.maxOutboundQueue, uint64(len(p.outbound)))
 			default:
 				idleTicks++
 				if idleTicks < keepaliveEvery {
+					if now.Sub(lastDiag) >= diagnosticsInterval {
+						p.logDiagnostics(now.Sub(lastDiag), diagOutboundSamples, diagOutboundBytes, diagKeepalives)
+						lastDiag = now
+						diagOutboundSamples = 0
+						diagOutboundBytes = 0
+						diagKeepalives = 0
+					}
 					continue
 				}
 				idleTicks = 0
 				hdr := p.epochHeader()
 				sample = hdr[:]
 				isKeepalive = true
+				diagKeepalives++
 			}
 
 			if !isKeepalive {
 				logger.Infof("vp8channel: writerLoop: outbound #%d, %d bytes (outbound_q=%d)", outboundSeq, len(sample), len(p.outbound))
 			}
 			p.writeSample(sample)
+			if now.Sub(lastDiag) >= diagnosticsInterval {
+				p.logDiagnostics(now.Sub(lastDiag), diagOutboundSamples, diagOutboundBytes, diagKeepalives)
+				lastDiag = now
+				diagOutboundSamples = 0
+				diagOutboundBytes = 0
+				diagKeepalives = 0
+			}
 		}
 	}
 }
@@ -589,12 +630,49 @@ func (p *streamTransport) writerLoop() {
 func (p *streamTransport) writeSample(sample []byte) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	start := time.Now()
 	if err := p.track.WriteSample(media.Sample{
 		Data:     sample,
 		Duration: p.frameInterval,
 	}); err != nil && !p.closed.Load() {
+		p.writeSampleErrors.Add(1)
 		logger.Warnf("vp8channel: writeSample: track.WriteSample FAILED: %v", err)
 	}
+	if elapsed := time.Since(start); elapsed > slowWriteThreshold {
+		p.writeSampleSlow.Add(1)
+		logger.Warnf("vp8channel: writeSample slow: bytes=%d elapsed=%v", len(sample), elapsed)
+	}
+}
+
+func (p *streamTransport) logDiagnostics(interval time.Duration, outboundSamples, outboundBytes, keepalives uint64) {
+	p.kcpMu.RLock()
+	rt := p.kcp
+	p.kcpMu.RUnlock()
+
+	if rt == nil {
+		logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp=nil",
+			interval.Truncate(time.Millisecond), outboundSamples, outboundBytes, keepalives,
+			len(p.outbound), cap(p.outbound), p.maxOutboundQueue.Load(),
+			p.canSendFalseClosed.Load(), p.canSendFalseNoKCP.Load(), p.canSendFalseStream.Load(), p.canSendFalseQueue.Load(),
+			p.writeSampleSlow.Load(), p.writeSampleErrors.Load())
+		return
+	}
+
+	st := rt.stats()
+	logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp={srtt_ms:%d,rto_ms:%d,in:%dB/%dpkts,out:%dB/%dpkts,drops:%d,write_blocks:%d,max_write_delay_ms:%d,in_q:%d/%d,max_in_q:%d,out_q:%d/%d,max_out_q:%d,snmp_sent:%dB,snmp_recv:%dB,segs_in:%d,segs_out:%d,retrans:%d,fast_retrans:%d,early_retrans:%d,lost:%d,repeat:%d,snd_q:%d,snd_buf:%d,rcv_q:%d}",
+		interval.Truncate(time.Millisecond), outboundSamples, outboundBytes, keepalives,
+		len(p.outbound), cap(p.outbound), p.maxOutboundQueue.Load(),
+		p.canSendFalseClosed.Load(), p.canSendFalseNoKCP.Load(), p.canSendFalseStream.Load(), p.canSendFalseQueue.Load(),
+		p.writeSampleSlow.Load(), p.writeSampleErrors.Load(),
+		st.SRTTMS, st.RTOMS,
+		st.Conn.InBytes, st.Conn.InPackets,
+		st.Conn.OutBytes, st.Conn.OutPackets,
+		st.Conn.InDrops, st.Conn.WriteBlocks, st.Conn.MaxWriteDelayMS,
+		st.Conn.InQueue, st.Conn.InQueueCap, st.Conn.MaxInQueue,
+		st.Conn.OutQueue, st.Conn.OutQueueCap, st.Conn.MaxOutQueue,
+		st.KCPBytesSent, st.KCPBytesReceived, st.KCPInSegs, st.KCPOutSegs,
+		st.KCPRetransSegs, st.KCPFastRetrans, st.KCPEarlyRetrans,
+		st.KCPLostSegs, st.KCPRepeatSegs, st.KCPSndQueue, st.KCPSndBuffer, st.KCPRcvQueue)
 }
 
 func (p *streamTransport) batchSample(first []byte, maxBytes int) []byte {
