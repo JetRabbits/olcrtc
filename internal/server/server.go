@@ -401,6 +401,19 @@ func (s *Server) reinstallSession(dead *smux.Session) {
 	s.reinstallMu.Lock()
 	defer s.reinstallMu.Unlock()
 
+	// Check whether someone already reinstalled before we acquired the lock.
+	// If so, our `dead` pointer is stale and we must not touch s.conn (which
+	// now belongs to the new session).  A stale goroutine (e.g. a liveness
+	// control loop from a previous session that fired right after a
+	// carrier-based reinstall) would otherwise close the current session's
+	// muxconn, leaving it without a working conn.
+	s.sessMu.RLock()
+	sessionWasReplaced := s.session != dead
+	s.sessMu.RUnlock()
+	if sessionWasReplaced {
+		return
+	}
+
 	// Close the old muxconn immediately so that any in-flight Push calls
 	// (from data arriving on a new bridge before this reinstall completes)
 	// are discarded rather than feeding stale frames into the dying smux
@@ -424,13 +437,6 @@ func (s *Server) reinstallSession(dead *smux.Session) {
 	}
 
 	s.sessMu.Lock()
-	if s.session != dead {
-		// Someone else already reinstalled - discard our build.
-		s.sessMu.Unlock()
-		_ = newSess.Close()
-		_ = newConn.Close()
-		return
-	}
 	oldSess := s.session
 	oldControl := s.controlStrm
 	oldControlStop := s.controlStop
