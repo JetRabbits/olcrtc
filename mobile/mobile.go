@@ -22,6 +22,8 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 
+	"github.com/openlibrecommunity/olcrtc/internal/transport"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/seichannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 
 	_ "golang.org/x/mobile/bind"                       // ensure gomobile bind is available
@@ -53,12 +55,13 @@ var (
 )
 
 const (
-	defaultTransport   = "vp8channel"
-	dataTransport      = "datachannel"
-	defaultDNSServer   = "8.8.8.8:53"
-	defaultHTTPPingURL = "https://www.google.com/generate_204"
-	defaultSocksHost   = "127.0.0.1"
-	carrierWBStream    = "wbstream"
+	defaultTransport     = "vp8channel"
+	seichannelTransport = "seichannel"
+	dataTransport       = "datachannel"
+	defaultDNSServer    = "8.8.8.8:53"
+	defaultHTTPPingURL  = "https://www.google.com/generate_204"
+	defaultSocksHost    = "127.0.0.1"
+	carrierWBStream     = "wbstream"
 )
 
 const (
@@ -169,11 +172,11 @@ func SetLivenessOptions(intervalMillis, timeoutMillis, failures int) {
 func SetDebug(enabled bool) {
 	logger.SetVerbose(enabled)
 	if enabled {
-		log.SetFlags(log.Ltime | log.Lshortfile)
+		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
 		return
 	}
 
-	log.SetFlags(log.Ltime)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
 
 // Start launches the olcRTC client in background.
@@ -254,10 +257,7 @@ func Check(
 				DeviceID:  clientID,
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
-				TransportOptions: vp8channel.Options{
-					FPS:       clampAtLeastOne(vp8FPS, 120),
-					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
-				},
+				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize),
 				Liveness: livenessConfig(cfg),
 			},
 			func() {
@@ -345,10 +345,7 @@ func Ping(
 				DeviceID:  clientID,
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
-				TransportOptions: vp8channel.Options{
-					FPS:       clampAtLeastOne(vp8FPS, 120),
-					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
-				},
+				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize),
 				Liveness: livenessConfig(cfg),
 			},
 			func() {
@@ -596,10 +593,7 @@ func startWithConfig(
 				DNSServer: cfg.dnsServer,
 				SOCKSUser: socksUser,
 				SOCKSPass: socksPass,
-				TransportOptions: vp8channel.Options{
-					FPS:       cfg.vp8FPS,
-					BatchSize: cfg.vp8BatchSize,
-				},
+				TransportOptions: transportOptionsFor(cfg.transport, cfg.vp8FPS, cfg.vp8BatchSize),
 				Liveness: livenessConfig(cfg),
 			},
 			func() {
@@ -771,6 +765,8 @@ func normalizeTransport(value string) string {
 	switch value {
 	case dataTransport, "data", "dc":
 		return dataTransport
+	case seichannelTransport, "sei", "h264":
+		return seichannelTransport
 	case defaultTransport, "vp8":
 		return defaultTransport
 	default:
@@ -783,6 +779,22 @@ func normalizeCarrier(carrierName string) string {
 		return carrierWBStream
 	}
 	return carrierName
+}
+
+// transportOptionsFor builds the correct transport.Options for the given transportName.
+func transportOptionsFor(transportName string, fps, batchSize int) transport.Options {
+	switch transportName {
+	case seichannelTransport:
+		return seichannel.Options{
+			FPS:       clampAtLeastOne(fps, 120),
+			BatchSize: clampAtLeastOne(batchSize, 64),
+		}
+	default:
+		return vp8channel.Options{
+			FPS:       clampAtLeastOne(fps, 120),
+			BatchSize: clampAtLeastOne(batchSize, 64),
+		}
+	}
 }
 
 func validateStartArgs(carrierName, roomID, clientID, keyHex string) error {

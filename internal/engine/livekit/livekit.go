@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	livekit "github.com/livekit/protocol/livekit"
 	protoLogger "github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
@@ -69,7 +70,12 @@ func (r *sdkRoom) publishData(data []byte) error {
 }
 
 func (r *sdkRoom) publishTrack(track webrtc.TrackLocal) error {
-	_, err := r.room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{Name: videoTrackName})
+	_, err := r.room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
+		Name:        videoTrackName,
+		Source:      livekit.TrackSource_CAMERA,
+		VideoWidth:  640,
+		VideoHeight: 480,
+	})
 	if err != nil {
 		return fmt.Errorf("publish track: %w", err)
 	}

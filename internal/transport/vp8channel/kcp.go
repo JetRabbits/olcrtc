@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	kcp "github.com/xtaci/kcp-go/v5"
@@ -25,15 +26,16 @@ const (
 	kcpMTU = 1400
 
 	// Send/receive window in segments, sized to the bandwidth-delay product
-	// of the policed video path (~1.2 MB/s wire cap, sub-second RTT), NOT to
+	// of the policed video path (~1.2 MB/s wire cap, ~100ms RTT), NOT to
 	// "as much as possible". A large send window let the upper layer dump
 	// megabytes into KCP instantly; with the wire paced to ~1.2 MB/s those
 	// segments then sat queued for SECONDS, so KCP's RTO fired and triggered
 	// a retransmit storm while control-plane pongs starved behind the same
 	// queue (-> missed pongs -> reconnect). A small send window bounds
-	// in-flight data to ~BDP, keeping queuing latency low. The receive
-	// window stays generous so the peer is never the bottleneck.
-	kcpSndWnd = 768
+	// in-flight data to ~BDP (1.2MB/s * 0.1s / 1400B ≈ 86), keeping queuing
+	// latency low. The receive window stays generous so the peer is never
+	// the bottleneck.
+	kcpSndWnd = 450
 	kcpRcvWnd = 1024
 
 	// Length prefix for our message framing on top of KCP stream mode.
@@ -63,7 +65,7 @@ type kcpRuntime struct {
 	closeOnce sync.Once
 }
 
-func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
+func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte, frameInterval time.Duration) (*kcpRuntime, error) {
 	c := newKCPConn(out, inboundQueueSize, epochHdr)
 
 	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
@@ -72,7 +74,7 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 		return nil, fmt.Errorf("kcp new conn: %w", err)
 	}
 
-	// nodelay=1, interval=5ms, fast resend=2, congestion control OFF (nc=1).
+	// nodelay=1, interval=frameInterval, fast resend=2, congestion control OFF (nc=1).
 	// KCP does NOT regulate the send rate here - the writerLoop byte pacer
 	// does, fed at a fixed rate just under the carrier's policer knee. KCP's
 	// own loss-based congestion control is the wrong controller for a hard
@@ -80,7 +82,13 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 	// the wire to ~45 KiB/s. With nc=1 KCP just keeps the BDP-sized window
 	// full and retransmits the few losses; the pacer caps the rate so we
 	// never overdrive the policer into its collapse zone.
-	sess.SetNoDelay(1, 5, 2, 1)
+	// Interval matches frameInterval so KCP flushes at the same cadence the
+	// VP8 writer emits frames, avoiding queue buildup between KCP and pacer.
+	kcpIntervalMs := int(frameInterval.Milliseconds())
+	if kcpIntervalMs < 10 {
+		kcpIntervalMs = 10
+	}
+	sess.SetNoDelay(1, kcpIntervalMs, 2, 1)
 	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;

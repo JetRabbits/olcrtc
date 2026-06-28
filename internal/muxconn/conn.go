@@ -275,14 +275,17 @@ func (c *Conn) recycleIfDrained() {
 //
 // When cipher is set, p is AEAD-encrypted before sending.
 // When cipher is nil, p is sent as-is (plaintext passthrough).
+//
+// CanSend bypass: if CanSend stays false for too long (e.g. SFU throttles
+// the data channel), we stop waiting and send anyway. This is safe for
+// control messages (PING/PONG/handshake) which are small and must be
+// delivered even under congestion. The transport will buffer or drop
+// if the underlying channel is truly full.
 func (c *Conn) Write(p []byte) (int, error) {
-	// Spin briefly first - on a healthy link CanSend usually clears within
-	// well under a millisecond, so a 10ms sleep adds visible per-frame
-	// latency to interactive request/response traffic. Fall back to a
-	// modest sleep only if the link is truly congested.
 	const (
 		fastSpinAttempts = 16
 		slowPollDelay    = 2 * time.Millisecond
+		canSendTimeout   = 10 * time.Millisecond // max time to wait for CanSend
 	)
 	spinStart := time.Now()
 	canSendBlocked := false
@@ -313,6 +316,11 @@ func (c *Conn) Write(p []byte) (int, error) {
 		}
 		if attempt == fastSpinAttempts {
 			logger.Warnf("muxconn.Write: CanSend=false, starting slow poll (attempt=%d, elapsed=%v)", attempt, time.Since(spinStart))
+		}
+		// CanSend bypass: if we've waited too long, send anyway.
+		if time.Since(spinStart) > canSendTimeout {
+			logger.Warnf("muxconn.Write: CanSend timeout after %v, bypassing (send anyway)", time.Since(spinStart))
+			break
 		}
 		time.Sleep(slowPollDelay)
 	}

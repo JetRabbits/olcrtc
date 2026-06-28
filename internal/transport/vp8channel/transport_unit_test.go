@@ -211,7 +211,8 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 		t.Fatal("bindingToken/randomEpoch returned zero")
 	}
 
-	rt, err := startKCP(tr.outbound, nil, tr.epochHeader())
+	testFrameInterval := 33 * time.Millisecond // ~30fps
+	rt, err := startKCP(tr.outbound, nil, tr.epochHeader(), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP: %v", err)
 	}
@@ -249,7 +250,8 @@ func TestResetPeerRestartsKCPAndDrainsOutbound(t *testing.T) {
 		_ = tr.Close()
 	}()
 
-	rt, err := startKCP(tr.outbound, nil, tr.epochHeader())
+	testFrameInterval := 33 * time.Millisecond // ~30fps
+	rt, err := startKCP(tr.outbound, nil, tr.epochHeader(), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP: %v", err)
 	}

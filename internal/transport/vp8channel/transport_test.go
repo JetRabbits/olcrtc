@@ -71,14 +71,15 @@ func TestKCPLoopback(t *testing.T) {
 	b2a := make(chan []byte, 256)
 
 	cb, doneB, getRecv := buildReceiver(len(msgs))
+	testFrameInterval := 33 * time.Millisecond // ~30fps
 
-	rtA, err := startKCP(a2b, nil, testEpochHdr(1))
+	rtA, err := startKCP(a2b, nil, testEpochHdr(1), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP A: %v", err)
 	}
 	defer rtA.close()
 
-	rtB, err := startKCP(b2a, cb, testEpochHdr(2))
+	rtB, err := startKCP(b2a, cb, testEpochHdr(2), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP B: %v", err)
 	}
@@ -247,7 +248,8 @@ func TestSinglePeerConfirmsOnlyAfterKCPApplicationData(t *testing.T) {
 		received <- append([]byte(nil), data...)
 	}
 
-	rt, err := startKCP(tr.outbound, tr.onData, tr.epochHeader())
+	testFrameInterval := 33 * time.Millisecond // ~30fps
+	rt, err := startKCP(tr.outbound, tr.onData, tr.epochHeader(), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP receiver: %v", err)
 	}
@@ -266,7 +268,7 @@ func TestSinglePeerConfirmsOnlyAfterKCPApplicationData(t *testing.T) {
 	}
 
 	senderOut := make(chan []byte, 16)
-	senderRT, err := startKCP(senderOut, nil, buildEpochHeader(token, 0x200))
+	senderRT, err := startKCP(senderOut, nil, buildEpochHeader(token, 0x200), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP sender: %v", err)
 	}

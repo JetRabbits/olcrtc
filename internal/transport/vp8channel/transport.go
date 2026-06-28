@@ -284,7 +284,7 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 	// would deadlock: muxconn.Write spins on CanSend (which checks kcp!=nil)
 	// and KCP was only started lazily on the first incoming peer frame.
 	p.kcpOnce.Do(func() {
-		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+		rt, err := startKCP(p.outbound, p.onData, p.epochHeader(), p.frameInterval)
 		if err != nil {
 			logger.Infof("vp8channel: startKCP failed: %v", err)
 			return
@@ -738,7 +738,7 @@ func (p *streamTransport) restartKCP(epochHdr [epochHdrLen]byte) {
 	if old != nil {
 		old.close()
 	}
-	rt, err := startKCP(p.outbound, p.onData, epochHdr)
+	rt, err := startKCP(p.outbound, p.onData, epochHdr, p.frameInterval)
 	if err != nil {
 		return
 	}
@@ -899,7 +899,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		if old != nil {
 			old.close()
 		}
-		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+		rt, err := startKCP(p.outbound, p.onData, p.epochHeader(), p.frameInterval)
 		if err == nil {
 			p.kcpMu.Lock()
 			p.kcp = rt
@@ -959,7 +959,7 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 		if p.onPeerData != nil {
 			p.onPeerData(peerID, data)
 		}
-	}, hdr)
+	}, hdr, p.frameInterval)
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer 0x%08x failed: %v", epoch, err)
 		return nil

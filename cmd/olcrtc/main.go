@@ -340,6 +340,7 @@ func isNoisyLogLine(line []byte) bool {
 
 func configureLogging(debug bool) {
 	installStderrFilter()
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.SetOutput(filteredWriter{w: os.Stderr})
 	logger.DisableNoisyPionLogs()
 	if debug {

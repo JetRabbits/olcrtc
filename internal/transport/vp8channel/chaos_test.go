@@ -104,14 +104,15 @@ func runChaosLoopback(t *testing.T, msgs [][]byte, cfg chaosCfg, timeout time.Du
 	b2a := make(chan []byte, 1024)
 
 	cb, doneB, getRecv := buildReceiver(len(msgs))
+	testFrameInterval := 33 * time.Millisecond // ~30fps
 
-	rtA, err := startKCP(a2b, nil, testEpochHdr(1))
+	rtA, err := startKCP(a2b, nil, testEpochHdr(1), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP A: %v", err)
 	}
 	defer rtA.close()
 
-	rtB, err := startKCP(b2a, cb, testEpochHdr(2))
+	rtB, err := startKCP(b2a, cb, testEpochHdr(2), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP B: %v", err)
 	}
@@ -205,13 +206,14 @@ func TestKCPRecoversFromBurstLoss(t *testing.T) {
 	a2b := make(chan []byte, 1024)
 	b2a := make(chan []byte, 1024)
 	cb, doneB, getRecv := buildReceiver(len(msgs))
+	testFrameInterval := 33 * time.Millisecond // ~30fps
 
-	rtA, err := startKCP(a2b, nil, testEpochHdr(1))
+	rtA, err := startKCP(a2b, nil, testEpochHdr(1), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP A: %v", err)
 	}
 	defer rtA.close()
-	rtB, err := startKCP(b2a, cb, testEpochHdr(2))
+	rtB, err := startKCP(b2a, cb, testEpochHdr(2), testFrameInterval)
 	if err != nil {
 		t.Fatalf("startKCP B: %v", err)
 	}
