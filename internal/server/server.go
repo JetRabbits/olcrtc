@@ -389,14 +389,6 @@ func (s *Server) installSession() {
 }
 
 func (s *Server) handleReconnect() {
-	const carrierReconnectSessionGrace = 30 * time.Second
-	if openedAt := s.sessionOpenedAt.Load(); openedAt != nil {
-		age := time.Since(*openedAt)
-		if age < carrierReconnectSessionGrace {
-			logger.Infof("server reconnect reason=carrier - skipping smux reinstall (session age = %s < %s)", age.Round(time.Second), carrierReconnectSessionGrace)
-			return
-		}
-	}
 	s.recordReconnect()
 	logger.Infof("server reconnect reason=carrier - tearing down smux session")
 	s.sessMu.RLock()
