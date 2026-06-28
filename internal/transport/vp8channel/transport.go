@@ -459,14 +459,22 @@ func (p *streamTransport) drainOutbound() {
 	}
 }
 
-// ResetPeer drops queued KCP traffic and starts a fresh KCP state machine while
-// keeping the carrier connection alive. The client/server liveness layer calls
-// this before rebuilding smux so replacement handshakes are not parsed behind
-// stale bytes from streams that were active when the old session died.
+// ResetPeer drops the peer confirmation state but keeps the KCP state machine
+// alive. The client/server liveness layer calls this before rebuilding smux
+// when the underlying data channel was interrupted (e.g. SFU closed the
+// WebRTC data channel).
+//
+// We do NOT restart KCP here — KCP handles packet loss natively via
+// retransmission, so a brief data channel interruption is transparent.
+// The caller (reinstallSession / tryReopenSession) creates a new muxconn/smux
+// over the same transport, and the existing KCP session continues sending
+// and receiving through vp8channel's VP8 frame pipeline. Restarting KCP
+// would destroy in-flight WireGuard packets and force a full tunnel reset,
+// which breaks long-lived connections (Telegram, etc.).
 func (p *streamTransport) ResetPeer() {
 	p.peerConfirmed.Store(false)
 	p.peerEpoch.Store(0)
-	p.restartKCP(p.rotateEpochHeader())
+	// Keep KCP alive — do NOT call restartKCP().
 }
 
 // Reconnect forwards to the underlying engine session.

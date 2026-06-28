@@ -237,7 +237,7 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	}
 }
 
-func TestResetPeerRestartsKCPAndDrainsOutbound(t *testing.T) {
+func TestResetPeerKeepsKCPAlive(t *testing.T) {
 	tr := &streamTransport{
 		stream:       &fakeVideoStream{canSend: true},
 		outbound:     make(chan []byte, 10),
@@ -258,27 +258,33 @@ func TestResetPeerRestartsKCPAndDrainsOutbound(t *testing.T) {
 	tr.kcpMu.Lock()
 	tr.kcp = rt
 	tr.kcpMu.Unlock()
-	tr.outbound <- []byte("stale")
+	tr.outbound <- []byte("pending-data")
 	oldEpoch := tr.localEpoch
 
+	// ResetPeer should NOT restart KCP — it keeps the session alive so
+	// brief SFU data channel interruptions are handled transparently via
+	// KCP's native retransmission.
 	tr.ResetPeer()
 
 	tr.kcpMu.RLock()
 	got := tr.kcp
 	tr.kcpMu.RUnlock()
-	if got == nil || got == rt {
-		t.Fatalf("ResetPeer kcp = %p, want fresh non-nil runtime distinct from %p", got, rt)
+	if got != rt {
+		t.Fatalf("ResetPeer replaced kcp runtime: got %p, want original %p", got, rt)
 	}
-	if len(tr.outbound) != 0 {
-		t.Fatalf("ResetPeer left %d outbound frame(s), want 0", len(tr.outbound))
+	// Outbound data should NOT be drained — KCP still needs it.
+	if len(tr.outbound) != 1 {
+		t.Fatalf("ResetPeer drained %d outbound frame(s), want 1", len(tr.outbound))
 	}
-	if tr.localEpoch == oldEpoch {
-		t.Fatalf("ResetPeer localEpoch = %#x, want different epoch", tr.localEpoch)
+	// localEpoch should NOT be rotated — peer frames must still match.
+	if tr.localEpoch != oldEpoch {
+		t.Fatalf("ResetPeer changed localEpoch from %#x to %#x, want unchanged", oldEpoch, tr.localEpoch)
 	}
+	// Old KCP runtime must still be alive (not closed).
 	select {
 	case <-rt.readDone:
-	case <-time.After(time.Second):
-		t.Fatal("old KCP runtime did not stop")
+		t.Fatal("ResetPeer closed old KCP runtime, want it alive")
+	default:
 	}
 }
 
