@@ -889,15 +889,18 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if len(kcpPayload) == 0 {
 		return
 	}
-	if p.peerConfirmed.Load() && peerEpoch != p.peerEpoch.Load() {
-		// A peer epoch change after confirmation means the remote client
-		// restarted (e.g. retry after handshake timeout). Accept the new epoch
-		// by resetting peerConfirmed and restarting KCP without changing localEpoch.
-		// Without this, all frames from the restarted client are silently dropped
-		// and the retry always fails with a handshake timeout.
-		// We reset peerConfirmed but do NOT call restartKCP (which would rotate
-		// localEpoch and trigger a reconnect cascade on the remote side).
-		logger.Infof("vp8channel: handleIncomingFrame: peer epoch changed 0x%08x→0x%08x, resetting confirmation", p.peerEpoch.Load(), peerEpoch)
+	if peerEpoch != p.peerEpoch.Load() && p.peerEpoch.Load() != 0 {
+		// A peer epoch change means the remote side reset or restarted its KCP
+		// (e.g. after a carrier reconnect or handshake timeout). This can happen
+		// before or after peerConfirmed — stale in-flight frames from the old
+		// peer session carry the old epoch and would otherwise leak into the new
+		// KCP instance, creating smux stream-1 collisions that corrupt the
+		// handshake/control path.
+		//
+		// Destroy the current KCP instance and start fresh so only data from
+		// the new peer epoch is processed. We keep the local epoch unchanged
+		// so we do not trigger a reconnect cascade on the remote side.
+		logger.Infof("vp8channel: handleIncomingFrame: peer epoch changed 0x%08x→0x%08x, restarting KCP (confirmed=%v)", p.peerEpoch.Load(), peerEpoch, p.peerConfirmed.Load())
 		p.peerConfirmed.Store(false)
 		p.drainOutbound()
 		p.kcpMu.Lock()

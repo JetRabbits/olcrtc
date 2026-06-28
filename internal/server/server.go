@@ -391,6 +391,17 @@ func (s *Server) installSession() {
 func (s *Server) handleReconnect() {
 	s.recordReconnect()
 	logger.Infof("server reconnect reason=carrier - tearing down smux session")
+
+	// Drain stale in-flight frames from the transport pipeline before creating
+	// a new muxconn. After closing the old muxconn, the transport can still
+	// deliver buffered smux frames (SYN + PSH for stream 1) from the previous
+	// client session. If we create the new muxconn immediately, those stale
+	// frames land on stream 1 of the new smux session before the new client's
+	// handshake arrives, causing a stream-ID collision that manifests as
+	// CLIENT_HELLO on the control stream.
+	logger.Debugf("handleReconnect: draining stale frames for 200ms")
+	time.Sleep(200 * time.Millisecond)
+
 	s.sessMu.RLock()
 	current := s.session
 	s.sessMu.RUnlock()
@@ -733,6 +744,16 @@ func isPeerConsumedMoreThanSent(err error) bool {
 	return strings.Contains(err.Error(), "peer consumed more than sent")
 }
 
+// isClientHelloOnControl reports whether the control stream received a
+// CLIENT_HELLO message, indicating a stale handshake collided with the
+// active control stream (stream-ID collision after reconnection).
+func isClientHelloOnControl(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "CLIENT_HELLO")
+}
+
 // handshakeReady reports whether the current session has completed its
 // handshake. The session is reset on reconnect, so this is recomputed.
 func (s *Server) handshakeReady() bool {
@@ -927,6 +948,29 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 		}
 		if isPeerConsumedMoreThanSent(err) {
 			logger.Warnf("server control stream ended with benign smux write accounting error; keeping smux session for data streams")
+			return
+		}
+		// If we got CLIENT_HELLO on the control stream, the client attempted
+		// a new handshake whose SYN+PSH for stream 1 arrived before the
+		// server reinstalled. The stale frames created stream 1 and
+		// completed a handshake, then the next CLIENT_HELLO (the one from
+		// the client's actual new session) was delivered to our control
+		// stream. Close the control stream and reset session state so that
+		// serveSingle accepts the client's retry as a fresh handshake on a
+		// new stream (from the client's new smux session). Do NOT trigger
+		// liveness reinstall, KCP reset, or carrier reconnect — the
+		// underlying transport is fine, only the smux session routing was
+		// confused by stale frames.
+		if isClientHelloOnControl(err) {
+			s.sessMu.Lock()
+			if s.controlStrm == stream {
+				s.controlStrm = nil
+				s.controlStop = nil
+			}
+			s.sessionID = ""
+			s.deviceID = ""
+			s.sessMu.Unlock()
+			stop()
 			return
 		}
 		s.recordReconnect()
