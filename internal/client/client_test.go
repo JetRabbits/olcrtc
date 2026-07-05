@@ -602,7 +602,7 @@ func TestHandleSocks5UDPAssociateRoundTrip(t *testing.T) {
 		_ = socksServer.Close()
 		_ = socksClient.Close()
 	}()
-	c := &Client{deviceID: "client-1", session: clientSess}
+	c := &Client{deviceID: "client-1", session: clientSess, sessionID: "test-session"}
 	clientDone := make(chan struct{})
 	go func() {
 		c.handleSocks5(context.Background(), socksServer)
