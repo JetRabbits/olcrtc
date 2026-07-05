@@ -12,6 +12,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 )
@@ -113,6 +114,22 @@ func newWebRTCAPI() (*webrtc.API, error) {
 	settingEngine := webrtc.SettingEngine{}
 	if protect.Protector != nil {
 		settingEngine.SetICEProxyDialer(protect.NewProxyDialer())
+		// SetICEProxyDialer only protects the (TCP) relay dial. Pion still
+		// opens its LOCAL UDP sockets for host candidates and TURN allocation
+		// via ListenPacket, which are unprotected by default. Once the Android
+		// TUN is up, those unprotected UDP sockets loop back into the tunnel,
+		// so any ICE work done AFTER connect - notably the publisher-PC
+		// renegotiation retained by #95 - fails with "TURN all retransmissions
+		// failed" on NAT'd real devices that need a relay. Emulators get a
+		// direct host/srflx path and never exercise TURN, so this only breaks
+		// on-device. Route every Pion socket through the VpnService protector,
+		// matching the jitsi engine.
+		pnet, err := protect.NewProtectedNet()
+		if err != nil {
+			return nil, fmt.Errorf("protected net: %w", err)
+		}
+		settingEngine.SetNet(pnet)
+		settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	}
 	settingEngine.LoggerFactory = logger.NewPionLoggerFactory()
 
