@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -38,6 +39,21 @@ const (
 	kcpSndWnd = 450
 	kcpRcvWnd = 1024
 
+	// Reed-Solomon FEC — DISABLED (kept documented after Exp #68).
+	//
+	// FEC was trialled (RS(13,10), 30% parity overhead) to recover lost
+	// packets without an RTO round-trip. It measurably improved KCP-level
+	// recovery (fast-retransmit began firing, RetransSegs -85%, RepeatSegs
+	// -95%) BUT regressed the end-to-end transfer: the extra 30% packet volume
+	// overloaded the capacity/policing-limited VP8/Telemost path, and even the
+	// initial public-IP request stopped completing. FEC helps random-loss
+	// links; this path is congestion/bufferbloat-limited, where adding packets
+	// is counterproductive. The correct lever is rate control (pacer) + RTO
+	// tuning, not FEC. Left at 0/0. Both peers must match, so do not enable one
+	// side only.
+	kcpFECDataShards   = 0
+	kcpFECParityShards = 0
+
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
 	// outside of kcp.Send, which destroys the frg field that message mode
@@ -63,12 +79,19 @@ type kcpRuntime struct {
 	readDone  chan struct{}
 	writeMu   sync.Mutex // serializes length-prefix + payload writes
 	closeOnce sync.Once
+	// deliveredBytes counts application payload bytes actually delivered to
+	// onData (real in-order forward progress). Unlike kcp.DefaultSnmp.
+	// BytesReceived — which counts raw input including duplicate/retransmit
+	// segments and therefore keeps ticking up even when a path has stalled and
+	// only dups arrive — this only advances when the tunnel makes genuine
+	// inbound progress. The stall watchdog needs exactly that distinction.
+	deliveredBytes atomic.Uint64
 }
 
 func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte, frameInterval time.Duration) (*kcpRuntime, error) {
 	c := newKCPConn(out, inboundQueueSize, epochHdr)
 
-	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
+	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, kcpFECDataShards, kcpFECParityShards, c)
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("kcp new conn: %w", err)
@@ -131,6 +154,7 @@ func (r *kcpRuntime) readLoop(onData func([]byte)) {
 			return
 		}
 		if onData != nil {
+			r.deliveredBytes.Add(uint64(len(payload)))
 			onData(payload)
 		}
 	}
@@ -154,14 +178,20 @@ func (r *kcpRuntime) send(msg []byte) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
-	logger.Infof("vp8channel: KCP.send: queuing %d bytes", len(msg))
+	// Per-message send tracing is Debug-only: it fires on the data hot path
+	// (once per WireGuard/tunnel packet). On mobile the process logger writes
+	// to a file on flash storage under a global mutex, so keeping this at Info
+	// serialized every packet behind two synchronous writes and throttled
+	// throughput to a trickle. Aggregate KCP counters are reported every few
+	// seconds by logDiagnostics instead.
+	logger.Debugf("vp8channel: KCP.send: queuing %d bytes", len(msg))
 	if _, err := r.sess.Write(hdr[:]); err != nil {
 		return fmt.Errorf("kcp write header: %w", err)
 	}
 	if _, err := r.sess.Write(msg); err != nil {
 		return fmt.Errorf("kcp write payload: %w", err)
 	}
-	logger.Infof("vp8channel: KCP.send: flushed %d bytes to UDPSession", len(msg))
+	logger.Debugf("vp8channel: KCP.send: flushed %d bytes to UDPSession", len(msg))
 	return nil
 }
 
@@ -170,6 +200,23 @@ func (r *kcpRuntime) close() {
 		_ = r.sess.Close()
 		_ = r.conn.Close()
 	})
+}
+
+// srtt returns KCP's smoothed round-trip time in milliseconds, the signal the
+// delay-based pacer uses to detect bufferbloat. Returns 0 before the first RTT
+// sample (no ACK yet).
+func (r *kcpRuntime) srtt() int32 {
+	return r.sess.GetSRTT()
+}
+
+// paceSampleCounters returns the counters the pacer and stall watchdog react
+// to. inBytes is application-delivered payload (real inbound progress, per this
+// runtime — resets on a KCP restart, which is fine: the watchdog treats a reset
+// as "no progress"). outBytes/outSegs/retransSegs are process-global
+// (kcp.DefaultSnmp) send/loss counters; only deltas are used.
+func (r *kcpRuntime) paceSampleCounters() (inBytes, outBytes, outSegs, retransSegs uint64) {
+	snmp := kcp.DefaultSnmp.Copy()
+	return r.deliveredBytes.Load(), snmp.BytesSent, snmp.OutSegs, snmp.RetransSegs
 }
 
 type kcpRuntimeStats struct {

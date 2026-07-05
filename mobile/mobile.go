@@ -55,7 +55,7 @@ var (
 )
 
 const (
-	defaultTransport     = "vp8channel"
+	defaultTransport    = "vp8channel"
 	seichannelTransport = "seichannel"
 	dataTransport       = "datachannel"
 	defaultDNSServer    = "8.8.8.8:53"
@@ -84,14 +84,15 @@ var (
 )
 
 type mobileConfig struct {
-	transport        string
-	dnsServer        string
-	socksListenHost  string
-	vp8FPS           int
-	vp8BatchSize     int
-	livenessInterval time.Duration
-	livenessTimeout  time.Duration
-	livenessFailures int
+	transport         string
+	dnsServer         string
+	socksListenHost   string
+	vp8FPS            int
+	vp8BatchSize      int
+	vp8MaxBytesPerSec int
+	livenessInterval  time.Duration
+	livenessTimeout   time.Duration
+	livenessFailures  int
 }
 
 // SetProtector sets the Android VPN socket protector.
@@ -151,6 +152,22 @@ func SetVP8Options(fps, batchSize int) {
 	ensureDefaultConfigLocked()
 	defaults.vp8FPS = clampAtLeastOne(fps, 120)
 	defaults.vp8BatchSize = clampAtLeastOne(batchSize, 64)
+}
+
+// SetVP8MaxBytesPerSec sets the upper bound for the vp8channel wire byte-rate
+// pacer. The adaptive delay-based pacer probes up to but never above this cap;
+// a value <= 0 leaves the transport default (which also honours the
+// OLCRTC_VP8_MAX_BYTES_PER_SEC env var). This lets the mobile client bound its
+// own uplink pace symmetrically with the server, which matters because the
+// client's KCP ACK uplink gates the server's download window.
+func SetVP8MaxBytesPerSec(maxBytesPerSec int) {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	if maxBytesPerSec < 0 {
+		maxBytesPerSec = 0
+	}
+	defaults.vp8MaxBytesPerSec = maxBytesPerSec
 }
 
 // SetLivenessOptions configures control-stream ping/pong checks.
@@ -249,16 +266,16 @@ func Check(
 		doneCh <- runClientWithReady(
 			ctx,
 			client.Config{
-				Transport: transportName,
-				Carrier:   carrierName,
-				RoomURL:   buildRoomURL(carrierName, roomID),
-				KeyHex:    keyHex,
-				Plaintext: plaintext,
-				DeviceID:  clientID,
-				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
-				DNSServer: defaultDNSServer,
-				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize),
-				Liveness: livenessConfig(cfg),
+				Transport:        transportName,
+				Carrier:          carrierName,
+				RoomURL:          buildRoomURL(carrierName, roomID),
+				KeyHex:           keyHex,
+				Plaintext:        plaintext,
+				DeviceID:         clientID,
+				LocalAddr:        socksListenAddr(cfg.socksListenHost, socksPort),
+				DNSServer:        defaultDNSServer,
+				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize, cfg.vp8MaxBytesPerSec),
+				Liveness:         livenessConfig(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -337,16 +354,16 @@ func Ping(
 		doneCh <- runClientWithReady(
 			ctx,
 			client.Config{
-				Transport: transportName,
-				Carrier:   carrierName,
-				RoomURL:   buildRoomURL(carrierName, roomID),
-				KeyHex:    keyHex,
-				Plaintext: false, // Ping doesn't use plaintext
-				DeviceID:  clientID,
-				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
-				DNSServer: defaultDNSServer,
-				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize),
-				Liveness: livenessConfig(cfg),
+				Transport:        transportName,
+				Carrier:          carrierName,
+				RoomURL:          buildRoomURL(carrierName, roomID),
+				KeyHex:           keyHex,
+				Plaintext:        false, // Ping doesn't use plaintext
+				DeviceID:         clientID,
+				LocalAddr:        socksListenAddr(cfg.socksListenHost, socksPort),
+				DNSServer:        defaultDNSServer,
+				TransportOptions: transportOptionsFor(transportName, vp8FPS, vp8BatchSize, cfg.vp8MaxBytesPerSec),
+				Liveness:         livenessConfig(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -583,18 +600,18 @@ func startWithConfig(
 		err := runClientWithReady(
 			ctx,
 			client.Config{
-				Transport: cfg.transport,
-				Carrier:   carrierName,
-				RoomURL:   roomURL,
-				KeyHex:    keyHex,
-				Plaintext: plaintext,
-				DeviceID:  clientID,
-				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
-				DNSServer: cfg.dnsServer,
-				SOCKSUser: socksUser,
-				SOCKSPass: socksPass,
-				TransportOptions: transportOptionsFor(cfg.transport, cfg.vp8FPS, cfg.vp8BatchSize),
-				Liveness: livenessConfig(cfg),
+				Transport:        cfg.transport,
+				Carrier:          carrierName,
+				RoomURL:          roomURL,
+				KeyHex:           keyHex,
+				Plaintext:        plaintext,
+				DeviceID:         clientID,
+				LocalAddr:        socksListenAddr(cfg.socksListenHost, socksPort),
+				DNSServer:        cfg.dnsServer,
+				SOCKSUser:        socksUser,
+				SOCKSPass:        socksPass,
+				TransportOptions: transportOptionsFor(cfg.transport, cfg.vp8FPS, cfg.vp8BatchSize, cfg.vp8MaxBytesPerSec),
+				Liveness:         livenessConfig(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -782,7 +799,10 @@ func normalizeCarrier(carrierName string) string {
 }
 
 // transportOptionsFor builds the correct transport.Options for the given transportName.
-func transportOptionsFor(transportName string, fps, batchSize int) transport.Options {
+func transportOptionsFor(transportName string, fps, batchSize, maxBytesPerSec int) transport.Options {
+	if maxBytesPerSec < 0 {
+		maxBytesPerSec = 0
+	}
 	switch transportName {
 	case seichannelTransport:
 		return seichannel.Options{
@@ -791,8 +811,9 @@ func transportOptionsFor(transportName string, fps, batchSize int) transport.Opt
 		}
 	default:
 		return vp8channel.Options{
-			FPS:       clampAtLeastOne(fps, 120),
-			BatchSize: clampAtLeastOne(batchSize, 64),
+			FPS:            clampAtLeastOne(fps, 120),
+			BatchSize:      clampAtLeastOne(batchSize, 64),
+			MaxBytesPerSec: maxBytesPerSec,
 		}
 	}
 }

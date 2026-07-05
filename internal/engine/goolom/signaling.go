@@ -161,7 +161,18 @@ func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
 		s.logSignalSummary("slotsConfig", payload, 6)
 		s.sendAck(uid)
 		if slotsConfigHasUnboundParticipant(payload) {
-			s.triggerDeferredReconnect("slotsConfig has participantVideoByMid with empty mid")
+			// An empty participantVideoByMid mid used to force an immediate
+			// repair reconnect. That fast-path is too aggressive: Telemost emits
+			// slotsConfig within ~1s of the client joining — long before the
+			// client can finish its smux/control handshake — so it tore the
+			// session down every few seconds and the handshake never completed
+			// (stable-looking connect that still timed out on HTTP). The tunnel
+			// actually works with an empty mid because client↔server routing is
+			// epoch-based, not MID-based (the client receives server VP8 fine).
+			// Let the control-path-proof window in checkNewParticipant decide:
+			// if the client proves liveness (CONTROL_PONG) we keep the session;
+			// only a genuine no-pong timeout triggers the repair reconnect.
+			logger.Infof("goolom: slotsConfig reports empty participantVideoByMid mid (deferring to control-path proof, no immediate reconnect)")
 		}
 	}
 	if payload, ok := msg["slotsMeta"]; ok {
@@ -470,7 +481,26 @@ func (s *Session) triggerDeferredReconnect(reason string) {
 	if s.closed.Load() {
 		return
 	}
+	// If the client's control path was recently proven alive (a CONTROL_PONG
+	// within the protect window), the tunnel is already working even though
+	// Telemost reports an empty MID binding: client↔server routing is
+	// epoch-based, not MID-based, so an empty mid does not actually break this
+	// tunnel. Reconnecting here would tear the active smux/WireGuard session
+	// down every few seconds and prevent any real traffic from completing
+	// (observed as a stable-looking connect that still times out on HTTP).
+	// The slotsConfig empty-mid fast-path funnels through here too, so this
+	// guard protects both it and the 12s fallback. checkNewParticipant already
+	// applies the same window before arming; this mirrors it for the trigger.
+	const handshakeProtectWindow = 75 * time.Second
+	if ts := s.lastHandshakeAt.Load(); ts != 0 {
+		if elapsed := time.Since(time.Unix(0, ts)); elapsed < handshakeProtectWindow {
+			logger.Infof("goolom: skipping deferred reconnect (%s): control path alive %s ago (protect window %s)",
+				reason, elapsed.Truncate(time.Second), handshakeProtectWindow)
+			return
+		}
+	}
 	logger.Infof("goolom: triggering deferred reconnect for fresh SDP exchange (%s)", reason)
+	s.intentionalReconnect.Store(true)
 	s.queueReconnect()
 }
 

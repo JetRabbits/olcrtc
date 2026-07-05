@@ -290,9 +290,23 @@ func (s *Session) handleReconnectAttempt(ctx context.Context, maxReconnects int,
 	if time.Since(s.lastReconnect) > reconnectWindow {
 		s.reconnectCount = 0
 	}
-	s.reconnectCount++
 	s.lastReconnect = time.Now()
 
+	// A deliberate MID-binding repair reconnect (fresh SDP for a newly joined
+	// participant) is expected operational churn, not a conference failure. It
+	// must not count toward the failure budget, otherwise ordinary client-join
+	// activity drives reconnectCount past maxReconnects and the server ends the
+	// conference and exits (observed as repeated k8s pod restarts). Genuine
+	// failures (ws/ice/liveness) still accumulate and trip the guard.
+	if s.intentionalReconnect.Swap(false) {
+		backoff := time.Duration(s.reconnectCount+1) * 2 * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		return s.retryReconnect(ctx, backoff)
+	}
+
+	s.reconnectCount++
 	if s.reconnectCount > maxReconnects {
 		s.signalEnded("reconnect limit reached")
 		return true

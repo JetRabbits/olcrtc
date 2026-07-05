@@ -2,6 +2,9 @@ package vp8channel
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 )
@@ -41,4 +44,26 @@ func optionsFrom(cfg transport.Config) (Options, error) {
 		return Options{}, fmt.Errorf("%w: vp8channel: got %T", transport.ErrOptionsTypeMismatch, cfg.Options)
 	}
 	return opts, nil
+}
+
+// envMaxBytesPerSec returns the wire byte-rate cap configured via the
+// OLCRTC_VP8_MAX_BYTES_PER_SEC environment variable, or 0 when unset/invalid.
+//
+// This is an operational tuning knob for the VP8/KCP pacer. On a real mobile
+// carrier the fixed 1.2 MiB/s default can overdrive the path: KCP (nc=1) plus
+// the pacer keep the wire full faster than the radio/SFU can drain, srtt
+// balloons (observed 314ms -> ~1s) and the path collapses into an RTO
+// retransmit stall. Lowering the cap to match the sustainable path rate avoids
+// the bufferbloat. Kept as an env var so it can be tuned per deployment
+// (kubectl set env) without a rebuild; unset preserves the historical default.
+func envMaxBytesPerSec() int {
+	raw := strings.TrimSpace(os.Getenv("OLCRTC_VP8_MAX_BYTES_PER_SEC"))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }

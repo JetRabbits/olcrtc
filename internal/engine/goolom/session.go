@@ -115,6 +115,14 @@ type Session struct {
 	reconnectCount int
 	sessionMu      sync.Mutex
 
+	// intentionalReconnect marks the next queued reconnect as a deliberate
+	// MID-binding repair (fresh SDP exchange) rather than a connection
+	// failure. Repair reconnects are a normal, expected part of servicing new
+	// participants and must not exhaust the failure budget that guards against
+	// dead-conference loops (which would otherwise make the server process
+	// exit and restart under k8s during ordinary client-join churn).
+	intentionalReconnect atomic.Bool
+
 	sendQueue       chan []byte
 	sendQueueClosed atomic.Bool
 	closed          atomic.Bool

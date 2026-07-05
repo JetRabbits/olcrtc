@@ -133,7 +133,11 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		if elapsed > 50*time.Millisecond {
 			c.writeBlocks.Add(1)
 			updateMaxUint64(&c.maxWriteDelayMS, uint64(elapsed.Milliseconds()))
-			logger.Infof("vp8channel: kcpConn.WriteTo: %d bytes → outbound (len=%d, dur=%v)", len(buf), len(c.out), elapsed)
+			// Debug-only: a stalled outbound enqueue can repeat per packet under
+			// carrier back-pressure. The writeBlocks/maxWriteDelayMS counters are
+			// surfaced by logDiagnostics every few seconds; keep this off the
+			// synchronous (flash-backed on mobile) Info path.
+			logger.Debugf("vp8channel: kcpConn.WriteTo: %d bytes → outbound (len=%d, dur=%v)", len(buf), len(c.out), elapsed)
 		}
 		return len(p), nil
 	case <-c.closed:

@@ -107,10 +107,36 @@ type streamTransport struct {
 	writerUp      atomic.Bool
 	writerOnce    sync.Once
 	kcpOnce       sync.Once
+	paceOnce      sync.Once
 	frameInterval time.Duration
 	batchSize     int
-	perTickBytes  int
-	writeMu       sync.Mutex
+	fps           int
+	// perTickBytes is the current per-frame-tick byte budget the writer may
+	// emit. It bounds the wire rate (perTickBytes*fps). When the adaptive
+	// pacer is enabled a background controller rewrites it from observed srtt;
+	// otherwise it stays at the fixed startup value. Atomic because the
+	// controller goroutine writes it while the writer/peer-writer goroutines
+	// read it.
+	perTickBytes atomic.Int64
+	// maxBytesPerSec is the hard upper bound (opts / env / default) the
+	// adaptive pacer must never exceed.
+	maxBytesPerSec int
+	// adaptivePacer enables the delay-based rate controller (paceControlLoop).
+	adaptivePacer bool
+	// stallRecovery enables the dataplane stall watchdog (stall.go): a frozen
+	// inbound path while still sending triggers a carrier reconnect to force a
+	// fresh WebRTC/SFU media allocation.
+	stallRecovery bool
+	// stallTimeout is how long inbound may stay frozen (while sending) before
+	// the watchdog declares a stall. Includes per-instance jitter so the two
+	// ends do not trigger dueling reconnects.
+	stallTimeout time.Duration
+	// stallRecoveries counts watchdog-triggered recovery reconnects (diagnostics).
+	stallRecoveries atomic.Uint64
+	// paceEffectiveRate is the controller's current byte-rate, published for
+	// diagnostics.
+	paceEffectiveRate atomic.Int64
+	writeMu           sync.Mutex
 
 	// localEpoch is stamped into every outgoing VP8 frame. Explicit
 	// upper-layer resets rotate it so the peer can reset its KCP state too.
@@ -221,6 +247,9 @@ func newStreamTransport(
 	}
 	byteRate := opts.MaxBytesPerSec
 	if byteRate <= 0 {
+		byteRate = envMaxBytesPerSec()
+	}
+	if byteRate <= 0 {
 		byteRate = defaultMaxBytesPerSec
 	}
 	// Bytes we may emit per frame tick to hold the wire under byteRate. The
@@ -229,6 +258,19 @@ func newStreamTransport(
 	perTickBytes := byteRate / fps
 	if perTickBytes < epochHdrLen {
 		perTickBytes = epochHdrLen
+	}
+
+	adaptive := envAdaptivePacerEnabled()
+	// With the adaptive pacer the wire starts conservatively and probes up
+	// from observed delay, so seed perTickBytes from the controller's start
+	// rate rather than the (high) upper bound. Without it, keep the historical
+	// fixed budget.
+	startPerTick := perTickBytes
+	startRate := byteRate
+	if adaptive {
+		ctrl := newPaceController(byteRate, fps, time.Now())
+		startPerTick = ctrl.perTickBytes()
+		startRate = ctrl.currentRate()
 	}
 
 	tr := &streamTransport{
@@ -242,12 +284,24 @@ func newStreamTransport(
 		videoTrackReady: make(chan struct{}),
 		frameInterval:   time.Second / time.Duration(fps),
 		batchSize:       batchSize,
-		perTickBytes:    perTickBytes,
+		fps:             fps,
+		maxBytesPerSec:  byteRate,
+		adaptivePacer:   adaptive,
+		stallRecovery:   envStallRecoveryEnabled(),
 		bindingToken:    bindingToken(cfg.RoomURL),
 		localEpoch:      randomEpoch(),
 		peers:           make(map[uint32]*kcpRuntime),
 		peerOut:         make(map[uint32]chan []byte),
 	}
+	// Stall timeout = base (env or default) + per-instance jitter, so the
+	// server and client stall timers desync and do not fire dueling recoveries.
+	stallBase := envStallTimeout()
+	if stallBase <= 0 {
+		stallBase = defaultStallTimeout
+	}
+	tr.stallTimeout = stallBase + time.Duration(randomEpoch()%uint32(stallJitterMaxMS))*time.Millisecond
+	tr.perTickBytes.Store(int64(startPerTick))
+	tr.paceEffectiveRate.Store(int64(startRate))
 
 	// In single-peer mode, confirm the peer epoch only on first successful
 	// upper-layer KCP delivery. Telemost can forward priming/control/garbage
@@ -300,7 +354,96 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 		go p.writerLoop()
 	})
 
+	if p.adaptivePacer || p.stallRecovery {
+		p.paceOnce.Do(func() {
+			go p.paceControlLoop()
+		})
+	}
+
 	return nil
+}
+
+// perTick returns the current per-frame-tick byte budget for the wire pacer.
+func (p *streamTransport) perTick() int {
+	return int(p.perTickBytes.Load())
+}
+
+// paceSample bundles the control inputs the pacer and stall watchdog react to.
+type paceSample struct {
+	srttMS        int32
+	outSegs       uint64
+	retrans       uint64
+	inBytes       uint64
+	outBytes      uint64
+	queueNonEmpty bool
+}
+
+// currentPaceSample gathers the pacer/watchdog control inputs. In single-peer
+// mode it reflects the main KCP session; in multi-peer mode the srtt is the
+// worst (highest) across peers so pacing protects the most congested peer, and
+// the (process-global) byte/segment counters are read once. All zero when no
+// KCP runtime exists yet.
+func (p *streamTransport) currentPaceSample() paceSample {
+	queueNonEmpty := len(p.outbound) > 0
+	p.kcpMu.RLock()
+	rt := p.kcp
+	p.kcpMu.RUnlock()
+	if rt != nil {
+		inB, outB, outSegs, retr := rt.paceSampleCounters()
+		return paceSample{
+			srttMS: rt.srtt(), outSegs: outSegs, retrans: retr,
+			inBytes: inB, outBytes: outB, queueNonEmpty: queueNonEmpty,
+		}
+	}
+	var worst int32
+	var inB, outB, outSegs, retr uint64
+	p.peersMu.RLock()
+	for _, prt := range p.peers {
+		if v := prt.srtt(); v > worst {
+			worst = v
+		}
+		inB, outB, outSegs, retr = prt.paceSampleCounters()
+	}
+	p.peersMu.RUnlock()
+	return paceSample{
+		srttMS: worst, outSegs: outSegs, retrans: retr,
+		inBytes: inB, outBytes: outB, queueNonEmpty: queueNonEmpty,
+	}
+}
+
+// paceControlLoop drives the delay-based rate controller and the dataplane
+// stall watchdog: every control tick it samples srtt, loss and inbound/outbound
+// progress, updates the pacer's per-tick budget, and — if inbound has frozen
+// while we keep sending — triggers a carrier reconnect to re-allocate the SFU
+// media path. Runs until the transport is closed.
+func (p *streamTransport) paceControlLoop() {
+	ticker := time.NewTicker(adaptiveControlInterval)
+	defer ticker.Stop()
+
+	ctrl := newPaceController(p.maxBytesPerSec, p.fps, time.Now())
+	var stall *stallDetector
+	if p.stallRecovery {
+		stall = newStallDetector(p.stallTimeout, stallMinRecoveryGap)
+	}
+	for {
+		select {
+		case <-p.closeCh:
+			return
+		case now := <-ticker.C:
+			s := p.currentPaceSample()
+			if p.adaptivePacer {
+				ptb := ctrl.observe(s.srttMS, s.outSegs, s.retrans, now)
+				p.perTickBytes.Store(int64(ptb))
+				p.paceEffectiveRate.Store(int64(ctrl.currentRate()))
+			}
+			if stall != nil && stall.observe(s.inBytes, s.outSegs, s.queueNonEmpty, p.peerConfirmed.Load(), now) {
+				p.stallRecoveries.Add(1)
+				logger.Warnf("vp8channel: dataplane stall detected (inbound frozen >=%v while sending) - triggering media recovery reconnect #%d",
+					p.stallTimeout, p.stallRecoveries.Load())
+				go p.stream.Reconnect("dataplane-stall")
+			}
+		}
+	}
 }
 
 // epochHeader returns the 5-byte VP8-frame header used to tag every KCP
@@ -598,7 +741,7 @@ func (p *streamTransport) writerLoop() {
 			isKeepalive := false
 			select {
 			case frame := <-p.outbound:
-				sample = p.batchSample(frame, p.perTickBytes)
+				sample = p.batchSample(frame, p.perTick())
 				idleTicks = 0
 				outboundSeq++
 				diagOutboundSamples++
@@ -624,7 +767,11 @@ func (p *streamTransport) writerLoop() {
 			}
 
 			if !isKeepalive {
-				logger.Infof("vp8channel: writerLoop: outbound #%d, %d bytes (outbound_q=%d)", outboundSeq, len(sample), len(p.outbound))
+				// Debug-only: fires per emitted VP8 sample on the data hot path.
+				// On mobile the logger writes to a flash-backed file under a
+				// global mutex, so leaving this at Info paced the writer to disk
+				// I/O. Periodic throughput is covered by logDiagnostics.
+				logger.Debugf("vp8channel: writerLoop: outbound #%d, %d bytes (outbound_q=%d)", outboundSeq, len(sample), len(p.outbound))
 			}
 			p.writeSample(sample)
 			if now.Sub(lastDiag) >= diagnosticsInterval {
@@ -661,18 +808,20 @@ func (p *streamTransport) logDiagnostics(interval time.Duration, outboundSamples
 	p.kcpMu.RUnlock()
 
 	if rt == nil {
-		logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp=nil",
+		logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d pace={bps:%d,per_tick:%d,adaptive:%v,stall_recov:%d} can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp=nil",
 			interval.Truncate(time.Millisecond), outboundSamples, outboundBytes, keepalives,
 			len(p.outbound), cap(p.outbound), p.maxOutboundQueue.Load(),
+			p.paceEffectiveRate.Load(), p.perTickBytes.Load(), p.adaptivePacer, p.stallRecoveries.Load(),
 			p.canSendFalseClosed.Load(), p.canSendFalseNoKCP.Load(), p.canSendFalseStream.Load(), p.canSendFalseQueue.Load(),
 			p.writeSampleSlow.Load(), p.writeSampleErrors.Load())
 		return
 	}
 
 	st := rt.stats()
-	logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp={srtt_ms:%d,rto_ms:%d,in:%dB/%dpkts,out:%dB/%dpkts,drops:%d,write_blocks:%d,max_write_delay_ms:%d,in_q:%d/%d,max_in_q:%d,out_q:%d/%d,max_out_q:%d,snmp_sent:%dB,snmp_recv:%dB,segs_in:%d,segs_out:%d,retrans:%d,fast_retrans:%d,early_retrans:%d,lost:%d,repeat:%d,snd_q:%d,snd_buf:%d,rcv_q:%d}",
+	logger.Infof("vp8channel diagnostics: interval=%v outbound_samples=%d outbound_bytes=%d keepalives=%d outbound_q=%d/%d max_outbound_q=%d pace={bps:%d,per_tick:%d,adaptive:%v,stall_recov:%d} can_send_false={closed:%d,kcp_nil:%d,stream:%d,queue:%d} write_sample={slow:%d,errors:%d} kcp={srtt_ms:%d,rto_ms:%d,in:%dB/%dpkts,out:%dB/%dpkts,drops:%d,write_blocks:%d,max_write_delay_ms:%d,in_q:%d/%d,max_in_q:%d,out_q:%d/%d,max_out_q:%d,snmp_sent:%dB,snmp_recv:%dB,segs_in:%d,segs_out:%d,retrans:%d,fast_retrans:%d,early_retrans:%d,lost:%d,repeat:%d,snd_q:%d,snd_buf:%d,rcv_q:%d}",
 		interval.Truncate(time.Millisecond), outboundSamples, outboundBytes, keepalives,
 		len(p.outbound), cap(p.outbound), p.maxOutboundQueue.Load(),
+		p.paceEffectiveRate.Load(), p.perTickBytes.Load(), p.adaptivePacer, p.stallRecoveries.Load(),
 		p.canSendFalseClosed.Load(), p.canSendFalseNoKCP.Load(), p.canSendFalseStream.Load(), p.canSendFalseQueue.Load(),
 		p.writeSampleSlow.Load(), p.writeSampleErrors.Load(),
 		st.SRTTMS, st.RTOMS,
@@ -1001,7 +1150,7 @@ func (p *streamTransport) peerWriterPump(_ uint32, out chan []byte) {
 				if !ok {
 					return
 				}
-				p.writeSample(p.batchSampleFrom(frame, out, p.perTickBytes))
+				p.writeSample(p.batchSampleFrom(frame, out, p.perTick()))
 			default:
 			}
 		}
