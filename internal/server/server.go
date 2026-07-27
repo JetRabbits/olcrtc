@@ -176,6 +176,20 @@ func (ps *peerSession) dataPlaneActive() (streams int64, lastTrafficAge time.Dur
 	return 0, 0, false
 }
 
+func (s *Server) anyPeerDataPlaneActive() (peerID string, streams int64, lastTrafficAge time.Duration, ok bool) {
+	if s == nil {
+		return "", 0, 0, false
+	}
+	s.sessMu.RLock()
+	defer s.sessMu.RUnlock()
+	for id, ps := range s.peerSessions {
+		if activeStreams, age, active := ps.dataPlaneActive(); active {
+			return id, activeStreams, age, true
+		}
+	}
+	return "", 0, 0, false
+}
+
 // ConnectRequest is a message from the client to establish a new connection.
 type ConnectRequest struct {
 	Cmd  string `json:"cmd"`
@@ -1029,6 +1043,11 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 			case <-ctx.Done():
 				return false
 			default:
+			}
+			if peerID, streams, age, ok := s.anyPeerDataPlaneActive(); ok {
+				logger.Warnf("server: AcceptStream(control) error ignored reason=active-data-plane peer=%s streams=%d last_traffic_age=%s err=%v",
+					peerID, streams, age.Round(time.Second), err)
+				return false
 			}
 			logger.Infof("server: AcceptStream(control) error - reinstalling session: %v", err)
 			s.resetLinkPeer()

@@ -850,6 +850,34 @@ func TestServePeerAcceptStreamErrorClosesSessionWhenDataPlaneInactive(t *testing
 	}
 }
 
+func TestAcceptHandshakeControlErrorKeepsSessionWhenPeerDataPlaneActive(t *testing.T) {
+	serverSess, clientSess, cleanup := newSmuxSessionPair(t)
+	defer cleanup()
+	_ = clientSess.Close()
+	_ = serverSess.Close()
+
+	closed := make(chan string, 1)
+	ps := &peerSession{peerID: "peer-control", sessionID: "peer-sid"}
+	ps.beginStream()
+	s := &Server{
+		sessionID:    "existing-sid",
+		peerSessions: map[string]*peerSession{ps.peerID: ps},
+		onClose:      func(_ string, reason string) { closed <- reason },
+	}
+
+	if s.acceptHandshake(context.Background(), serverSess) {
+		t.Fatal("acceptHandshake unexpectedly succeeded on closed control session")
+	}
+	if got := s.currentSessionID(); got != "existing-sid" {
+		t.Fatalf("sessionID = %q, want existing-sid", got)
+	}
+	select {
+	case reason := <-closed:
+		t.Fatalf("onClose called with reason %q despite active peer data plane", reason)
+	default:
+	}
+}
+
 func newControlStreamPair(t *testing.T) (*smux.Stream, *smux.Stream, func()) {
 	t.Helper()
 	a, b := net.Pipe()
