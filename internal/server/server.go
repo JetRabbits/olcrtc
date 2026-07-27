@@ -1182,6 +1182,12 @@ func (s *Server) servePeer(ps *peerSession) {
 			if s.stopping() {
 				return
 			}
+			if streams, age, ok := ps.dataPlaneActive(); ok {
+				logger.Warnf("server: AcceptStream(peer=%s) error ignored reason=active-data-plane streams=%d last_traffic_age=%s err=%v",
+					ps.peerID, streams, age.Round(time.Second), err)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			logger.Infof("server: AcceptStream(peer=%s) error - closing peer session: %v", ps.peerID, err)
 			s.removePeerSession(ps.peerID, "closed")
 			return

@@ -759,6 +759,97 @@ func TestPeerControlLoopClosesSessionWhenNoRecentTraffic(t *testing.T) {
 	}
 }
 
+func TestServePeerAcceptStreamErrorKeepsSessionAliveWhenDataPlaneActive(t *testing.T) {
+	serverSess, clientSess, cleanup := newSmuxSessionPair(t)
+	defer cleanup()
+	_ = clientSess.Close()
+	_ = serverSess.Close()
+
+	closed := make(chan string, 1)
+	ps := &peerSession{peerID: "peer-upload", session: serverSess, sessionID: "sid-upload"}
+	ps.beginStream()
+	s := &Server{
+		done:         make(chan struct{}),
+		peerSessions: map[string]*peerSession{ps.peerID: ps},
+		onClose:      func(_ string, reason string) { closed <- reason },
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		s.servePeer(ps)
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	s.sessMu.RLock()
+	_, exists := s.peerSessions[ps.peerID]
+	s.sessMu.RUnlock()
+	if !exists {
+		t.Fatal("peer session removed despite active data plane after AcceptStream error")
+	}
+	select {
+	case reason := <-closed:
+		t.Fatalf("onClose called with reason %q despite active data plane", reason)
+	default:
+	}
+
+	ps.endStream()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("servePeer did not exit after data plane became inactive")
+	}
+	select {
+	case reason := <-closed:
+		if reason != "closed" {
+			t.Fatalf("close reason = %q, want closed", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("onClose not called after data plane became inactive")
+	}
+}
+
+func TestServePeerAcceptStreamErrorClosesSessionWhenDataPlaneInactive(t *testing.T) {
+	serverSess, clientSess, cleanup := newSmuxSessionPair(t)
+	defer cleanup()
+	_ = clientSess.Close()
+	_ = serverSess.Close()
+
+	closed := make(chan string, 1)
+	ps := &peerSession{peerID: "peer-idle", session: serverSess, sessionID: "sid-idle"}
+	s := &Server{
+		done:         make(chan struct{}),
+		peerSessions: map[string]*peerSession{ps.peerID: ps},
+		onClose:      func(_ string, reason string) { closed <- reason },
+	}
+
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		s.servePeer(ps)
+	}()
+
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("servePeer did not exit after inactive AcceptStream error")
+	}
+	select {
+	case reason := <-closed:
+		if reason != "closed" {
+			t.Fatalf("close reason = %q, want closed", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("onClose not called for inactive AcceptStream error")
+	}
+
+	s.sessMu.RLock()
+	_, exists := s.peerSessions[ps.peerID]
+	s.sessMu.RUnlock()
+	if exists {
+		t.Fatal("peer session still present after inactive AcceptStream error")
+	}
+}
+
 func newControlStreamPair(t *testing.T) (*smux.Stream, *smux.Stream, func()) {
 	t.Helper()
 	a, b := net.Pipe()
@@ -796,6 +887,26 @@ func newControlStreamPair(t *testing.T) (*smux.Stream, *smux.Stream, func()) {
 		_ = b.Close()
 	}
 	return serverStream, clientStream, cleanup
+}
+
+func newSmuxSessionPair(t *testing.T) (*smux.Session, *smux.Session, func()) {
+	t.Helper()
+	a, b := net.Pipe()
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	cleanup := func() {
+		_ = clientSess.Close()
+		_ = serverSess.Close()
+		_ = a.Close()
+		_ = b.Close()
+	}
+	return serverSess, clientSess, cleanup
 }
 
 func TestStatusRecordsReconnectAndUnhealthy(t *testing.T) {
