@@ -668,7 +668,7 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 	}
 }
 
-func TestPeerControlLoopKeepsSessionAliveWhenTrafficRecent(t *testing.T) {
+func TestPeerControlLoopKeepsSessionAliveWhenDataPlaneActive(t *testing.T) {
 	serverStream, clientStream, cleanup := newControlStreamPair(t)
 	defer cleanup()
 	go func() { _, _ = io.Copy(io.Discard, clientStream) }()
@@ -677,7 +677,8 @@ func TestPeerControlLoopKeepsSessionAliveWhenTrafficRecent(t *testing.T) {
 	unhealthy := make(chan int, 1)
 	closed := make(chan string, 1)
 	ps := &peerSession{peerID: "peer-recent", sessionID: "sid-recent"}
-	ps.markTraffic(time.Now())
+	ps.beginStream()
+	defer ps.endStream()
 	s := &Server{
 		health:       runtime.NewHealthTracker(nil),
 		peerSessions: map[string]*peerSession{ps.peerID: ps},
@@ -708,11 +709,11 @@ func TestPeerControlLoopKeepsSessionAliveWhenTrafficRecent(t *testing.T) {
 	_, exists := s.peerSessions[ps.peerID]
 	s.sessMu.RUnlock()
 	if !exists {
-		t.Fatal("peer session removed despite recent data-plane traffic")
+		t.Fatal("peer session removed despite active data plane")
 	}
 	select {
 	case reason := <-closed:
-		t.Fatalf("onClose called with reason %q despite recent traffic", reason)
+		t.Fatalf("onClose called with reason %q despite active data plane", reason)
 	default:
 	}
 }

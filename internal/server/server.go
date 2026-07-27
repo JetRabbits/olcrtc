@@ -33,12 +33,6 @@ const (
 	connectCommand   = "connect"
 	udpDialCommand   = "udp-dial"
 	maxUDPPacketSize = 65535
-	// recentTrafficLivenessGrace keeps a VPN peer alive when its control stream
-	// misses pongs but the data plane is still moving. Under vp8channel/iOS load,
-	// control frames can starve behind video-paced KCP batches even while tunnel
-	// traffic is flowing; data-plane activity is the authoritative VPN liveness
-	// signal in that state.
-	recentTrafficLivenessGrace = 2 * time.Minute
 )
 
 var (
@@ -134,9 +128,12 @@ type peerSession struct {
 	controlStop context.CancelFunc
 	sessionID   string
 	deviceID    string
-	// lastTrafficUnixNano is updated when peer data-plane frames arrive. It lets
-	// the server treat active VPN traffic as proof of life even if the auxiliary
-	// control stream misses pongs under load.
+	// activeStreams counts currently open tunnel streams for this peer. Together
+	// with lastTrafficUnixNano it makes data-plane activity authoritative for VPN
+	// liveness: a control-stream failure must not kill a peer while traffic is
+	// actively flowing or streams are still open.
+	activeStreams atomic.Int64
+	// lastTrafficUnixNano is updated when peer data-plane frames arrive.
 	lastTrafficUnixNano atomic.Int64
 	// sessionReady is closed once sessionID is populated from acceptHandshake.
 	sessionReady chan struct{}
@@ -149,16 +146,34 @@ func (ps *peerSession) markTraffic(now time.Time) {
 	ps.lastTrafficUnixNano.Store(now.UnixNano())
 }
 
-func (ps *peerSession) recentTraffic(now time.Time, window time.Duration) (time.Duration, bool) {
-	if ps == nil || window <= 0 {
-		return 0, false
+func (ps *peerSession) beginStream() {
+	if ps == nil {
+		return
 	}
-	lastNano := ps.lastTrafficUnixNano.Load()
-	if lastNano <= 0 {
-		return 0, false
+	ps.activeStreams.Add(1)
+	ps.markTraffic(time.Now())
+}
+
+func (ps *peerSession) endStream() {
+	if ps == nil {
+		return
 	}
-	age := now.Sub(time.Unix(0, lastNano))
-	return age, age <= window
+	ps.activeStreams.Add(-1)
+}
+
+func (ps *peerSession) dataPlaneActive() (streams int64, lastTrafficAge time.Duration, ok bool) {
+	if ps == nil {
+		return 0, 0, false
+	}
+	streams = ps.activeStreams.Load()
+	if streams > 0 {
+		lastNano := ps.lastTrafficUnixNano.Load()
+		if lastNano > 0 {
+			return streams, time.Since(time.Unix(0, lastNano)), true
+		}
+		return streams, 0, true
+	}
+	return 0, 0, false
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
@@ -1145,12 +1160,10 @@ func (s *Server) startPeerControlLoop(ctx context.Context, ps *peerSession, stre
 		if err != nil {
 			logger.Warnf("peer control stream ended peer=%s: %v", ps.peerID, err)
 		}
-		if errors.Is(err, control.ErrUnhealthy) {
-			if age, ok := ps.recentTraffic(time.Now(), recentTrafficLivenessGrace); ok {
-				logger.Warnf("peer control unhealthy ignored peer=%s reason=recent-traffic age=%s window=%s",
-					ps.peerID, age.Round(time.Second), recentTrafficLivenessGrace)
-				return
-			}
+		if streams, age, ok := ps.dataPlaneActive(); ok {
+			logger.Warnf("peer control ended ignored peer=%s reason=active-data-plane streams=%d last_traffic_age=%s err=%v",
+				ps.peerID, streams, age.Round(time.Second), err)
+			return
 		}
 		s.removePeerSession(ps.peerID, "liveness")
 	}()
@@ -1176,6 +1189,8 @@ func (s *Server) servePeer(ps *peerSession) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			ps.beginStream()
+			defer ps.endStream()
 			s.handleStream(context.Background(), stream, ps.sessionID)
 		}()
 	}
