@@ -668,6 +668,135 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 	}
 }
 
+func TestPeerControlLoopKeepsSessionAliveWhenTrafficRecent(t *testing.T) {
+	serverStream, clientStream, cleanup := newControlStreamPair(t)
+	defer cleanup()
+	go func() { _, _ = io.Copy(io.Discard, clientStream) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	unhealthy := make(chan int, 1)
+	closed := make(chan string, 1)
+	ps := &peerSession{peerID: "peer-recent", sessionID: "sid-recent"}
+	ps.markTraffic(time.Now())
+	s := &Server{
+		health:       runtime.NewHealthTracker(nil),
+		peerSessions: map[string]*peerSession{ps.peerID: ps},
+		onClose:      func(_ string, reason string) { closed <- reason },
+		liveness: control.Config{
+			Interval: 5 * time.Millisecond,
+			Timeout:  1 * time.Millisecond,
+			Failures: 1,
+			OnUnhealthy: func(missed int) {
+				unhealthy <- missed
+			},
+		},
+	}
+	defer func() {
+		cancel()
+		s.wg.Wait()
+	}()
+
+	s.startPeerControlLoop(ctx, ps, serverStream)
+	select {
+	case <-unhealthy:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control unhealthy")
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	s.sessMu.RLock()
+	_, exists := s.peerSessions[ps.peerID]
+	s.sessMu.RUnlock()
+	if !exists {
+		t.Fatal("peer session removed despite recent data-plane traffic")
+	}
+	select {
+	case reason := <-closed:
+		t.Fatalf("onClose called with reason %q despite recent traffic", reason)
+	default:
+	}
+}
+
+func TestPeerControlLoopClosesSessionWhenNoRecentTraffic(t *testing.T) {
+	serverStream, clientStream, cleanup := newControlStreamPair(t)
+	defer cleanup()
+	go func() { _, _ = io.Copy(io.Discard, clientStream) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := make(chan string, 1)
+	ps := &peerSession{peerID: "peer-stale", sessionID: "sid-stale"}
+	s := &Server{
+		health:       runtime.NewHealthTracker(nil),
+		peerSessions: map[string]*peerSession{ps.peerID: ps},
+		onClose:      func(_ string, reason string) { closed <- reason },
+		liveness: control.Config{
+			Interval: 5 * time.Millisecond,
+			Timeout:  1 * time.Millisecond,
+			Failures: 1,
+		},
+	}
+	defer func() {
+		cancel()
+		s.wg.Wait()
+	}()
+
+	s.startPeerControlLoop(ctx, ps, serverStream)
+	select {
+	case reason := <-closed:
+		if reason != "liveness" {
+			t.Fatalf("close reason = %q, want liveness", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for liveness close")
+	}
+
+	s.sessMu.RLock()
+	_, exists := s.peerSessions[ps.peerID]
+	s.sessMu.RUnlock()
+	if exists {
+		t.Fatal("peer session still present after stale liveness close")
+	}
+}
+
+func newControlStreamPair(t *testing.T) (*smux.Stream, *smux.Stream, func()) {
+	t.Helper()
+	a, b := net.Pipe()
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	serverStreamCh := make(chan *smux.Stream, 1)
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err == nil {
+			serverStreamCh <- stream
+		}
+	}()
+	clientStream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	var serverStream *smux.Stream
+	select {
+	case serverStream = <-serverStreamCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out accepting control stream")
+	}
+	cleanup := func() {
+		_ = clientStream.Close()
+		_ = serverStream.Close()
+		_ = clientSess.Close()
+		_ = serverSess.Close()
+		_ = a.Close()
+		_ = b.Close()
+	}
+	return serverStream, clientStream, cleanup
+}
+
 func TestStatusRecordsReconnectAndUnhealthy(t *testing.T) {
 	updates := 0
 	s := &Server{health: runtime.NewHealthTracker(func(control.Status) { updates++ })}

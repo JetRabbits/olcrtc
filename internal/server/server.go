@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,12 @@ const (
 	connectCommand   = "connect"
 	udpDialCommand   = "udp-dial"
 	maxUDPPacketSize = 65535
+	// recentTrafficLivenessGrace keeps a VPN peer alive when its control stream
+	// misses pongs but the data plane is still moving. Under vp8channel/iOS load,
+	// control frames can starve behind video-paced KCP batches even while tunnel
+	// traffic is flowing; data-plane activity is the authoritative VPN liveness
+	// signal in that state.
+	recentTrafficLivenessGrace = 2 * time.Minute
 )
 
 var (
@@ -127,8 +134,31 @@ type peerSession struct {
 	controlStop context.CancelFunc
 	sessionID   string
 	deviceID    string
+	// lastTrafficUnixNano is updated when peer data-plane frames arrive. It lets
+	// the server treat active VPN traffic as proof of life even if the auxiliary
+	// control stream misses pongs under load.
+	lastTrafficUnixNano atomic.Int64
 	// sessionReady is closed once sessionID is populated from acceptHandshake.
 	sessionReady chan struct{}
+}
+
+func (ps *peerSession) markTraffic(now time.Time) {
+	if ps == nil {
+		return
+	}
+	ps.lastTrafficUnixNano.Store(now.UnixNano())
+}
+
+func (ps *peerSession) recentTraffic(now time.Time, window time.Duration) (time.Duration, bool) {
+	if ps == nil || window <= 0 {
+		return 0, false
+	}
+	lastNano := ps.lastTrafficUnixNano.Load()
+	if lastNano <= 0 {
+		return 0, false
+	}
+	age := now.Sub(time.Unix(0, lastNano))
+	return age, age <= window
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
@@ -786,6 +816,9 @@ func (s *Server) onPeerData(peerID string, data []byte) {
 		s.onData(data)
 		return
 	}
+	if len(data) > 0 {
+		ps.markTraffic(time.Now())
+	}
 	ps.conn.Push(data)
 }
 
@@ -1111,6 +1144,13 @@ func (s *Server) startPeerControlLoop(ctx context.Context, ps *peerSession, stre
 		}
 		if err != nil {
 			logger.Warnf("peer control stream ended peer=%s: %v", ps.peerID, err)
+		}
+		if errors.Is(err, control.ErrUnhealthy) {
+			if age, ok := ps.recentTraffic(time.Now(), recentTrafficLivenessGrace); ok {
+				logger.Warnf("peer control unhealthy ignored peer=%s reason=recent-traffic age=%s window=%s",
+					ps.peerID, age.Round(time.Second), recentTrafficLivenessGrace)
+				return
+			}
 		}
 		s.removePeerSession(ps.peerID, "liveness")
 	}()
