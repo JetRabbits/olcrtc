@@ -552,25 +552,71 @@ func (s *Server) handleReconnect() {
 	s.sessMu.RLock()
 	current := s.session
 	s.sessMu.RUnlock()
-	s.reinstallSession(current)
+	s.reinstallSessionWithReset(current, true)
+}
+
+type muxConnSnapshot struct {
+	conn        *muxconn.Conn
+	controlConn *muxconn.Conn
+}
+
+func (s *Server) snapshotCurrentMuxConns() []muxConnSnapshot {
+	s.sessMu.RLock()
+	defer s.sessMu.RUnlock()
+	return s.snapshotCurrentMuxConnsLocked()
+}
+
+func (s *Server) snapshotCurrentMuxConnsLocked() []muxConnSnapshot {
+	snapshots := make([]muxConnSnapshot, 0, 1+len(s.peerSessions))
+	snapshots = append(snapshots, muxConnSnapshot{conn: s.conn, controlConn: s.controlConn})
+	for _, ps := range s.peerSessions {
+		// Copy the conn pointers while sessMu is held. peerSession fields can be
+		// swapped by peer setup/teardown; reading ps.conn after unlocking races and
+		// can miss the exact conn that needed to be closed before ResetPeer.
+		snapshots = append(snapshots, muxConnSnapshot{conn: ps.conn, controlConn: ps.controlConn})
+	}
+	return snapshots
+}
+
+func closeMuxConnSnapshots(snapshots []muxConnSnapshot) {
+	for _, snapshot := range snapshots {
+		if snapshot.conn != nil {
+			_ = snapshot.conn.Close()
+		}
+		if snapshot.controlConn != nil {
+			_ = snapshot.controlConn.Close()
+		}
+	}
+}
+
+func (s *Server) closeCurrentMuxConns() {
+	closeMuxConnSnapshots(s.snapshotCurrentMuxConns())
+}
+
+func (s *Server) resetLinkPeerThenReinstall(dead *smux.Session) {
+	s.reinstallSessionWithReset(dead, true)
 }
 
 func (s *Server) reinstallSession(dead *smux.Session) {
+	s.reinstallSessionWithReset(dead, false)
+}
+
+func (s *Server) reinstallSessionWithReset(dead *smux.Session, resetPeer bool) {
 	s.reinstallMu.Lock()
 	defer s.reinstallMu.Unlock()
 
-	// Close the old muxconns immediately so that any in-flight Push calls
-	// (from data arriving on a new bridge before this reinstall completes)
-	// are discarded rather than feeding stale frames into the dying smux
-	// session.
 	s.sessMu.RLock()
-	if s.conn != nil {
-		_ = s.conn.Close()
+	if s.staleReinstall(dead) {
+		s.sessMu.RUnlock()
+		return
 	}
-	if s.controlConn != nil {
-		_ = s.controlConn.Close()
-	}
+	muxconns := s.snapshotCurrentMuxConnsLocked()
 	s.sessMu.RUnlock()
+
+	closeMuxConnSnapshots(muxconns)
+	if resetPeer {
+		s.resetLinkPeer()
+	}
 
 	// Pre-build the replacement so we can swap atomically below.
 	r := s.buildReplacementSession()
@@ -1050,8 +1096,7 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 				return false
 			}
 			logger.Infof("server: AcceptStream(control) error - reinstalling session: %v", err)
-			s.resetLinkPeer()
-			s.reinstallSession(sess)
+			s.resetLinkPeerThenReinstall(sess)
 			return false
 		}
 		_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
@@ -1064,8 +1109,7 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 				continue
 			}
 			logger.Warnf("handshake failed: %v", err)
-			s.resetLinkPeer()
-			s.reinstallSession(sess)
+			s.resetLinkPeerThenReinstall(sess)
 			return false
 		}
 		s.sessMu.Lock()
@@ -1331,8 +1375,7 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 		}
 		s.recordReconnect()
 		logger.Infof("server reconnect reason=liveness - reinstalling smux session")
-		s.resetLinkPeer()
-		s.reinstallSession(sess)
+		s.resetLinkPeerThenReinstall(sess)
 		// Tell the carrier to rebuild itself too. Without this the SFU side
 		// keeps its dead PC around and the client's reconnect handshakes
 		// keep landing in the void until the carrier eventually notices on

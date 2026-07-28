@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 )
 
@@ -50,6 +51,19 @@ func TestSmuxConfigLong(t *testing.T) {
 	cfg := runtime.SmuxConfigLong(0)
 	if cfg.KeepAliveInterval != 10*time.Second || cfg.KeepAliveTimeout != 120*time.Second {
 		t.Fatalf("SmuxConfigLong(0) keepalive = %+v", cfg)
+	}
+}
+
+func TestSmuxConfigProfileUsesProfileBuffers(t *testing.T) {
+	profile := limits.MobileLowMemory()
+	data := runtime.SmuxConfigProfile(0, profile)
+	if data.MaxReceiveBuffer != profile.Smux.DataReceiveBuffer || data.MaxStreamBuffer != profile.Smux.DataStreamBuffer {
+		t.Fatalf("data smux buffers = %+v", data)
+	}
+	control := runtime.ControlSmuxConfigProfile(0, profile)
+	if control.MaxReceiveBuffer != profile.Smux.ControlReceiveBuffer ||
+		control.MaxStreamBuffer != profile.Smux.ControlStreamBuffer {
+		t.Fatalf("control smux buffers = %+v", control)
 	}
 }
 

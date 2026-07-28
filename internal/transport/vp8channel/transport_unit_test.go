@@ -12,6 +12,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	enginebuiltin "github.com/openlibrecommunity/olcrtc/internal/engine/builtin"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -59,6 +60,96 @@ func TestControlEpochTracksDataEpoch(t *testing.T) {
 	for range 5 {
 		tr.rotateEpochHeader()
 		check("after rotation")
+	}
+}
+
+func TestNewStreamTransportUsesProfileQueueCapacities(t *testing.T) {
+	profile := limits.MobileLowMemory()
+	tr := newStreamTransport(&engineVideoSession{}, nil, transport.Config{ResourceProfile: profile}, Options{})
+	if cap(tr.outbound) != profile.VP8.DataOutboundQueue {
+		t.Fatalf("data outbound cap = %d, want %d", cap(tr.outbound), profile.VP8.DataOutboundQueue)
+	}
+	if cap(tr.controlOutbound) != profile.VP8.ControlOutboundQueue {
+		t.Fatalf("control outbound cap = %d, want %d", cap(tr.controlOutbound), profile.VP8.ControlOutboundQueue)
+	}
+	if tr.profile.VP8.RTPReorderWindow != profile.VP8.RTPReorderWindow {
+		t.Fatalf("rtp reorder window = %d, want %d", tr.profile.VP8.RTPReorderWindow, profile.VP8.RTPReorderWindow)
+	}
+}
+
+func TestStartKCPWithProfileUsesQueueCapacity(t *testing.T) {
+	profile := limits.MobileLowMemory()
+	rt, err := startKCPWithProfile(make(chan []byte), nil, testEpochHdr(1), profile, true)
+	if err != nil {
+		t.Fatalf("startKCPWithProfile: %v", err)
+	}
+	defer rt.close()
+	if cap(rt.conn.in) != profile.KCP.ControlInboundQueue {
+		t.Fatalf("control KCP inbound cap = %d, want %d", cap(rt.conn.in), profile.KCP.ControlInboundQueue)
+	}
+}
+
+func TestKCPRuntimeCloseUnblocksSaturatedOutbound(t *testing.T) {
+	out := make(chan []byte, 1)
+	rt, err := startKCPWithProfile(out, nil, testEpochHdr(1), limits.MobileLowMemory(), false)
+	if err != nil {
+		t.Fatalf("startKCPWithProfile: %v", err)
+	}
+	out <- []byte("stopped-writer")
+	done := make(chan error, 1)
+	go func() {
+		done <- rt.send(bytes.Repeat([]byte("x"), 4096))
+	}()
+	time.Sleep(20 * time.Millisecond)
+	rt.close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("KCP send did not unblock after close with saturated outbound queue")
+	}
+}
+
+func TestConcurrentResetPeerAndCloseDoesNotInstallRuntimeAfterClose(t *testing.T) {
+	tr := &streamTransport{
+		stream:          &fakeVideoStream{},
+		outbound:        make(chan []byte, 1),
+		controlOutbound: make(chan []byte, 1),
+		closeCh:         make(chan struct{}),
+		writerDone:      make(chan struct{}),
+		bindingToken:    1,
+		localEpoch:      1,
+		profile:         limits.MobileLowMemory(),
+		peers:           make(map[uint32]*kcpRuntime),
+		peerOut:         make(map[uint32]chan []byte),
+		ctrlPeers:       make(map[uint32]*peerControlKCP),
+	}
+	done := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		go func() {
+			for j := 0; j < 20; j++ {
+				tr.ResetPeer()
+			}
+			done <- struct{}{}
+		}()
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("ResetPeer goroutine did not finish")
+		}
+	}
+	tr.kcpMu.RLock()
+	kcp := tr.kcp
+	tr.kcpMu.RUnlock()
+	tr.controlKCPMu.RLock()
+	controlKCP := tr.controlKCP
+	tr.controlKCPMu.RUnlock()
+	if kcp != nil || controlKCP != nil {
+		t.Fatalf("runtime installed after close: data=%p control=%p", kcp, controlKCP)
 	}
 }
 
@@ -426,9 +517,10 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatal("SetReconnectCallback did not install stream callback")
 	}
 	stream.reconnect()
-	if !reconnected || tr.kcp == nil {
-		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
+	if !reconnected || !tr.peerConfirmed.Load() {
+		t.Fatalf("stream reconnect should only call upper layer: reconnected=%v peerConfirmed=%v", reconnected, tr.peerConfirmed.Load())
 	}
+	tr.ResetPeer()
 	reconnected = false
 	// After reconnect, peerConfirmed is reset so the next frame re-latches
 	// the peer epoch. This allows the server to restart with a new epoch.

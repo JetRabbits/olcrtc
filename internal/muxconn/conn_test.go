@@ -10,6 +10,7 @@ import (
 	"time"
 
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 )
 
@@ -89,6 +90,15 @@ func TestPushAndReadRoundTrip(t *testing.T) {
 	}
 	if got := string(buf[:n]); got != "hello world" {
 		t.Fatalf("Read() = %q, want %q", got, "hello world")
+	}
+}
+
+func TestNewWithProfileUsesDataInboundQueueCapacity(t *testing.T) {
+	cipher := newTestCipher(t)
+	profile := limits.Profile{MuxConn: limits.MuxConn{DataInboundQueue: 3}}
+	conn := NewWithProfile(&stubLink{canSend: true}, cipher, profile)
+	if cap(conn.in) != 3 {
+		t.Fatalf("data inbound queue cap = %d, want 3", cap(conn.in))
 	}
 }
 
@@ -239,4 +249,50 @@ func TestCloseMakesReadReturnEOF(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("Read() did not unblock after Close")
 	}
+}
+
+func TestConcurrentReadPushCloseRace(t *testing.T) {
+	cipher := newTestCipher(t)
+	conn := NewWithProfile(&stubLink{canSend: true}, cipher, limits.Profile{MuxConn: limits.MuxConn{DataInboundQueue: 4}})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 3)
+		for {
+			_, err := conn.Read(buf)
+			if errors.Is(err, io.EOF) {
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload, err := cipher.Encrypt([]byte("abcdef"))
+			if err != nil {
+				t.Errorf("Encrypt() error = %v", err)
+				return
+			}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					conn.Push(payload)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	wg.Wait()
 }

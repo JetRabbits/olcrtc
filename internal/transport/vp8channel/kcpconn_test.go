@@ -88,3 +88,28 @@ func TestKCPConnTimeouts(t *testing.T) {
 		t.Fatal("WriteTo() unexpectedly succeeded")
 	}
 }
+
+func TestKCPConnCloseUnblocksSaturatedWrite(t *testing.T) {
+	out := make(chan []byte, 1)
+	conn := newKCPConn(out, 1, testEpochHdr(1))
+	if _, err := conn.WriteTo([]byte("fills"), nil); err != nil {
+		t.Fatalf("initial WriteTo() error = %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.WriteTo([]byte("blocked"), nil)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("blocked WriteTo() error = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked WriteTo() did not unblock on Close")
+	}
+}

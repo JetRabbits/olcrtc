@@ -12,6 +12,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	kcp "github.com/xtaci/kcp-go/v5"
 )
 
@@ -26,17 +27,6 @@ const (
 	// kcp-go hardcodes mtuLimit=1500, so SetMtu() above this is silently
 	// clamped. Stay below that with headroom for KCP overhead (24 bytes).
 	kcpMTU = 1400
-
-	// Send/receive window in segments. Bulk data runs on its own KCP session,
-	// isolated from the control plane (ping/pong has a separate startKCP and is
-	// drained with priority by writerLoop), so a large data window no longer
-	// starves control liveness the way it did before that split (issue #95).
-	// One VP8 frame can carry many KCP segments and ACKs only trickle back at
-	// frame cadence, so a generous window is what keeps the policed path full
-	// and lets throughput reach the SFU's real ceiling (~10 Mbit on Telemost)
-	// instead of being clamped to a fraction of it.
-	kcpSndWnd = 4096
-	kcpRcvWnd = 4096
 
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
@@ -66,7 +56,26 @@ type kcpRuntime struct {
 }
 
 func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
-	c := newKCPConn(out, inboundQueueSize, epochHdr)
+	return startKCPWithProfile(out, onData, epochHdr, limits.Default(), false)
+}
+
+func startKCPWithProfile(
+	out chan<- []byte,
+	onData func([]byte),
+	epochHdr [epochHdrLen]byte,
+	profile limits.Profile,
+	control bool,
+) (*kcpRuntime, error) {
+	p := limits.Normalize(profile)
+	inboundCap := p.KCP.DataInboundQueue
+	sndWnd := p.KCP.DataSendWindow
+	rcvWnd := p.KCP.DataReceiveWindow
+	if control {
+		inboundCap = p.KCP.ControlInboundQueue
+		sndWnd = p.KCP.ControlSendWindow
+		rcvWnd = p.KCP.ControlReceiveWindow
+	}
+	c := newKCPConn(out, inboundCap, epochHdr)
 
 	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
 	if err != nil {
@@ -83,7 +92,7 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 	// the wire. With nc=1 KCP keeps the window full and retransmits the few
 	// losses, letting throughput reach the SFU's real ceiling.
 	sess.SetNoDelay(1, 5, 2, 1)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	sess.SetWindowSize(sndWnd, rcvWnd)
 	sess.SetMtu(kcpMTU)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;
 	// stream framing is still required for our wire format.
@@ -162,7 +171,8 @@ func (r *kcpRuntime) send(msg []byte) error {
 
 func (r *kcpRuntime) close() {
 	r.closeOnce.Do(func() {
-		_ = r.sess.Close()
 		_ = r.conn.Close()
+		_ = r.sess.Close()
+		<-r.readDone
 	})
 }

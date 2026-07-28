@@ -15,6 +15,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/framing"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -37,6 +38,150 @@ func TestSetupCipher(t *testing.T) {
 	if cipher == nil {
 		t.Fatal("setupCipher() returned nil cipher")
 	}
+}
+
+func TestFlowCapsAndCounterRelease(t *testing.T) {
+	var updates []FlowStats
+	c := &Client{
+		flowLimits: limits.SOCKS{MaxTCP: 1, MaxUDP: 1, MaxTotal: 2},
+		onFlowStats: func(s FlowStats) {
+			updates = append(updates, s)
+		},
+	}
+	kind1, kind2 := flowPending, flowPending
+	if !c.reserveTotalForTest() || !c.classifyReservedFlow(&kind1, flowTCP) ||
+		!c.reserveTotalForTest() || c.classifyReservedFlow(&kind2, flowTCP) {
+		t.Fatalf("TCP cap was not enforced, stats=%+v", c.FlowStats())
+	}
+	if !c.classifyReservedFlow(&kind2, flowUDP) || c.reserveTotalForTest() {
+		t.Fatalf("UDP/total cap was not enforced, stats=%+v", c.FlowStats())
+	}
+	if got := c.FlowStats(); got.TCP != 1 || got.UDP != 1 || got.Total != 2 {
+		t.Fatalf("stats after acquire = %+v", got)
+	}
+	c.releaseReservedFlow(kind1)
+	c.releaseReservedFlow(kind2)
+	if got := c.FlowStats(); got.TCP != 0 || got.UDP != 0 || got.Total != 0 {
+		t.Fatalf("stats after release = %+v", got)
+	}
+	if len(updates) != 4 || updates[len(updates)-1].Total != 0 {
+		t.Fatalf("updates = %+v", updates)
+	}
+	for i := 1; i < len(updates); i++ {
+		if updates[i].Seq <= updates[i-1].Seq {
+			t.Fatalf("non-monotonic update seqs: %+v", updates)
+		}
+	}
+}
+
+func (c *Client) reserveTotalForTest() bool {
+	c.flowsMu.Lock()
+	defer c.flowsMu.Unlock()
+	return c.reserveTotalLocked()
+}
+
+func TestCloseTrackedFlowsWaitsForHandlers(t *testing.T) {
+	c := &Client{flows: make(map[net.Conn]struct{})}
+	server, peer := net.Pipe()
+	c.trackAccepted(server)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 1)
+		_, _ = server.Read(buf)
+		_ = server.Close()
+		c.untrackAccepted(server)
+	}()
+
+	c.closeTrackedFlows()
+	waited := make(chan struct{})
+	go func() {
+		c.flowsWG.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("flow handler did not exit after closeTrackedFlows")
+	}
+	<-done
+	_ = peer.Close()
+}
+
+func TestAcceptLoopDoesNotRegisterAfterShutdownBegins(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	c := &Client{
+		flows:      make(map[net.Conn]struct{}),
+		acceptDone: make(chan struct{}),
+		flowLimits: limits.SOCKS{MaxTotal: 1},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go c.acceptLoop(ctx, ln)
+	c.closeTrackedFlows()
+	conn, err := net.Dial("tcp4", ln.Addr().String())
+	if err == nil {
+		_ = conn.Close()
+	}
+	c.flowsMu.Lock()
+	registered := len(c.flows)
+	c.flowsMu.Unlock()
+	got := c.FlowStats()
+	if registered != 0 || got.Total != 0 {
+		t.Fatalf("post-shutdown accepted flow registered=%d stats=%+v", registered, c.FlowStats())
+	}
+	cancel()
+	_ = ln.Close()
+	select {
+	case <-c.acceptDone:
+	case <-time.After(time.Second):
+		t.Fatal("acceptLoop did not exit")
+	}
+	c.flowsWG.Wait()
+}
+
+func TestTrackAcceptedEnforcesMaxTotalBeforeHandshake(t *testing.T) {
+	c := &Client{flows: make(map[net.Conn]struct{}), flowLimits: limits.SOCKS{MaxTotal: 1}}
+	a1, b1 := net.Pipe()
+	defer func() { _ = b1.Close() }()
+	if !c.trackAccepted(a1) {
+		t.Fatal("first accepted flow was rejected")
+	}
+	a2, b2 := net.Pipe()
+	defer func() { _ = a2.Close(); _ = b2.Close() }()
+	if c.trackAccepted(a2) {
+		t.Fatal("second accepted flow exceeded MaxTotal but was registered")
+	}
+	c.releaseReservedFlow(flowPending)
+	c.untrackAccepted(a1)
+	_ = a1.Close()
+}
+
+func TestLowMemoryHandshakeDeadlineBoundsIncompleteSocket(t *testing.T) {
+	server, peer := net.Pipe()
+	c := &Client{
+		flows:      make(map[net.Conn]struct{}),
+		flowLimits: limits.SOCKS{MaxTotal: 1, HandshakeTimeout: 25 * time.Millisecond},
+	}
+	if !c.trackAccepted(server) {
+		t.Fatal("trackAccepted rejected first flow")
+	}
+	done := make(chan struct{})
+	go func() {
+		c.handleSocks5(context.Background(), server)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("incomplete SOCKS handshake was not bounded by deadline")
+	}
+	if got := c.FlowStats(); got.Total != 0 {
+		t.Fatalf("stats after handshake timeout = %+v", got)
+	}
+	_ = peer.Close()
 }
 
 func TestSetupCipherRejectsBadInput(t *testing.T) {
@@ -665,6 +810,49 @@ func TestHandleSocks5UDPAssociateRoundTrip(t *testing.T) {
 	<-clientDone
 }
 
+func TestUDPAssociateMalformedTrafficDoesNotRefreshIdle(t *testing.T) {
+	socksServer, socksClient := net.Pipe()
+	defer func() { _ = socksClient.Close() }()
+	c := &Client{flowLimits: limits.SOCKS{UDPAssociateIdleTimeout: 50 * time.Millisecond}}
+	done := make(chan struct{})
+	go func() {
+		c.udpAssociate(context.Background(), socksServer, nil)
+		close(done)
+	}()
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(socksClient, reply); err != nil {
+		t.Fatalf("ReadFull(reply) error = %v", err)
+	}
+	relayPort := int(binary.BigEndian.Uint16(reply[8:10]))
+	udpClient, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort})
+	if err != nil {
+		t.Fatalf("DialUDP() error = %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+	deadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _ = udpClient.Write([]byte{0, 1, 2})
+		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-done:
+			return
+		default:
+		}
+	}
+	t.Fatal("malformed UDP traffic refreshed idle timeout")
+}
+
+func TestUDPAssociateIdleUsesLastValidActivity(t *testing.T) {
+	c := &Client{flowLimits: limits.SOCKS{UDPAssociateIdleTimeout: 50 * time.Millisecond}}
+	timeoutErr := &net.DNSError{IsTimeout: true}
+	if c.udpAssociateIdleExpired(timeoutErr, time.Now().UnixNano()) {
+		t.Fatal("fresh activity was treated as idle-expired")
+	}
+	if !c.udpAssociateIdleExpired(timeoutErr, time.Now().Add(-time.Second).UnixNano()) {
+		t.Fatal("stale activity was not treated as idle-expired")
+	}
+}
+
 func readStreamRequestForTest(stream *smux.Stream) (map[string]any, []byte, error) {
 	buf := make([]byte, 0, 256)
 	tmp := make([]byte, 64)
@@ -830,6 +1018,45 @@ func TestResetLinkPeer(t *testing.T) {
 	c.resetLinkPeer()
 	if ln.resetCount != 1 {
 		t.Fatalf("ResetPeer calls = %d, want 1", ln.resetCount)
+	}
+}
+
+func TestHandleReconnectClosesMuxConnBeforeResetPeer(t *testing.T) {
+	cipher, err := cryptopkg.NewCipher("01234567890123456789012345678901")
+	if err != nil {
+		t.Fatalf("NewCipher() error = %v", err)
+	}
+	profile := limits.Profile{MuxConn: limits.MuxConn{DataInboundQueue: 1}}
+	ln := &blockingResetLinkStub{}
+	c := &Client{ln: ln, cipher: cipher, profile: limits.Normalize(profile)}
+	c.conn = muxconn.NewWithProfile(ln, cipher, profile)
+	blockedFrame, err := cipher.Encrypt([]byte("blocked"))
+	if err != nil {
+		t.Fatalf("Encrypt() error = %v", err)
+	}
+	c.conn.Push(blockedFrame)
+	ln.reset = func() { c.onData(blockedFrame) }
+
+	done := make(chan struct{})
+	go func() {
+		c.handleReconnect(context.Background(), Config{}, func() {}, "liveness")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handleReconnect blocked while ResetPeer delivered into saturated muxconn")
+	}
+}
+
+type blockingResetLinkStub struct {
+	closerLinkStub
+	reset func()
+}
+
+func (s *blockingResetLinkStub) ResetPeer() {
+	if s.reset != nil {
+		s.reset()
 	}
 }
 

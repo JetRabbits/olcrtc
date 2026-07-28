@@ -165,7 +165,16 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 func (c *kcpConn) Close() error {
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		for {
+			select {
+			case <-c.in:
+			default:
+				return
+			}
+		}
+	})
 	return nil
 }
 

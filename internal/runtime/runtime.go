@@ -13,6 +13,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/xtaci/smux"
 )
@@ -64,6 +65,10 @@ func SetupCipher(keyHex string) (*crypto.Cipher, error) {
 // constrains the smux payload size so the encrypted whole smux frame fits
 // under the transport's per-message payload cap.
 func SmuxConfig(maxWirePayload int) *smux.Config {
+	return smuxConfig(maxWirePayload, limits.Default().Smux.DataReceiveBuffer, limits.Default().Smux.DataStreamBuffer)
+}
+
+func smuxConfig(maxWirePayload, receiveBuffer, streamBuffer int) *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.KeepAliveDisabled = false
@@ -74,11 +79,17 @@ func SmuxConfig(maxWirePayload int) *smux.Config {
 			cfg.MaxFrameSize = maxFrameSize
 		}
 	}
-	cfg.MaxReceiveBuffer = smuxMaxReceiveBuffer
-	cfg.MaxStreamBuffer = smuxMaxStreamBuffer
+	cfg.MaxReceiveBuffer = receiveBuffer
+	cfg.MaxStreamBuffer = streamBuffer
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg
+}
+
+// SmuxConfigProfile is SmuxConfig using the data-plane buffers from profile.
+func SmuxConfigProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	p := limits.Normalize(profile)
+	return smuxConfig(maxWirePayload, p.Smux.DataReceiveBuffer, p.Smux.DataStreamBuffer)
 }
 
 // SmuxConfigLong is SmuxConfig with a relaxed keep-alive timeout for
@@ -90,7 +101,14 @@ func SmuxConfig(maxWirePayload int) *smux.Config {
 // (jitsi/datachannel) keep the conservative 30s timeout so a genuinely dead
 // link is detected and reconnected promptly.
 func SmuxConfigLong(maxWirePayload int) *smux.Config {
-	cfg := SmuxConfig(maxWirePayload)
+	cfg := SmuxConfigProfile(maxWirePayload, limits.Default())
+	cfg.KeepAliveTimeout = 120 * time.Second
+	return cfg
+}
+
+// SmuxConfigLongProfile is SmuxConfigLong using the data-plane buffers from profile.
+func SmuxConfigLongProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	cfg := SmuxConfigProfile(maxWirePayload, profile)
 	cfg.KeepAliveTimeout = 120 * time.Second
 	return cfg
 }
@@ -107,11 +125,16 @@ func IsControlPlane(tr transport.Transport) bool {
 // transport: relaxed keep-alive for ControlPlane carriers, conservative
 // otherwise.
 func SmuxConfigFor(tr transport.Transport) *smux.Config {
+	return SmuxConfigForProfile(tr, limits.Default())
+}
+
+// SmuxConfigForProfile returns the data-plane smux config for profile.
+func SmuxConfigForProfile(tr transport.Transport, profile limits.Profile) *smux.Config {
 	maxWirePayload := MaxPayload(tr)
 	if IsControlPlane(tr) {
-		return SmuxConfigLong(maxWirePayload)
+		return SmuxConfigLongProfile(maxWirePayload, profile)
 	}
-	return SmuxConfig(maxWirePayload)
+	return SmuxConfigProfile(maxWirePayload, profile)
 }
 
 // LivenessTimeout returns the control-stream pong timeout for a transport:
@@ -141,6 +164,12 @@ func ConnectAckTimeout(tr transport.Transport) time.Duration {
 // small stream buffers and disable smux keepalives (the olcrtc control.Run
 // ping loop handles liveness itself).
 func ControlSmuxConfig(maxWirePayload int) *smux.Config {
+	return ControlSmuxConfigProfile(maxWirePayload, limits.Default())
+}
+
+// ControlSmuxConfigProfile returns a lean control-plane smux config for profile.
+func ControlSmuxConfigProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	p := limits.Normalize(profile)
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.MaxFrameSize = smuxMaxFrameSize
@@ -151,8 +180,8 @@ func ControlSmuxConfig(maxWirePayload int) *smux.Config {
 		}
 	}
 	// Tiny buffers: control frames are at most a few hundred bytes.
-	cfg.MaxReceiveBuffer = 256 * 1024
-	cfg.MaxStreamBuffer = 32 * 1024
+	cfg.MaxReceiveBuffer = p.Smux.ControlReceiveBuffer
+	cfg.MaxStreamBuffer = p.Smux.ControlStreamBuffer
 	// Disable smux keepalive - control.Run runs its own ping/pong loop.
 	cfg.KeepAliveDisabled = true
 	return cfg

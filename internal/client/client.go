@@ -21,6 +21,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/framing"
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
@@ -95,7 +96,36 @@ type Client struct {
 	// established (sessionID != ""). Tunnel handlers wait on it so they do
 	// not open smux streams before the server has accepted the handshake.
 	sessionReady chan struct{}
+
+	flowsMu     sync.Mutex
+	flows       map[net.Conn]struct{}
+	flowsWG     sync.WaitGroup
+	acceptDone  chan struct{}
+	flowsClosed bool
+	flowLimits  limits.SOCKS
+	profile     limits.Profile
+	activeTCP   int64
+	activeUDP   int64
+	activeTotal int64
+	flowSeq     int64
+	onFlowStats func(FlowStats)
 }
+
+// FlowStats reports active accepted SOCKS flows for diagnostics.
+type FlowStats struct {
+	Seq   int64
+	TCP   int64
+	UDP   int64
+	Total int64
+}
+
+type flowKind int
+
+const (
+	flowPending flowKind = iota
+	flowTCP
+	flowUDP
+)
 
 type socksRequest struct {
 	command byte
@@ -146,6 +176,13 @@ type Config struct {
 
 	// OnHealth receives liveness/reconnect status updates. Nil means no-op.
 	OnHealth HealthFunc
+
+	// OnFlowStats receives active SOCKS flow diagnostics whenever counters change.
+	OnFlowStats func(FlowStats)
+
+	// ResourceProfile selects immutable per-session resource limits. Zero value
+	// preserves cross-platform defaults.
+	ResourceProfile limits.Profile
 }
 
 // Run starts the client with the given configuration.
@@ -168,6 +205,7 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 		return fmt.Errorf("resolve device id: %w", err)
 	}
 
+	profile := limits.Normalize(cfg.ResourceProfile)
 	c := &Client{
 		cipher:       cipher,
 		deviceID:     deviceID,
@@ -177,6 +215,11 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 		socksPass:    cfg.SOCKSPass,
 		health:       runtime.NewHealthTracker(cfg.OnHealth),
 		sessionReady: make(chan struct{}),
+		flows:        make(map[net.Conn]struct{}),
+		acceptDone:   make(chan struct{}),
+		flowLimits:   profile.SOCKS,
+		profile:      profile,
+		onFlowStats:  cfg.OnFlowStats,
 	}
 
 	// shutdown is registered BEFORE bringUpLink so we always close any
@@ -209,6 +252,8 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	go c.acceptLoop(runCtx, listener)
 
 	<-runCtx.Done()
+	_ = listener.Close()
+	<-c.acceptDone
 	return nil
 }
 
@@ -232,6 +277,7 @@ func (c *Client) bringUpLink(
 		RequireTargetedPeer: true,
 		Options:             cfg.TransportOptions,
 		Traffic:             cfg.Traffic,
+		ResourceProfile:     cfg.ResourceProfile,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create link: %w", err)
@@ -262,10 +308,10 @@ func (c *Client) bringUpLink(
 		return err
 	}
 
-	c.conn = muxconn.New(ln, c.cipher)
-	c.controlConn = muxconn.NewControl(ln, c.cipher)
+	c.conn = muxconn.NewWithProfile(ln, c.cipher, cfg.ResourceProfile)
+	c.controlConn = muxconn.NewControlWithProfile(ln, c.cipher, cfg.ResourceProfile)
 
-	sess, controlSess, err := buildSmuxClient(ln, c.conn, c.controlConn)
+	sess, controlSess, err := buildSmuxClient(ln, c.conn, c.controlConn, cfg.ResourceProfile)
 	if err != nil {
 		_ = c.conn.Close()
 		if c.controlConn != nil {
@@ -286,7 +332,7 @@ func (c *Client) bringUpLink(
 		}
 		return fmt.Errorf("handshake: %w", err)
 	}
-	logger.Infof("session %s opened (device=%s)", sid, c.deviceID)
+	logger.Infof("client session opened")
 
 	c.sessMu.Lock()
 	c.session = sess
@@ -333,8 +379,9 @@ func waitForPeer(ctx context.Context, ln transport.Transport) error {
 func buildSmuxClient(
 	ln transport.Transport,
 	conn, controlConn *muxconn.Conn,
+	profile limits.Profile,
 ) (*smux.Session, *smux.Session, error) {
-	sess, err := smux.Client(conn, runtime.SmuxConfigFor(ln))
+	sess, err := smux.Client(conn, runtime.SmuxConfigForProfile(ln, profile))
 	if err != nil {
 		return nil, nil, fmt.Errorf("smux client: %w", err)
 	}
@@ -343,7 +390,7 @@ func buildSmuxClient(
 	}
 	// Separate smux session for the control stream only: small buffers, no
 	// smux keepalive (our own control.Run ping/pong handles liveness).
-	controlSess, err := smux.Client(controlConn, controlSmuxConfig(linkMaxPayload(ln)))
+	controlSess, err := smux.Client(controlConn, controlSmuxConfig(linkMaxPayload(ln), profile))
 	if err != nil {
 		_ = sess.Close()
 		return nil, nil, fmt.Errorf("control smux client: %w", err)
@@ -438,7 +485,10 @@ func smuxConfig(maxWirePayload int) *smux.Config {
 // session. The control session carries only ping/pong frames, so we use
 // small buffers and disable smux keepalives (our own control.Run ping loop
 // handles liveness).
-func controlSmuxConfig(maxWirePayload int) *smux.Config {
+func controlSmuxConfig(maxWirePayload int, profileOpt ...limits.Profile) *smux.Config {
+	if len(profileOpt) > 0 {
+		return runtime.ControlSmuxConfigProfile(maxWirePayload, profileOpt[0])
+	}
 	return runtime.ControlSmuxConfig(maxWirePayload)
 }
 
@@ -452,12 +502,14 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
 
 	c.recordReconnect()
 	logger.Infof("client reconnect reason=%s - tearing down smux session", reason)
-	c.resetLinkPeer()
 
 	// Close the old muxconns immediately so any in-flight Push from data
 	// arriving on the new bridge is discarded. Without this, the server
 	// side that reconnected faster can push frames into our old muxconn,
-	// corrupting the dying smux session.
+	// corrupting the dying smux session. This must happen before ResetPeer:
+	// vp8channel ResetPeer closes KCP and waits for its read goroutine; that
+	// goroutine may currently be blocked in c.onData -> muxconn.Push on a full
+	// inbound queue, and closing the muxconn is what unblocks it.
 	c.sessMu.RLock()
 	if c.conn != nil {
 		_ = c.conn.Close()
@@ -466,12 +518,13 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
 		_ = c.controlConn.Close()
 	}
 	c.sessMu.RUnlock()
+	c.resetLinkPeer()
 
 	// Install fresh muxconns immediately so onData never hits nil while
 	// the old session is being torn down. tryReopenSession will swap them
 	// again with its own conns on each attempt.
-	newConn := muxconn.New(c.ln, c.cipher)
-	newControlConn := muxconn.NewControl(c.ln, c.cipher)
+	newConn := muxconn.NewWithProfile(c.ln, c.cipher, c.profile)
+	newControlConn := muxconn.NewControlWithProfile(c.ln, c.cipher, c.profile)
 
 	c.sessMu.Lock()
 	oldControl := c.controlStrm
@@ -566,12 +619,12 @@ func (c *Client) tryReopenSession(
 	cancel context.CancelFunc,
 	attempt int,
 ) bool {
-	conn := muxconn.New(c.ln, c.cipher)
+	conn := muxconn.NewWithProfile(c.ln, c.cipher, c.profile)
 
 	// If the transport has an isolated control plane, build a second muxconn
 	// wired to it. The smux control stream will run over controlConn so that
 	// bulk data writes on conn can never head-of-line block control ping/pong.
-	controlConn := muxconn.NewControl(c.ln, c.cipher)
+	controlConn := muxconn.NewControlWithProfile(c.ln, c.cipher, c.profile)
 
 	c.sessMu.Lock()
 	oldConn := c.conn
@@ -586,7 +639,7 @@ func (c *Client) tryReopenSession(
 		_ = oldCtrl.Close()
 	}
 
-	sess, controlSess, err := buildSmuxClient(c.ln, conn, controlConn)
+	sess, controlSess, err := buildSmuxClient(c.ln, conn, controlConn, c.profile)
 	if err != nil {
 		logger.Warnf("smux re-init failed (attempt %d): %v", attempt, err)
 		return false
@@ -616,7 +669,7 @@ func (c *Client) tryReopenSession(
 		}
 		return false
 	}
-	logger.Infof("session %s reopened (device=%s)", sid, c.deviceID)
+	logger.Infof("client session reopened")
 	c.sessMu.Lock()
 	c.session = sess
 	c.controlStrm = ctrlStream
@@ -658,14 +711,11 @@ func (c *Client) startControlLoop(
 	onMissedPong := liveness.OnMissedPong
 	onUnhealthy := liveness.OnUnhealthy
 	liveness.OnPong = func(h control.Health) {
-		c.sessMu.RLock()
-		sid := c.sessionID
-		c.sessMu.RUnlock()
 		c.recordPong(h)
 		// ai-generated: next two lines, peer-restart-corroboration PR.
 		c.controlLastPong.Store(time.Now())
 		c.notifyLinkHealth(false)
-		logger.Debugf("control alive session=%s rtt=%v seq=%d", sid, h.RTT, h.Seq)
+		logger.Debugf("control alive rtt=%v seq=%d", h.RTT, h.Seq)
 		if onPong != nil {
 			onPong(h)
 		}
@@ -810,8 +860,23 @@ func (c *Client) shutdown() {
 	if c.ln != nil {
 		_ = c.ln.Close()
 	}
+	c.closeTrackedFlows()
+	c.flowsWG.Wait()
 	if control != nil {
 		_ = control.Close()
+	}
+}
+
+func (c *Client) closeTrackedFlows() {
+	c.flowsMu.Lock()
+	c.flowsClosed = true
+	conns := make([]net.Conn, 0, len(c.flows))
+	for conn := range c.flows {
+		conns = append(conns, conn)
+	}
+	c.flowsMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 }
 
@@ -845,6 +910,7 @@ func (c *Client) onData(data []byte) {
 }
 
 func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
+	defer close(c.acceptDone)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -856,12 +922,54 @@ func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
 				continue
 			}
 		}
+		if !c.trackAccepted(conn) {
+			_ = conn.Close()
+			continue
+		}
 		go c.handleSocks5(ctx, conn)
 	}
 }
 
+func (c *Client) trackAccepted(conn net.Conn) bool {
+	c.flowsMu.Lock()
+	if c.flowsClosed || !c.reserveTotalLocked() {
+		c.flowsMu.Unlock()
+		return false
+	}
+	if c.flows == nil {
+		c.flows = make(map[net.Conn]struct{})
+	}
+	c.flows[conn] = struct{}{}
+	c.flowsWG.Add(1)
+	stats := c.nextFlowStatsLocked()
+	c.flowsMu.Unlock()
+	c.publishFlowStats(stats)
+	return true
+}
+
+func (c *Client) untrackAccepted(conn net.Conn) {
+	tracked := false
+	c.flowsMu.Lock()
+	if c.flows != nil {
+		_, tracked = c.flows[conn]
+		delete(c.flows, conn)
+	}
+	c.flowsMu.Unlock()
+	if tracked {
+		c.flowsWG.Done()
+	}
+}
+
 func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	flowKind := flowPending
+	defer func() {
+		c.releaseReservedFlow(flowKind)
+		_ = conn.Close()
+		c.untrackAccepted(conn)
+	}()
+	if c.flowLimits.HandshakeTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(c.flowLimits.HandshakeTimeout))
+	}
 
 	if err := c.socks5Handshake(conn); err != nil {
 		return
@@ -871,6 +979,7 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		return
 	}
+	_ = conn.SetDeadline(time.Time{})
 
 	// Wait until the session handshake is fully complete (sessionID != "").
 	// Without this gate, tunnel streams opened during server-side reinstall
@@ -886,8 +995,16 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		if sess != nil && !sess.IsClosed() && sid != "" {
 			switch req.command {
 			case socksCommandConnect:
+				if !c.classifyReservedFlow(&flowKind, flowTCP) {
+					_, _ = conn.Write(replyHostUnreachable())
+					return
+				}
 				c.tunnel(conn, sess, req.addr, req.port)
 			case socksCommandUDPAssociate:
+				if !c.classifyReservedFlow(&flowKind, flowUDP) {
+					_, _ = conn.Write(replyHostUnreachable())
+					return
+				}
 				c.udpAssociate(ctx, conn, sess)
 			}
 			return
@@ -904,6 +1021,97 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 			// session became ready; re-check
 		}
 	}
+}
+
+func (c *Client) reserveTotalLocked() bool {
+	total := atomic.LoadInt64(&c.activeTotal)
+	if c.flowLimits.MaxTotal > 0 && total >= int64(c.flowLimits.MaxTotal) {
+		return false
+	}
+	atomic.StoreInt64(&c.activeTotal, total+1)
+	return true
+}
+
+func (c *Client) classifyReservedFlow(kind *flowKind, next flowKind) bool {
+	c.flowsMu.Lock()
+	tcp := atomic.LoadInt64(&c.activeTCP)
+	udpCount := atomic.LoadInt64(&c.activeUDP)
+	if !c.classWithinLimits(tcp, udpCount, next) {
+		c.flowsMu.Unlock()
+		return false
+	}
+	if next == flowUDP {
+		atomic.StoreInt64(&c.activeUDP, udpCount+1)
+	} else {
+		atomic.StoreInt64(&c.activeTCP, tcp+1)
+	}
+	*kind = next
+	stats := c.nextFlowStatsLocked()
+	c.flowsMu.Unlock()
+	c.publishFlowStats(stats)
+	return true
+}
+
+func (c *Client) classWithinLimits(tcp, udpCount int64, next flowKind) bool {
+	limits := c.flowLimits
+	nextTCP, nextUDP := tcp, udpCount
+	if next == flowUDP {
+		nextUDP++
+	} else {
+		nextTCP++
+	}
+	if limits.MaxTCP > 0 && nextTCP > int64(limits.MaxTCP) {
+		return false
+	}
+	if limits.MaxUDP > 0 && nextUDP > int64(limits.MaxUDP) {
+		return false
+	}
+	return true
+}
+
+func (c *Client) releaseReservedFlow(kind flowKind) {
+	c.flowsMu.Lock()
+	switch kind {
+	case flowUDP:
+		if atomic.LoadInt64(&c.activeUDP) > 0 {
+			atomic.AddInt64(&c.activeUDP, -1)
+		}
+	case flowTCP:
+		if atomic.LoadInt64(&c.activeTCP) > 0 {
+			atomic.AddInt64(&c.activeTCP, -1)
+		}
+	}
+	if atomic.LoadInt64(&c.activeTotal) > 0 {
+		atomic.AddInt64(&c.activeTotal, -1)
+	}
+	stats := c.nextFlowStatsLocked()
+	c.flowsMu.Unlock()
+	c.publishFlowStats(stats)
+}
+
+func (c *Client) publishFlowStats(stats FlowStats) {
+	if c.onFlowStats != nil {
+		c.onFlowStats(stats)
+	}
+}
+
+func (c *Client) FlowStats() FlowStats {
+	c.flowsMu.Lock()
+	defer c.flowsMu.Unlock()
+	return c.flowStatsLocked()
+}
+
+func (c *Client) flowStatsLocked() FlowStats {
+	tcp := atomic.LoadInt64(&c.activeTCP)
+	udp := atomic.LoadInt64(&c.activeUDP)
+	total := atomic.LoadInt64(&c.activeTotal)
+	seq := atomic.LoadInt64(&c.flowSeq)
+	return FlowStats{Seq: seq, TCP: tcp, UDP: udp, Total: total}
+}
+
+func (c *Client) nextFlowStatsLocked() FlowStats {
+	atomic.AddInt64(&c.flowSeq, 1)
+	return c.flowStatsLocked()
 }
 
 func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
@@ -1002,7 +1210,9 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		targetPort    int
 		udpClientMu   sync.RWMutex
 		udpClientAddr *net.UDPAddr
+		lastActivity  atomic.Int64
 	)
+	lastActivity.Store(time.Now().UnixNano())
 
 	closeStream := func() {
 		streamMu.Lock()
@@ -1038,8 +1248,15 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		default:
 		}
 
+		c.setUDPAssociateReadDeadline(udpConn, lastActivity.Load())
 		n, src, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if c.udpAssociateIdleExpired(err, lastActivity.Load()) {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
 			return
 		}
 		datagram, err := parseSocks5UDPDatagram(buf[:n])
@@ -1047,6 +1264,7 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 			logger.Debugf("UDP ASSOCIATE parse failed: %v", err)
 			continue
 		}
+		lastActivity.Store(time.Now().UnixNano())
 
 		udpClientMu.Lock()
 		udpClientAddr = src
@@ -1064,7 +1282,7 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 				err = c.sendUDPDialRequest(stream, targetAddr, targetPort)
 			}
 			if err == nil {
-				go c.forwardUDPReplies(udpConn, stream, targetAddr, targetPort, &udpClientMu, &udpClientAddr)
+				go c.forwardUDPReplies(udpConn, stream, targetAddr, targetPort, &udpClientMu, &udpClientAddr, &lastActivity)
 			}
 		}
 		current := stream
@@ -1092,6 +1310,28 @@ func (c *Client) listenUDPRelay(tcpAddr net.Addr) (*net.UDPConn, error) {
 	return net.ListenUDP("udp4", udpAddr)
 }
 
+func (c *Client) setUDPAssociateReadDeadline(conn *net.UDPConn, lastActivityNano int64) {
+	idle := c.flowLimits.UDPAssociateIdleTimeout
+	if idle <= 0 {
+		return
+	}
+	deadline := time.Unix(0, lastActivityNano).Add(idle)
+	probe := time.Now().Add(200 * time.Millisecond)
+	if probe.Before(deadline) {
+		deadline = probe
+	}
+	_ = conn.SetReadDeadline(deadline)
+}
+
+func (c *Client) udpAssociateIdleExpired(err error, lastActivityNano int64) bool {
+	idle := c.flowLimits.UDPAssociateIdleTimeout
+	if idle <= 0 {
+		return false
+	}
+	ne, ok := err.(net.Error)
+	return ok && ne.Timeout() && time.Since(time.Unix(0, lastActivityNano)) >= idle
+}
+
 func (c *Client) forwardUDPReplies(
 	udpConn *net.UDPConn,
 	stream *smux.Stream,
@@ -1099,6 +1339,7 @@ func (c *Client) forwardUDPReplies(
 	targetPort int,
 	udpClientMu *sync.RWMutex,
 	udpClientAddr **net.UDPAddr,
+	lastActivity *atomic.Int64,
 ) {
 	for {
 		packet, err := framing.ReadBytes(stream, maxUDPPacketSize)
@@ -1116,7 +1357,9 @@ func (c *Client) forwardUDPReplies(
 		if addr == nil {
 			continue
 		}
-		_, _ = udpConn.WriteToUDP(out, addr)
+		if _, err := udpConn.WriteToUDP(out, addr); err == nil && lastActivity != nil {
+			lastActivity.Store(time.Now().UnixNano())
+		}
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	enginebuiltin "github.com/openlibrecommunity/olcrtc/internal/engine/builtin"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/common"
@@ -33,19 +34,8 @@ const (
 	defaultMaxPayloadSize = 60 * 1024
 	defaultConnectTimeout = 60 * time.Second
 	rtpBufSize            = 65536
-	// outboundQueueSize bounds KCP packets waiting for the paced writer. Sized
-	// to a couple of send windows so KCP's flush never blocks (a blocked
-	// WriteTo would stall KCP's update loop and delay ACKs); the paced writer
-	// keeps it drained so this depth is headroom, not standing latency.
-	outboundQueueSize = 1536
-	// controlOutboundQueueSize is the queue for the control-plane KCP.
-	// Control messages are tiny (ping/pong JSON frames), so a small queue
-	// suffices. We keep it separate from bulk data to guarantee forward
-	// progress even when the data outbound queue is saturated.
-	controlOutboundQueueSize = 2048 // sized for ~20s publisher reconnect window at 20ms tick
-	inboundQueueSize         = 4096
-	canSendHighWatermark     = 90 // percent
-	keepaliveIdlePeriod      = 100 * time.Millisecond
+	canSendHighWatermark  = 90 // percent
+	keepaliveIdlePeriod   = 100 * time.Millisecond
 	// defaultPeerRestartGrace is how long the latched peer must be silent
 	// before a frame from a different epoch is read as a server restart. The
 	// server emits a decodable keepalive every ~2s, so a few missed beats is
@@ -155,6 +145,7 @@ type streamTransport struct {
 	controlKCPOnce  sync.Once
 	frameInterval   time.Duration
 	batchSize       int
+	profile         limits.Profile
 
 	// localEpoch is stamped into every outgoing VP8 frame. Explicit
 	// upper-layer resets rotate it so the peer can reset its KCP state too.
@@ -193,6 +184,7 @@ type streamTransport struct {
 	controlKCP      *kcpRuntime
 	controlKCPMu    sync.RWMutex
 	controlOnDataMu sync.RWMutex // guards onControlData reads/writes
+	restartMu       sync.Mutex
 	reconnectMu     sync.Mutex
 	reconnectFn     func()
 	peerConfirmed   atomic.Bool
@@ -294,17 +286,19 @@ func newStreamTransport(
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
 	}
+	profile := limits.Normalize(cfg.ResourceProfile)
 	tr := &streamTransport{
 		stream:           stream,
 		track:            track,
 		onData:           cfg.OnData,
 		onPeerData:       cfg.OnPeerData,
-		outbound:         make(chan []byte, outboundQueueSize),
-		controlOutbound:  make(chan []byte, controlOutboundQueueSize),
+		outbound:         make(chan []byte, profile.VP8.DataOutboundQueue),
+		controlOutbound:  make(chan []byte, profile.VP8.ControlOutboundQueue),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(fps),
 		batchSize:        batchSize,
+		profile:          profile,
 		bindingToken:     channelBindingToken(cfg),
 		localEpoch:       randomEpoch(),
 		peers:            make(map[uint32]*kcpRuntime),
@@ -345,7 +339,7 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 	// would deadlock: muxconn.Write spins on CanSend (which checks kcp!=nil)
 	// and KCP was only started lazily on the first incoming peer frame.
 	p.kcpOnce.Do(func() {
-		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+		rt, err := startKCPWithProfile(p.outbound, p.onData, p.epochHeader(), p.profile, false)
 		if err != nil {
 			logger.Infof("vp8channel: startKCP failed: %v", err)
 			return
@@ -371,7 +365,7 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 			}
 		}
 		chdr := p.controlEpochHeader()
-		rt, err := startKCP(p.controlOutbound, controlCb, chdr)
+		rt, err := startKCPWithProfile(p.controlOutbound, controlCb, chdr, p.profile, true)
 		if err != nil {
 			logger.Infof("vp8channel: startControlKCP failed: %v", err)
 			return
@@ -558,17 +552,21 @@ func (p *streamTransport) SupportsPeerRouting() bool {
 func (p *streamTransport) Close() error {
 	if p.closed.CompareAndSwap(false, true) {
 		close(p.closeCh)
+		p.restartMu.Lock()
+		defer p.restartMu.Unlock()
 
-		p.kcpMu.RLock()
+		p.kcpMu.Lock()
 		rt := p.kcp
-		p.kcpMu.RUnlock()
+		p.kcp = nil
+		p.kcpMu.Unlock()
 		if rt != nil {
 			rt.close()
 		}
 
-		p.controlKCPMu.RLock()
+		p.controlKCPMu.Lock()
 		crt := p.controlKCP
-		p.controlKCPMu.RUnlock()
+		p.controlKCP = nil
+		p.controlKCPMu.Unlock()
 		if crt != nil {
 			crt.close()
 		}
@@ -623,13 +621,18 @@ func (p *streamTransport) drainControlOutbound() {
 // this before rebuilding smux so replacement handshakes are not parsed behind
 // stale bytes from streams that were active when the old session died.
 func (p *streamTransport) ResetPeer() {
+	p.restartMu.Lock()
+	defer p.restartMu.Unlock()
+	if p.closed.Load() {
+		return
+	}
 	p.peerConfirmed.Store(false)
 	p.peerEpoch.Store(0)
 	// Rotate data epoch; controlEpochValue() derives live from the new data
 	// epoch so the control header automatically follows.
 	newHdr := p.rotateEpochHeader()
-	p.restartKCP(newHdr)
-	p.restartControlKCPWithHeader(p.controlEpochHeader())
+	p.restartKCPLocked(newHdr)
+	p.restartControlKCPWithHeaderLocked(p.controlEpochHeader())
 }
 
 // Reconnect forwards to the underlying engine session.
@@ -653,13 +656,9 @@ func (p *streamTransport) SetReconnectCallback(cb func()) {
 	p.reconnectFn = cb
 	p.reconnectMu.Unlock()
 	p.stream.SetReconnectCallback(func() {
-		// Rotate the data epoch and restart both KCPs. controlEpochValue()
-		// derives live from the new data epoch so the control header follows
-		// automatically — the peer re-correlates data+control by arithmetic.
-		p.peerConfirmed.Store(false)
-		p.peerEpoch.Store(0)
-		p.restartKCP(p.rotateEpochHeader())
-		p.restartControlKCPWithHeader(p.controlEpochHeader())
+		// Upper layers must close their current muxconn(s) before ResetPeer
+		// restarts KCP: KCP close waits for its read loop, and that loop can be
+		// blocked in the upper-layer onData callback when a muxconn queue is full.
 		if cb != nil {
 			cb()
 		}
@@ -908,6 +907,15 @@ func appendBatchPacket(dst, packet []byte) []byte {
 }
 
 func (p *streamTransport) restartKCP(epochHdr [epochHdrLen]byte) {
+	p.restartMu.Lock()
+	defer p.restartMu.Unlock()
+	p.restartKCPLocked(epochHdr)
+}
+
+func (p *streamTransport) restartKCPLocked(epochHdr [epochHdrLen]byte) {
+	if p.closed.Load() {
+		return
+	}
 	p.drainOutbound()
 	p.kcpMu.Lock()
 	old := p.kcp
@@ -916,8 +924,12 @@ func (p *streamTransport) restartKCP(epochHdr [epochHdrLen]byte) {
 	if old != nil {
 		old.close()
 	}
-	rt, err := startKCP(p.outbound, p.onData, epochHdr)
+	rt, err := startKCPWithProfile(p.outbound, p.onData, epochHdr, p.profile, false)
 	if err != nil {
+		return
+	}
+	if p.closed.Load() {
+		rt.close()
 		return
 	}
 	p.kcpMu.Lock()
@@ -928,6 +940,15 @@ func (p *streamTransport) restartKCP(epochHdr [epochHdrLen]byte) {
 // restartControlKCPWithHeader restarts the control KCP with a specific epoch header,
 // used to preserve the control epoch across carrier reconnects.
 func (p *streamTransport) restartControlKCPWithHeader(hdr [epochHdrLen]byte) {
+	p.restartMu.Lock()
+	defer p.restartMu.Unlock()
+	p.restartControlKCPWithHeaderLocked(hdr)
+}
+
+func (p *streamTransport) restartControlKCPWithHeaderLocked(hdr [epochHdrLen]byte) {
+	if p.closed.Load() {
+		return
+	}
 	p.drainControlOutbound()
 	p.controlKCPMu.Lock()
 	old := p.controlKCP
@@ -944,8 +965,12 @@ func (p *streamTransport) restartControlKCPWithHeader(hdr [epochHdrLen]byte) {
 			cb(data)
 		}
 	}
-	rt, err := startKCP(p.controlOutbound, controlCb, hdr)
+	rt, err := startKCPWithProfile(p.controlOutbound, controlCb, hdr, p.profile, true)
 	if err != nil {
+		return
+	}
+	if p.closed.Load() {
+		rt.close()
 		return
 	}
 	p.controlKCPMu.Lock()
@@ -999,10 +1024,18 @@ type reorderBuffer struct {
 	pkts    map[uint16]*rtp.Packet
 	nextSeq uint16
 	started bool
+	window  int
 }
 
-func newReorderBuffer() *reorderBuffer {
-	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, reorderWindow)}
+func newReorderBuffer(windowOpt ...int) *reorderBuffer {
+	window := reorderWindow
+	if len(windowOpt) > 0 {
+		window = windowOpt[0]
+	}
+	if window <= 0 {
+		window = reorderWindow
+	}
+	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, window), window: window}
 }
 
 // push adds pkt and returns any packets now deliverable in strict sequence
@@ -1024,7 +1057,7 @@ func (b *reorderBuffer) push(pkt *rtp.Packet) []*rtp.Packet {
 
 	// Holding a full window behind a hole means the head sequence is
 	// genuinely lost: skip forward to the oldest buffered packet.
-	if len(b.pkts) > reorderWindow {
+	if len(b.pkts) > b.window {
 		b.skipToOldest()
 	}
 	return b.drain()
@@ -1114,7 +1147,7 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 
 func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	var state vp8FrameState
-	reorder := newReorderBuffer()
+	reorder := newReorderBuffer(p.profile.VP8.RTPReorderWindow)
 	buf := make([]byte, rtpBufSize)
 	var rtpCount, frameCount int
 
@@ -1375,15 +1408,15 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 	}
 
 	peerID := formatPeerID(epoch)
-	out := make(chan []byte, outboundQueueSize)
+	out := make(chan []byte, p.profile.VP8.DataOutboundQueue)
 	// Address downlink frames to the specific client epoch so other clients
 	// do not ingest them (issue #95 multi-client cross-talk).
 	hdr := buildEpochHeaderTo(p.bindingToken, p.localEpochValue(), epoch)
-	rt, err := startKCP(out, func(data []byte) {
+	rt, err := startKCPWithProfile(out, func(data []byte) {
 		if p.onPeerData != nil {
 			p.onPeerData(peerID, data)
 		}
-	}, hdr)
+	}, hdr, p.profile, false)
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer 0x%08x failed: %v", epoch, err)
 		return nil
@@ -1541,7 +1574,7 @@ func (p *streamTransport) getOrCreatePeerControlKCP(dataEpoch uint32) *peerContr
 			onPeerCtrl(peerID, data)
 		}
 	}
-	rt, err := startKCP(p.controlOutbound, cb, hdr)
+	rt, err := startKCPWithProfile(p.controlOutbound, cb, hdr, p.profile, true)
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer control 0x%08x failed: %v", dataEpoch, err)
 		return nil

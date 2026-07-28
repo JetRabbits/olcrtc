@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 )
 
 // ErrTransportNotFound is returned when a requested transport is not registered.
@@ -154,6 +156,10 @@ type Config struct {
 	// Traffic controls payload-size and pacing shaping applied around the
 	// underlying transport's Send.
 	Traffic TrafficConfig
+
+	// ResourceProfile is an immutable per-session resource budget. Zero value
+	// preserves historical defaults.
+	ResourceProfile limits.Profile
 }
 
 // Factory creates a transport instance.

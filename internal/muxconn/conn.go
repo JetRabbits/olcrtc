@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 )
@@ -113,11 +114,17 @@ type Conn struct {
 // New wires a Conn over the given transport. Push must be set as the
 // transport's OnData callback before this conn is used.
 func New(ln transport.Transport, cipher *crypto.Cipher) *Conn {
+	return NewWithProfile(ln, cipher, limits.Default())
+}
+
+// NewWithProfile wires a data-plane Conn using profile's inbound queue budget.
+func NewWithProfile(ln transport.Transport, cipher *crypto.Cipher, profile limits.Profile) *Conn {
+	p := limits.Normalize(profile)
 	return &Conn{
 		ln:      ln,
 		send:    ln.Send,
 		cipher:  cipher,
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, p.MuxConn.DataInboundQueue),
 		closeCh: make(chan struct{}),
 	}
 }
@@ -126,16 +133,22 @@ func New(ln transport.Transport, cipher *crypto.Cipher) *Conn {
 // control-plane channel (transport.ControlPlane). Returns nil if the
 // transport does not implement ControlPlane.
 func NewControl(ln transport.Transport, cipher *crypto.Cipher) *Conn {
+	return NewControlWithProfile(ln, cipher, limits.Default())
+}
+
+// NewControlWithProfile wires a control-plane Conn using profile's inbound queue budget.
+func NewControlWithProfile(ln transport.Transport, cipher *crypto.Cipher, profile limits.Profile) *Conn {
 	cp, ok := ln.(transport.ControlPlane)
 	if !ok {
 		return nil
 	}
+	p := limits.Normalize(profile)
 	c := &Conn{
 		ln:      ln,
 		send:    cp.ControlSend,
 		canSend: cp.ControlCanSend,
 		cipher:  cipher,
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, p.MuxConn.ControlInboundQueue),
 		closeCh: make(chan struct{}),
 	}
 	cp.SetControlOnData(func(data []byte) { c.Push(data) })
@@ -144,13 +157,19 @@ func NewControl(ln transport.Transport, cipher *crypto.Cipher) *Conn {
 
 // NewPeer wires a Conn whose writes are addressed to a specific transport peer.
 func NewPeer(ln transport.PeerTransport, cipher *crypto.Cipher, peerID string) *Conn {
+	return NewPeerWithProfile(ln, cipher, peerID, limits.Default())
+}
+
+// NewPeerWithProfile wires a peer data-plane Conn using profile's inbound queue budget.
+func NewPeerWithProfile(ln transport.PeerTransport, cipher *crypto.Cipher, peerID string, profile limits.Profile) *Conn {
+	p := limits.Normalize(profile)
 	return &Conn{
 		ln: ln,
 		send: func(data []byte) error {
 			return ln.SendTo(peerID, data)
 		},
 		cipher:  cipher,
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, p.MuxConn.DataInboundQueue),
 		closeCh: make(chan struct{}),
 	}
 }
@@ -160,10 +179,16 @@ func NewPeer(ln transport.PeerTransport, cipher *crypto.Cipher, peerID string) *
 // PeerControlPlane. The caller is responsible for registering a push callback
 // via cp.SetControlOnPeerData to drive this conn's Push.
 func NewPeerControl(ln transport.Transport, cipher *crypto.Cipher, peerID string) *Conn {
+	return NewPeerControlWithProfile(ln, cipher, peerID, limits.Default())
+}
+
+// NewPeerControlWithProfile wires a per-peer control Conn using profile's inbound queue budget.
+func NewPeerControlWithProfile(ln transport.Transport, cipher *crypto.Cipher, peerID string, profile limits.Profile) *Conn {
 	cp, ok := ln.(transport.PeerControlPlane)
 	if !ok {
 		return nil
 	}
+	p := limits.Normalize(profile)
 	c := &Conn{
 		ln: ln,
 		send: func(data []byte) error {
@@ -173,7 +198,7 @@ func NewPeerControl(ln transport.Transport, cipher *crypto.Cipher, peerID string
 			return cp.ControlPeerCanSend(peerID)
 		},
 		cipher:  cipher,
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, p.MuxConn.ControlInboundQueue),
 		closeCh: make(chan struct{}),
 	}
 	return c

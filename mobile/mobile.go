@@ -19,6 +19,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/app/session"
 	"github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/control"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 
@@ -78,6 +79,7 @@ var (
 	done               chan struct{}         //nolint:gochecknoglobals // package-level state intentional
 	ready              chan struct{}         //nolint:gochecknoglobals // package-level state intentional
 	errRun             error
+	flowStats          client.FlowStats
 )
 
 type mobileConfig struct {
@@ -90,6 +92,7 @@ type mobileConfig struct {
 	livenessInterval time.Duration
 	livenessTimeout  time.Duration
 	livenessFailures int
+	lowMemoryProfile bool
 }
 
 // SetProtector sets the Android VPN socket protector.
@@ -175,6 +178,16 @@ func SetLivenessOptions(intervalMillis, timeoutMillis, failures int) {
 		return
 	}
 	defaults.livenessFailures = failures
+}
+
+// SetLowMemoryProfile enables the iOS NetworkExtension low-memory resource
+// budget for subsequent Start/Check/Ping calls. It does not mutate any
+// already-running session.
+func SetLowMemoryProfile(enabled bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	defaults.lowMemoryProfile = enabled
 }
 
 // SetDebug enables or disables verbose logging.
@@ -268,7 +281,8 @@ func Check(
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
 				},
-				Liveness: livenessConfig(cfg),
+				Liveness:        livenessConfig(cfg),
+				ResourceProfile: mobileResourceProfile(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -359,7 +373,8 @@ func Ping(
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
 				},
-				Liveness: livenessConfig(cfg),
+				Liveness:        livenessConfig(cfg),
+				ResourceProfile: mobileResourceProfile(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -587,6 +602,7 @@ func startWithConfig(
 	ready = make(chan struct{})
 	localReady := ready
 	errRun = nil
+	flowStats = client.FlowStats{}
 
 	var readyOnce sync.Once
 	go func() {
@@ -609,7 +625,9 @@ func startWithConfig(
 					FPS:       cfg.vp8FPS,
 					BatchSize: cfg.vp8BatchSize,
 				},
-				Liveness: livenessConfig(cfg),
+				Liveness:        livenessConfig(cfg),
+				OnFlowStats:     updateFlowStats,
+				ResourceProfile: mobileResourceProfile(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -697,6 +715,10 @@ func Stop() {
 	if doneCh != nil {
 		<-doneCh
 	}
+
+	mu.Lock()
+	flowStats = client.FlowStats{}
+	mu.Unlock()
 }
 
 // IsRunning returns true if the olcRTC client is active.
@@ -704,6 +726,27 @@ func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return cancel != nil
+}
+
+// ActiveTCPFlows returns the current mobile client's active TCP SOCKS flows.
+func ActiveTCPFlows() int64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return flowStats.TCP
+}
+
+// ActiveUDPFlows returns the current mobile client's active UDP ASSOCIATE flows.
+func ActiveUDPFlows() int64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return flowStats.UDP
+}
+
+// ActiveTotalFlows returns the current mobile client's active SOCKS flows.
+func ActiveTotalFlows() int64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return flowStats.Total
 }
 
 func registerDefaults() {
@@ -774,6 +817,21 @@ func livenessConfig(cfg mobileConfig) control.Config {
 		Timeout:  timeout,
 		Failures: failures,
 	}
+}
+
+func mobileResourceProfile(cfg mobileConfig) limits.Profile {
+	if cfg.lowMemoryProfile {
+		return limits.MobileLowMemory()
+	}
+	return limits.Default()
+}
+
+func updateFlowStats(stats client.FlowStats) {
+	mu.Lock()
+	if stats.Seq >= flowStats.Seq {
+		flowStats = stats
+	}
+	mu.Unlock()
 }
 
 func normalizeTransport(value string) string {

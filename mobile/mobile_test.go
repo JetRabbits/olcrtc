@@ -11,6 +11,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/control"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
@@ -43,6 +44,7 @@ func resetMobileGlobals(t *testing.T) {
 	done = nil
 	ready = nil
 	errRun = nil
+	flowStats = client.FlowStats{}
 	runClientWithReady = clientRunWithReady
 	defaults = mobileConfig{}
 	defaultsSet = sync.Once{}
@@ -87,6 +89,7 @@ func TestDefaultsAndSetters(t *testing.T) {
 	SetDNS("9.9.9.9:53")
 	SetVP8Options(-1, 999)
 	SetLivenessOptions(2500, 750, -1)
+	SetLowMemoryProfile(true)
 
 	mu.Lock()
 	got := defaults
@@ -94,7 +97,7 @@ func TestDefaultsAndSetters(t *testing.T) {
 	if got.transport != dataTransport || got.dnsServer != "9.9.9.9:53" ||
 		got.vp8FPS != 1 || got.vp8BatchSize != 64 ||
 		got.livenessInterval != 2500*time.Millisecond || got.livenessTimeout != 750*time.Millisecond ||
-		got.livenessFailures != control.DefaultFailures {
+		got.livenessFailures != control.DefaultFailures || !got.lowMemoryProfile {
 		t.Fatalf("defaults = %+v", got)
 	}
 
@@ -105,6 +108,77 @@ func TestDefaultsAndSetters(t *testing.T) {
 	SetDebug(false)
 	if logger.IsVerbose() {
 		t.Fatal("SetDebug(false) did not disable verbose")
+	}
+}
+
+func TestLowMemoryProfilePropagatesToClientConfig(t *testing.T) {
+	resetMobileGlobals(t)
+	t.Cleanup(func() { resetMobileGlobals(t) })
+	SetLowMemoryProfile(true)
+
+	runClientWithReady = func(ctx context.Context, cfg client.Config, onReady func()) error {
+		want := limits.MobileLowMemory()
+		if cfg.ResourceProfile.KCP.DataSendWindow != want.KCP.DataSendWindow ||
+			cfg.ResourceProfile.SOCKS.MaxTotal != want.SOCKS.MaxTotal {
+			t.Fatalf("ResourceProfile = %+v, want mobile low-memory", cfg.ResourceProfile)
+		}
+		cfg.OnFlowStats(client.FlowStats{TCP: 2, UDP: 1, Total: 3})
+		onReady()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	if err := Start("jitsi", testRoomID, "client", "key", 1080, "", ""); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := WaitReady(100); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+	if ActiveTCPFlows() != 2 || ActiveUDPFlows() != 1 || ActiveTotalFlows() != 3 {
+		t.Fatalf("active flows tcp=%d udp=%d total=%d", ActiveTCPFlows(), ActiveUDPFlows(), ActiveTotalFlows())
+	}
+	Stop()
+}
+
+func TestCheckDoesNotOverwriteSingletonFlowStats(t *testing.T) {
+	resetMobileGlobals(t)
+	t.Cleanup(func() { resetMobileGlobals(t) })
+	mu.Lock()
+	flowStats = client.FlowStats{TCP: 4, UDP: 1, Total: 5}
+	mu.Unlock()
+	runClientWithReady = func(ctx context.Context, cfg client.Config, onReady func()) error {
+		if cfg.OnFlowStats != nil {
+			t.Fatal("Check should not own singleton flow diagnostics")
+		}
+		onReady()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if _, err := Check("jitsi", "dc", testRoomID, "client", "key", 1080, 100, 1, 1); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if ActiveTCPFlows() != 4 || ActiveUDPFlows() != 1 || ActiveTotalFlows() != 5 {
+		t.Fatalf("singleton stats overwritten: tcp=%d udp=%d total=%d", ActiveTCPFlows(), ActiveUDPFlows(), ActiveTotalFlows())
+	}
+}
+
+func TestFlowStatsUpdateIgnoresOlderSnapshots(t *testing.T) {
+	resetMobileGlobals(t)
+	newer := client.FlowStats{Seq: 10, TCP: 2, UDP: 1, Total: 3}
+	older := client.FlowStats{Seq: 9, TCP: 0, UDP: 0, Total: 0}
+	updateFlowStats(newer)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			updateFlowStats(older)
+		}()
+	}
+	wg.Wait()
+	if ActiveTCPFlows() != newer.TCP || ActiveUDPFlows() != newer.UDP || ActiveTotalFlows() != newer.Total {
+		t.Fatalf("older stats overwrote newer snapshot: tcp=%d udp=%d total=%d",
+			ActiveTCPFlows(), ActiveUDPFlows(), ActiveTotalFlows())
 	}
 }
 

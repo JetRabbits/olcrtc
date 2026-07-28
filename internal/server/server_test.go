@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -245,6 +246,7 @@ type serverLinkStub struct {
 	closed     bool
 	resetCount int
 	resetCh    chan struct{}
+	resetFn    func()
 }
 
 func (s *serverLinkStub) Connect(context.Context) error   { return nil }
@@ -259,12 +261,109 @@ func (s *serverLinkStub) Features() transport.Features    { return transport.Fea
 func (s *serverLinkStub) Reconnect(string)                {}
 func (s *serverLinkStub) ResetPeer() {
 	s.resetCount++
+	if s.resetFn != nil {
+		s.resetFn()
+	}
 	if s.resetCh != nil {
 		select {
 		case s.resetCh <- struct{}{}:
 		default:
 		}
 	}
+}
+
+func TestServerCarrierReconnectClosesMuxBeforeReset(t *testing.T) {
+	cipher, err := cryptopkg.NewCipher("01234567890123456789012345678901")
+	if err != nil {
+		t.Fatalf("NewCipher() error = %v", err)
+	}
+	ln := &serverLinkStub{}
+	s := &Server{ln: ln, cipher: cipher, peerSessions: make(map[string]*peerSession), done: make(chan struct{})}
+	s.conn = muxconn.New(ln, cipher)
+	blockedFrame, err := cipher.Encrypt([]byte("blocked"))
+	if err != nil {
+		t.Fatalf("Encrypt() error = %v", err)
+	}
+	s.conn.Push(blockedFrame)
+	ln.resetFn = func() { s.onData(blockedFrame) }
+	done := make(chan struct{})
+	go func() {
+		s.handleReconnect()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handleReconnect blocked while reset delivered into saturated muxconn")
+	}
+	if ln.resetCount != 1 {
+		t.Fatalf("ResetPeer calls = %d, want 1", ln.resetCount)
+	}
+}
+
+func TestDuplicateReconnectForSameDeadSessionDoesNotCloseReplacement(t *testing.T) {
+	cipher, err := cryptopkg.NewCipher("01234567890123456789012345678901")
+	if err != nil {
+		t.Fatalf("NewCipher() error = %v", err)
+	}
+	ln := &serverLinkStub{}
+	dead, _, cleanup := newSmuxSessionPair(t)
+	defer cleanup()
+	oldConn := muxconn.New(ln, cipher)
+	s := &Server{
+		baseCtx:      context.Background(),
+		ln:           ln,
+		cipher:       cipher,
+		session:      dead,
+		conn:         oldConn,
+		peerSessions: make(map[string]*peerSession),
+		done:         make(chan struct{}),
+	}
+	s.reinstallSession(dead)
+	replacement := s.conn
+	if replacement == nil || replacement == oldConn {
+		t.Fatal("replacement conn was not installed")
+	}
+	s.reinstallSession(dead)
+	if s.conn != replacement {
+		t.Fatal("duplicate reconnect replaced live session instead of being stale")
+	}
+	if _, err := replacement.Write([]byte("still-open")); errors.Is(err, muxconn.ErrClosed) {
+		t.Fatal("duplicate reconnect closed the replacement muxconn")
+	}
+}
+
+func TestCloseCurrentMuxConnsSnapshotsPeerFieldsUnderLock(t *testing.T) {
+	cipher, err := cryptopkg.NewCipher("01234567890123456789012345678901")
+	if err != nil {
+		t.Fatalf("NewCipher() error = %v", err)
+	}
+	ln := &serverLinkStub{}
+	ps := &peerSession{peerID: "peer"}
+	s := &Server{
+		ln:           ln,
+		cipher:       cipher,
+		peerSessions: map[string]*peerSession{"peer": ps},
+		done:         make(chan struct{}),
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.sessMu.Lock()
+				ps.conn = muxconn.New(ln, cipher)
+				ps.controlConn = muxconn.New(ln, cipher)
+				s.sessMu.Unlock()
+			}
+		}()
+	}
+	for i := 0; i < 100; i++ {
+		s.closeCurrentMuxConns()
+		s.resetLinkPeer()
+	}
+	wg.Wait()
 }
 
 func TestShutdownClosesLinkAndConn(t *testing.T) {
