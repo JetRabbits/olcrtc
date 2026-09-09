@@ -150,8 +150,10 @@ func Run(ctx context.Context, cfg Config) error {
 		dnsServer: cfg.DNSServer, resolver: tunnelcore.Resolver(cfg.Resolver, cfg.DNSServer),
 		socksProxyAddr: cfg.SOCKSProxyAddr, socksProxyPort: cfg.SOCKSProxyPort,
 		socksProxyUser: cfg.SOCKSProxyUser, socksProxyPass: cfg.SOCKSProxyPass,
-		liveness: cfg.Liveness, resourceProfile: limits.Normalize(cfg.ResourceProfile), health: runtime.NewHealthTracker(cfg.OnHealth),
-		peerSessions: make(map[string]*peerSession), peerStats: make(map[string]peerStat),
+		liveness:        cfg.Liveness,
+		resourceProfile: limits.Normalize(cfg.ResourceProfile),
+		health:          runtime.NewHealthTracker(cfg.OnHealth),
+		peerSessions:    make(map[string]*peerSession), peerStats: make(map[string]peerStat),
 		done: make(chan struct{}),
 	}
 	defer func() {

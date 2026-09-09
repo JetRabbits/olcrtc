@@ -347,8 +347,10 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 		s.sessMu.Unlock()
 		return nil
 	}
-	conn := muxconn.NewPeerWithQueue(s.peerLn, s.keys, peerID, s.resourceProfile.MuxConn.DataInboundQueue)
-	session, err := tunnelcore.NewSession(conn, tunnelcore.ServerRole, runtime.SmuxConfigForProfile(s.ln, s.resourceProfile))
+	peerDataQueue := s.resourceProfile.MuxConn.DataInboundQueue
+	conn := muxconn.NewPeerWithQueue(s.peerLn, s.keys, peerID, peerDataQueue)
+	peerSmuxCfg := runtime.SmuxConfigForProfile(s.ln, s.resourceProfile)
+	session, err := tunnelcore.NewSession(conn, tunnelcore.ServerRole, peerSmuxCfg)
 	if err != nil {
 		s.sessMu.Unlock()
 		logger.Warnf("smux server init failed for peer %s: %v", peerID, err)

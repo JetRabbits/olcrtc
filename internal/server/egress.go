@@ -43,7 +43,13 @@ func (r ConnectRequest) validate() error {
 	return nil
 }
 
-func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request ConnectRequest, sessionID string, initial []byte) {
+func (s *Server) dispatch(
+	ctx context.Context,
+	stream *smux.Stream,
+	request ConnectRequest,
+	sessionID string,
+	initial []byte,
+) {
 	if request.Cmd == udpDialCommand {
 		s.dispatchUDPDial(stream, request, initial)
 		return
@@ -51,7 +57,13 @@ func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request Conn
 	s.dispatchConnect(ctx, stream, request, sessionID, initial)
 }
 
-func (s *Server) dispatchConnect(ctx context.Context, stream *smux.Stream, request ConnectRequest, sessionID string, initial []byte) {
+func (s *Server) dispatchConnect(
+	ctx context.Context,
+	stream *smux.Stream,
+	request ConnectRequest,
+	sessionID string,
+	initial []byte,
+) {
 	addr := net.JoinHostPort(request.Addr, strconv.Itoa(request.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
 	started := time.Now()

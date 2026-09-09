@@ -99,10 +99,10 @@ func TestParseConnectRequest(t *testing.T) {
 		t.Fatalf("parseConnectRequest() = %+v", req)
 	}
 
-	if _, ok := parseConnectRequest([]byte("not-json")); ok {
+	if _, valid := parseConnectRequest([]byte("not-json")); valid {
 		t.Fatal("parseConnectRequest() unexpectedly accepted invalid json")
 	}
-	if _, ok := parseConnectRequest([]byte(`{"cmd":"other"}`)); ok {
+	if _, valid := parseConnectRequest([]byte(`{"cmd":"other"}`)); valid {
 		t.Fatal("parseConnectRequest() unexpectedly accepted wrong command")
 	}
 
@@ -110,8 +110,8 @@ func TestParseConnectRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal(udp) error = %v", err)
 	}
-	if req, ok := parseConnectRequest(udpReq); !ok || req.Cmd != udpDialCommand || req.Port != 53 {
-		t.Fatalf("parseConnectRequest(udp) = (%+v, %v)", req, ok)
+	if parsed, valid := parseConnectRequest(udpReq); !valid || parsed.Cmd != udpDialCommand || parsed.Port != 53 {
+		t.Fatalf("parseConnectRequest(udp) = (%+v, %v)", parsed, valid)
 	}
 	var frame bytes.Buffer
 	if err := framing.WriteBytes(&frame, []byte("packet"), maxUDPPacketSize); err != nil {

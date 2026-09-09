@@ -37,6 +37,13 @@ var (
 	ErrSOCKSAuthFailed         = errors.New("SOCKS5 authentication failed")
 	ErrSOCKSCredTooLong        = errors.New("socks5 user/pass exceeds 255 bytes")
 	ErrEmptySOCKSDomain        = errors.New("empty socks5 domain")
+	ErrSOCKSDomainTooLong      = errors.New("socks5 domain too long")
+)
+
+// SOCKS flow kinds tracked by the resource-profile caps.
+const (
+	flowKindTCP = "tcp"
+	flowKindUDP = "udp"
 )
 
 const (
@@ -157,7 +164,9 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
 		resourceProfile: limits.Normalize(cfg.ResourceProfile),
-		health:          runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}), onFlowStats: cfg.OnFlowStats,
+		health:          runtime.NewHealthTracker(cfg.OnHealth),
+		sessionReady:    make(chan struct{}),
+		onFlowStats:     cfg.OnFlowStats,
 	}
 	defer func() {
 		cancel()
@@ -211,11 +220,11 @@ func (c *Client) maxSocksConns() int {
 func (c *Client) tryBeginFlow(kind string) bool {
 	c.socksMu.Lock()
 	profile := c.resourceProfile.SOCKS
-	if kind == "tcp" && profile.MaxTCP > 0 && c.activeTCP >= int64(profile.MaxTCP) {
+	if kind == flowKindTCP && profile.MaxTCP > 0 && c.activeTCP >= int64(profile.MaxTCP) {
 		c.socksMu.Unlock()
 		return false
 	}
-	if kind == "udp" && profile.MaxUDP > 0 && c.activeUDP >= int64(profile.MaxUDP) {
+	if kind == flowKindUDP && profile.MaxUDP > 0 && c.activeUDP >= int64(profile.MaxUDP) {
 		c.socksMu.Unlock()
 		return false
 	}
@@ -223,7 +232,7 @@ func (c *Client) tryBeginFlow(kind string) bool {
 		c.socksMu.Unlock()
 		return false
 	}
-	if kind == "tcp" {
+	if kind == flowKindTCP {
 		c.activeTCP++
 	} else {
 		c.activeUDP++
@@ -237,10 +246,10 @@ func (c *Client) tryBeginFlow(kind string) bool {
 
 func (c *Client) endFlow(kind string) {
 	c.socksMu.Lock()
-	if kind == "tcp" && c.activeTCP > 0 {
+	if kind == flowKindTCP && c.activeTCP > 0 {
 		c.activeTCP--
 	}
-	if kind == "udp" && c.activeUDP > 0 {
+	if kind == flowKindUDP && c.activeUDP > 0 {
 		c.activeUDP--
 	}
 	if c.activeTotal > 0 {

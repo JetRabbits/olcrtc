@@ -21,6 +21,9 @@ const (
 	transportVideo = "videochannel"
 )
 
+// providerNone disables provider authentication (direct room access).
+const providerNone = "none"
+
 const (
 	defaultTransport        = transportVP8
 	defaultDNSServer        = "8.8.8.8:53"
@@ -377,7 +380,7 @@ func validateRuntimeConfig(cfg runtimeConfig) error {
 	if !supportedTransport(cfg.transport) {
 		return fmt.Errorf("%w: transport %q", ErrInvalidConfig, cfg.transport)
 	}
-	if cfg.provider != "none" && cfg.roomURL == "" {
+	if cfg.provider != providerNone && cfg.roomURL == "" {
 		return fmt.Errorf("%w: room is required", ErrInvalidConfig)
 	}
 	if err := validateKey(cfg.keyHex); err != nil {
@@ -447,7 +450,7 @@ func validateHostPort(address string) error {
 
 func supportedProvider(provider string) bool {
 	switch provider {
-	case "jitsi", "telemost", "wbstream", "none":
+	case "jitsi", "telemost", "wbstream", providerNone:
 		return true
 	default:
 		return false

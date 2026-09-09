@@ -121,7 +121,7 @@ func TestBatchSampleCarriesMultipleKCPPackets(t *testing.T) {
 	}
 
 	tr := &streamTransport{
-		data:      newKCPPlane(4, nil),
+		data:      newKCPPlane(4),
 		batchSize: 3,
 	}
 	tr.data.out <- packet("two")
