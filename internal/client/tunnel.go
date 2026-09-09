@@ -66,6 +66,21 @@ func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targ
 	return nil
 }
 
+func (c *Client) sendUDPDialRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
+	request, err := json.Marshal(map[string]any{
+		"cmd": udpDialCommand, "addr": targetAddr, "port": targetPort,
+	})
+	if err != nil {
+		return fmt.Errorf("sid=%d marshal udp-dial req: %w", stream.ID(), err)
+	}
+	_ = stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := stream.Write(request); err != nil {
+		return fmt.Errorf("sid=%d write udp-dial req: %w", stream.ID(), err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+	return nil
+}
+
 type connectAckError struct {
 	code     byte
 	streamID uint32

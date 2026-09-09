@@ -50,6 +50,50 @@ func TestSetupKeySetRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestSocks5UDPDatagramCodecRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr string
+	}{
+		{name: "ipv4", addr: "127.0.0.1"},
+		{name: "ipv6", addr: "2001:db8::1"},
+		{name: "domain", addr: "example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := marshalSocks5UDPDatagram(tc.addr, 5353, []byte("payload"))
+			if err != nil {
+				t.Fatalf("marshalSocks5UDPDatagram() error = %v", err)
+			}
+			got, err := parseSocks5UDPDatagram(wire)
+			if err != nil {
+				t.Fatalf("parseSocks5UDPDatagram() error = %v", err)
+			}
+			if got.addr != tc.addr || got.port != 5353 || !bytes.Equal(got.payload, []byte("payload")) {
+				t.Fatalf("datagram = %+v", got)
+			}
+		})
+	}
+}
+
+func TestReadSocks5RequestAcceptsUDPAssociate(t *testing.T) {
+	server, clientConn := net.Pipe()
+	defer func() { _ = server.Close(); _ = clientConn.Close() }()
+	done := make(chan socksRequest, 1)
+	go func() {
+		req, err := (&Client{}).readSocks5Request(server)
+		if err != nil {
+			t.Errorf("readSocks5Request() error = %v", err)
+			return
+		}
+		done <- req
+	}()
+	_, _ = clientConn.Write([]byte{5, socksCommandUDPAssociate, 0, socksAddrIPv4, 127, 0, 0, 1, 0x12, 0x34})
+	req := <-done
+	if req.command != socksCommandUDPAssociate || req.addr != "127.0.0.1" || req.port != 0x1234 {
+		t.Fatalf("request = %+v", req)
+	}
+}
+
 func newClientTestKeys(t *testing.T) *cryptopkg.KeySet {
 	t.Helper()
 	keys, err := cryptopkg.NewKeySet([]byte("01234567890123456789012345678901"), cryptopkg.Client)

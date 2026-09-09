@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/xtaci/smux"
 
+	"github.com/openlibrecommunity/olcrtc/internal/framing"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/tunnelcore"
 )
@@ -40,7 +43,15 @@ func (r ConnectRequest) validate() error {
 	return nil
 }
 
-func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request ConnectRequest, sessionID string) {
+func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request ConnectRequest, sessionID string, initial []byte) {
+	if request.Cmd == udpDialCommand {
+		s.dispatchUDPDial(stream, request, initial)
+		return
+	}
+	s.dispatchConnect(ctx, stream, request, sessionID, initial)
+}
+
+func (s *Server) dispatchConnect(ctx context.Context, stream *smux.Stream, request ConnectRequest, sessionID string, initial []byte) {
 	addr := net.JoinHostPort(request.Addr, strconv.Itoa(request.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
 	started := time.Now()
@@ -56,9 +67,66 @@ func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request Conn
 	if _, err := stream.Write([]byte{tunnelcore.ConnectAckOK}); err != nil {
 		return
 	}
+	if len(initial) > 0 {
+		if _, err := conn.Write(initial); err != nil {
+			return
+		}
+	}
 	counts, _ := tunnelcore.CopyBidirectional(ctx, stream, conn)
 	if s.onTraffic != nil {
 		s.onTraffic(sessionID, addr, counts.LeftToRight, counts.RightToLeft)
+	}
+}
+
+func (s *Server) dispatchUDPDial(stream *smux.Stream, request ConnectRequest, initial []byte) {
+	if err := request.validate(); err != nil {
+		logger.Infof("sid=%d invalid udp-dial request: %v", stream.ID(), err)
+		return
+	}
+	addr := net.JoinHostPort(request.Addr, strconv.Itoa(request.Port))
+	logger.Infof("sid=%d udp-dial %s", stream.ID(), addr)
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Resolver: s.resolver}
+	conn, err := dialer.Dial("udp", addr)
+	if err != nil {
+		logger.Infof("sid=%d udp-dial %s failed: %v", stream.ID(), addr, err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	go s.frameUDPReplies(stream, conn)
+
+	reader := io.Reader(stream)
+	if len(initial) > 0 {
+		reader = io.MultiReader(bytes.NewReader(initial), stream)
+	}
+	for {
+		packet, err := framing.ReadBytes(reader, maxUDPPacketSize)
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				logger.Debugf("sid=%d udp-dial read frame failed: %v", stream.ID(), err)
+			}
+			return
+		}
+		if len(packet) == 0 {
+			continue
+		}
+		if _, err := conn.Write(packet); err != nil {
+			logger.Debugf("sid=%d udp-dial write failed: %v", stream.ID(), err)
+			return
+		}
+	}
+}
+
+func (s *Server) frameUDPReplies(stream *smux.Stream, conn net.Conn) {
+	buf := make([]byte, maxUDPPacketSize)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := framing.WriteBytes(stream, buf[:n], maxUDPPacketSize); err != nil {
+			_ = stream.Close()
+			return
+		}
 	}
 }
 

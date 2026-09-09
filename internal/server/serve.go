@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -213,9 +214,9 @@ func (s *Server) handleStream(ctx context.Context, stream *smux.Stream, sessionI
 		n, err := stream.Read(buffer)
 		if n > 0 {
 			header = append(header, buffer[:n]...)
-			if request, ok := parseConnectRequest(header); ok {
+			if request, headerLen, ok := parseStreamRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
-				s.dispatch(ctx, stream, request, sessionID)
+				s.dispatch(ctx, stream, request, sessionID, header[headerLen:])
 				return
 			}
 		}
@@ -226,11 +227,20 @@ func (s *Server) handleStream(ctx context.Context, stream *smux.Stream, sessionI
 }
 
 func parseConnectRequest(buffer []byte) (ConnectRequest, bool) {
+	request, _, ok := parseStreamRequest(buffer)
+	return request, ok
+}
+
+func parseStreamRequest(buffer []byte) (ConnectRequest, int, bool) {
 	var request ConnectRequest
-	if err := json.Unmarshal(buffer, &request); err != nil {
-		return request, false
+	decoder := json.NewDecoder(bytes.NewReader(buffer))
+	if err := decoder.Decode(&request); err != nil {
+		return request, 0, false
 	}
-	return request, request.Cmd == connectCommand
+	if request.Cmd != connectCommand && request.Cmd != udpDialCommand {
+		return request, 0, false
+	}
+	return request, int(decoder.InputOffset()), true
 }
 
 func defaultAuthHook(_ string, _ map[string]any) (string, error) {

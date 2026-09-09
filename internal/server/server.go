@@ -20,7 +20,11 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/tunnelcore"
 )
 
-const connectCommand = "connect"
+const (
+	connectCommand   = "connect"
+	udpDialCommand   = "udp-dial"
+	maxUDPPacketSize = 65535
+)
 
 var (
 	ErrKeyRequired         = runtime.ErrKeyRequired

@@ -105,6 +105,23 @@ func TestParseConnectRequest(t *testing.T) {
 	if _, ok := parseConnectRequest([]byte(`{"cmd":"other"}`)); ok {
 		t.Fatal("parseConnectRequest() unexpectedly accepted wrong command")
 	}
+
+	udpReq, err := json.Marshal(ConnectRequest{Cmd: udpDialCommand, Addr: "1.1.1.1", Port: 53})
+	if err != nil {
+		t.Fatalf("Marshal(udp) error = %v", err)
+	}
+	if req, ok := parseConnectRequest(udpReq); !ok || req.Cmd != udpDialCommand || req.Port != 53 {
+		t.Fatalf("parseConnectRequest(udp) = (%+v, %v)", req, ok)
+	}
+	var frame bytes.Buffer
+	if err := framing.WriteBytes(&frame, []byte("packet"), maxUDPPacketSize); err != nil {
+		t.Fatalf("WriteBytes() error = %v", err)
+	}
+	combined := append(append([]byte(nil), udpReq...), frame.Bytes()...)
+	_, headerLen, ok := parseStreamRequest(combined)
+	if !ok || headerLen != len(udpReq) {
+		t.Fatalf("parseStreamRequest() = headerLen %d ok %v, want %d true", headerLen, ok, len(udpReq))
+	}
 }
 
 func TestDefaultAuthHook(t *testing.T) {
