@@ -3,8 +3,8 @@ package limits
 
 import "time"
 
-// Profile is copied into a client/server session at construction time and is
-// then treated as immutable. A zero Profile normalizes to DefaultProfile.
+// Profile is copied into a client/server session at construction time.
+// A zero Profile normalizes to Default.
 type Profile struct {
 	KCP     KCP
 	VP8     VP8
@@ -48,73 +48,25 @@ type SOCKS struct {
 	UDPAssociateIdleTimeout time.Duration
 }
 
-// Default preserves the historical cross-platform resource budgets.
+// Default preserves upstream server/desktop throughput defaults.
 func Default() Profile {
 	return Profile{
-		KCP: KCP{
-			DataSendWindow:       4096,
-			DataReceiveWindow:    4096,
-			ControlSendWindow:    4096,
-			ControlReceiveWindow: 4096,
-			DataInboundQueue:     4096,
-			ControlInboundQueue:  4096,
-		},
-		VP8: VP8{
-			DataOutboundQueue:    1536,
-			ControlOutboundQueue: 2048,
-			RTPReorderWindow:     256,
-		},
-		Smux: Smux{
-			DataReceiveBuffer:    8 * 1024 * 1024,
-			DataStreamBuffer:     512 * 1024,
-			ControlReceiveBuffer: 256 * 1024,
-			ControlStreamBuffer:  32 * 1024,
-		},
-		MuxConn: MuxConn{
-			DataInboundQueue:    128,
-			ControlInboundQueue: 128,
-		},
-		SOCKS: SOCKS{},
+		KCP:     KCP{DataSendWindow: 4096, DataReceiveWindow: 4096, ControlSendWindow: 4096, ControlReceiveWindow: 4096, DataInboundQueue: 4096, ControlInboundQueue: 4096},
+		VP8:     VP8{DataOutboundQueue: 1536, ControlOutboundQueue: 2048, RTPReorderWindow: 256},
+		Smux:    Smux{DataReceiveBuffer: 32 * 1024 * 1024, DataStreamBuffer: 4 * 1024 * 1024, ControlReceiveBuffer: 256 * 1024, ControlStreamBuffer: 32 * 1024},
+		MuxConn: MuxConn{DataInboundQueue: 128, ControlInboundQueue: 128},
+		SOCKS:   SOCKS{MaxTCP: 512, MaxUDP: 512, MaxTotal: 512, HandshakeTimeout: 30 * time.Second, UDPAssociateIdleTimeout: 2 * time.Minute},
 	}
 }
 
 // MobileLowMemory targets the iOS NetworkExtension 50 MiB budget.
 func MobileLowMemory() Profile {
 	return Profile{
-		KCP: KCP{
-			DataSendWindow:       512,
-			DataReceiveWindow:    512,
-			ControlSendWindow:    64,
-			ControlReceiveWindow: 64,
-			DataInboundQueue:     512,
-			ControlInboundQueue:  128,
-		},
-		VP8: VP8{
-			DataOutboundQueue:    256,
-			ControlOutboundQueue: 128,
-			RTPReorderWindow:     64,
-		},
-		Smux: Smux{
-			DataReceiveBuffer:    1024 * 1024,
-			DataStreamBuffer:     128 * 1024,
-			ControlReceiveBuffer: 64 * 1024,
-			ControlStreamBuffer:  16 * 1024,
-		},
-		MuxConn: MuxConn{
-			DataInboundQueue:    16,
-			ControlInboundQueue: 8,
-		},
-		SOCKS: SOCKS{
-			MaxTCP:                  12,
-			// iOS commonly keeps four DNS UDP endpoints active before a browser
-			// download starts. A cap of four starves subsequent hostname lookups,
-			// so leave bounded headroom for DNS and QUIC without returning to an
-			// unbounded association count.
-			MaxUDP:                  8,
-			MaxTotal:                20,
-			HandshakeTimeout:        10 * time.Second,
-			UDPAssociateIdleTimeout: 45 * time.Second,
-		},
+		KCP:     KCP{DataSendWindow: 512, DataReceiveWindow: 512, ControlSendWindow: 64, ControlReceiveWindow: 64, DataInboundQueue: 512, ControlInboundQueue: 128},
+		VP8:     VP8{DataOutboundQueue: 256, ControlOutboundQueue: 128, RTPReorderWindow: 64},
+		Smux:    Smux{DataReceiveBuffer: 1024 * 1024, DataStreamBuffer: 128 * 1024, ControlReceiveBuffer: 64 * 1024, ControlStreamBuffer: 16 * 1024},
+		MuxConn: MuxConn{DataInboundQueue: 16, ControlInboundQueue: 8},
+		SOCKS:   SOCKS{MaxTCP: 12, MaxUDP: 8, MaxTotal: 20, HandshakeTimeout: 10 * time.Second, UDPAssociateIdleTimeout: 45 * time.Second},
 	}
 }
 
@@ -164,6 +116,21 @@ func Normalize(p Profile) Profile {
 	}
 	if p.MuxConn.ControlInboundQueue <= 0 {
 		p.MuxConn.ControlInboundQueue = d.MuxConn.ControlInboundQueue
+	}
+	if p.SOCKS.MaxTCP <= 0 {
+		p.SOCKS.MaxTCP = d.SOCKS.MaxTCP
+	}
+	if p.SOCKS.MaxUDP <= 0 {
+		p.SOCKS.MaxUDP = d.SOCKS.MaxUDP
+	}
+	if p.SOCKS.MaxTotal <= 0 {
+		p.SOCKS.MaxTotal = d.SOCKS.MaxTotal
+	}
+	if p.SOCKS.HandshakeTimeout <= 0 {
+		p.SOCKS.HandshakeTimeout = d.SOCKS.HandshakeTimeout
+	}
+	if p.SOCKS.UDPAssociateIdleTimeout <= 0 {
+		p.SOCKS.UDPAssociateIdleTimeout = d.SOCKS.UDPAssociateIdleTimeout
 	}
 	return p
 }

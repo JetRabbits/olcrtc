@@ -1,5 +1,5 @@
 // Package runtime holds infrastructure shared by the olcrtc server and
-// client: smux tuning, cipher setup, and control-stream health bookkeeping.
+// client: smux tuning, key setup, and control-stream health bookkeeping.
 // The lifecycle differences between server and client (accept loop / SOCKS5
 // dial vs. SOCKS5 listener / tunnel) live in their respective packages.
 package runtime
@@ -11,11 +11,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtaci/smux"
+
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
-	"github.com/xtaci/smux"
 )
 
 const (
@@ -31,8 +32,8 @@ const (
 	MinSmuxWirePayload = SmuxWireOverhead + 1
 
 	smuxMaxFrameSize     = 32 * 1024
-	smuxMaxReceiveBuffer = 8 * 1024 * 1024
-	smuxMaxStreamBuffer  = 512 * 1024
+	smuxMaxReceiveBuffer = 32 * 1024 * 1024
+	smuxMaxStreamBuffer  = 4 * 1024 * 1024
 )
 
 // ErrKeyRequired is returned when no encryption key is provided.
@@ -41,8 +42,8 @@ var ErrKeyRequired = errors.New("key required (use -key <hex>)")
 // ErrKeySize is returned when the encryption key is not 32 bytes.
 var ErrKeySize = errors.New("key must be 32 bytes")
 
-// SetupCipher decodes a 64-char hex key and instantiates the AEAD cipher.
-func SetupCipher(keyHex string) (*crypto.Cipher, error) {
+// SetupKeySet decodes a 64-char hex PSK and creates role-aware v2 keys.
+func SetupKeySet(keyHex string, role crypto.Role) (*crypto.KeySet, error) {
 	if keyHex == "" {
 		return nil, ErrKeyRequired
 	}
@@ -53,11 +54,11 @@ func SetupCipher(keyHex string) (*crypto.Cipher, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("%w, got %d", ErrKeySize, len(key))
 	}
-	cipher, err := crypto.NewCipher(string(key))
+	keys, err := crypto.NewKeySet(key, role)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+		return nil, fmt.Errorf("failed to create key set: %w", err)
 	}
-	return cipher, nil
+	return keys, nil
 }
 
 // SmuxConfig returns the tuned smux config used on both ends. Both peers
@@ -65,50 +66,39 @@ func SetupCipher(keyHex string) (*crypto.Cipher, error) {
 // constrains the smux payload size so the encrypted whole smux frame fits
 // under the transport's per-message payload cap.
 func SmuxConfig(maxWirePayload int) *smux.Config {
-	return smuxConfig(maxWirePayload, limits.Default().Smux.DataReceiveBuffer, limits.Default().Smux.DataStreamBuffer)
+	return SmuxConfigWithProfile(maxWirePayload, limits.Default())
 }
 
-func smuxConfig(maxWirePayload, receiveBuffer, streamBuffer int) *smux.Config {
+func SmuxConfigWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	profile = limits.Normalize(profile)
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = smuxMaxFrameSize
-	if maxWirePayload >= MinSmuxWirePayload {
-		maxFrameSize := maxWirePayload - SmuxWireOverhead
-		if maxFrameSize < cfg.MaxFrameSize {
-			cfg.MaxFrameSize = maxFrameSize
-		}
-	}
-	cfg.MaxReceiveBuffer = receiveBuffer
-	cfg.MaxStreamBuffer = streamBuffer
+	clampMaxFrameSize(cfg, maxWirePayload)
+	cfg.MaxReceiveBuffer = profile.Smux.DataReceiveBuffer
+	cfg.MaxStreamBuffer = profile.Smux.DataStreamBuffer
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg
 }
 
-// SmuxConfigProfile is SmuxConfig using the data-plane buffers from profile.
-func SmuxConfigProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
-	p := limits.Normalize(profile)
-	return smuxConfig(maxWirePayload, p.Smux.DataReceiveBuffer, p.Smux.DataStreamBuffer)
-}
-
 // SmuxConfigLong is SmuxConfig with a relaxed keep-alive timeout for
-// transports whose carrier can legitimately go silent for tens of seconds
+// transports whose provider can legitimately go silent for tens of seconds
 // (vp8channel/goolom publisher-PC reconnect + SFU renegotiation). A tight
-// timeout would tear down the smux session while the carrier is rebuilding
+// timeout would tear down the smux session while the provider is rebuilding
 // itself, forcing an unnecessary second reconnect. Only transports that
-// implement transport.ControlPlane use this; conventional carriers
+// implement transport.ControlPlane use this; conventional providers
 // (jitsi/datachannel) keep the conservative 30s timeout so a genuinely dead
 // link is detected and reconnected promptly.
 func SmuxConfigLong(maxWirePayload int) *smux.Config {
-	cfg := SmuxConfigProfile(maxWirePayload, limits.Default())
+	cfg := SmuxConfigWithProfile(maxWirePayload, limits.Default())
 	cfg.KeepAliveTimeout = 120 * time.Second
 	return cfg
 }
 
-// SmuxConfigLongProfile is SmuxConfigLong using the data-plane buffers from profile.
-func SmuxConfigLongProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
-	cfg := SmuxConfigProfile(maxWirePayload, profile)
+func SmuxConfigLongWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	cfg := SmuxConfigWithProfile(maxWirePayload, profile)
 	cfg.KeepAliveTimeout = 120 * time.Second
 	return cfg
 }
@@ -122,25 +112,24 @@ func IsControlPlane(tr transport.Transport) bool {
 }
 
 // SmuxConfigFor returns the data-plane smux config appropriate for the
-// transport: relaxed keep-alive for ControlPlane carriers, conservative
+// transport: relaxed keep-alive for ControlPlane providers, conservative
 // otherwise.
 func SmuxConfigFor(tr transport.Transport) *smux.Config {
 	return SmuxConfigForProfile(tr, limits.Default())
 }
 
-// SmuxConfigForProfile returns the data-plane smux config for profile.
 func SmuxConfigForProfile(tr transport.Transport, profile limits.Profile) *smux.Config {
 	maxWirePayload := MaxPayload(tr)
 	if IsControlPlane(tr) {
-		return SmuxConfigLongProfile(maxWirePayload, profile)
+		return SmuxConfigLongWithProfile(maxWirePayload, profile)
 	}
-	return SmuxConfigProfile(maxWirePayload, profile)
+	return SmuxConfigWithProfile(maxWirePayload, profile)
 }
 
 // LivenessTimeout returns the control-stream pong timeout for a transport:
 // a relaxed window for ControlPlane transports (KCP batching + frame pacing
 // can delay control packets under load), and the conservative default for
-// conventional carriers so dead links are detected quickly.
+// conventional providers so dead links are detected quickly.
 func LivenessTimeout(tr transport.Transport) time.Duration {
 	if IsControlPlane(tr) {
 		return 45 * time.Second
@@ -151,7 +140,7 @@ func LivenessTimeout(tr transport.Transport) time.Duration {
 // ConnectAckTimeout returns the tunnel CONNECT ack read deadline for a
 // transport. ControlPlane transports (SFU renegotiation) may take ~30s to
 // start forwarding data frames, so they get a generous window; conventional
-// carriers use the conservative default.
+// providers use the conservative default.
 func ConnectAckTimeout(tr transport.Transport) time.Duration {
 	if IsControlPlane(tr) {
 		return 90 * time.Second
@@ -164,27 +153,30 @@ func ConnectAckTimeout(tr transport.Transport) time.Duration {
 // small stream buffers and disable smux keepalives (the olcrtc control.Run
 // ping loop handles liveness itself).
 func ControlSmuxConfig(maxWirePayload int) *smux.Config {
-	return ControlSmuxConfigProfile(maxWirePayload, limits.Default())
+	return ControlSmuxConfigWithProfile(maxWirePayload, limits.Default())
 }
 
-// ControlSmuxConfigProfile returns a lean control-plane smux config for profile.
-func ControlSmuxConfigProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
-	p := limits.Normalize(profile)
+func ControlSmuxConfigWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	profile = limits.Normalize(profile)
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.MaxFrameSize = smuxMaxFrameSize
+	clampMaxFrameSize(cfg, maxWirePayload)
+	// Tiny buffers: control frames are at most a few hundred bytes.
+	cfg.MaxReceiveBuffer = profile.Smux.ControlReceiveBuffer
+	cfg.MaxStreamBuffer = profile.Smux.ControlStreamBuffer
+	// Disable smux keepalive - control.Run runs its own ping/pong loop.
+	cfg.KeepAliveDisabled = true
+	return cfg
+}
+
+func clampMaxFrameSize(cfg *smux.Config, maxWirePayload int) {
 	if maxWirePayload >= MinSmuxWirePayload {
 		maxFrameSize := maxWirePayload - SmuxWireOverhead
 		if maxFrameSize < cfg.MaxFrameSize {
 			cfg.MaxFrameSize = maxFrameSize
 		}
 	}
-	// Tiny buffers: control frames are at most a few hundred bytes.
-	cfg.MaxReceiveBuffer = p.Smux.ControlReceiveBuffer
-	cfg.MaxStreamBuffer = p.Smux.ControlStreamBuffer
-	// Disable smux keepalive - control.Run runs its own ping/pong loop.
-	cfg.KeepAliveDisabled = true
-	return cfg
 }
 
 // MaxPayload reports the transport's per-message payload limit. Returns 0

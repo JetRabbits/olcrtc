@@ -16,13 +16,19 @@
 
 Текущий `olcrtc` не парсит такой URI автоматически. Если клиентское приложение хочет использовать эту запись, оно должно само разобрать строку и передать полученные поля в YAML конфиг `olcrtc`.
 
+У соглашения нет поля версии внутри URI. Описанная ниже схема называется URI format v1. Переименование первого placeholder в `Provider` не меняет сериализованную строку, потому что на этой позиции уже находилось имя провайдера.
+
+Примечание по миграции: старые производители v1 могут по-прежнему добавлять `video-bitrate` и `video-hw`. Текущий runtime игнорирует оба поля, поэтому производители должны прекратить их добавлять. Это не вводит новую версию URI или URI-парсер в `olcrtc`.
+
+Основной клиент, который потребляет этот формат URI - [owenewans/owenclave](https://github.com/owenewans/owenclave) ([src.owenewans.org/owenrtc](https://src.owenewans.org/owenrtc)) - Android-клиент прокси (форк exclave), поддерживающий все распространённые протоколы (vless, hysteria2, mieru, trojan, vmess, tuic, shadowsocks, socks ...) плюс `olcrtc` и подписки.
+
 ---
 
 ## Формат
 
 ```text
-olcrtc://<Auth>?<Transport>@<RoomID>#<EncryptionKey>$<MIMO>
-olcrtc://<Auth>?<Transport><key=value&key=value>@<RoomID>#<EncryptionKey>$<MIMO>
+olcrtc://<Provider>?<Transport>@<RoomID>#<EncryptionKey>$<MIMO>
+olcrtc://<Provider>?<Transport><key=value&key=value>@<RoomID>#<EncryptionKey>$<MIMO>
 ```
 
 Все поля после `olcrtc://` считаются частью клиентского соглашения.
@@ -35,10 +41,10 @@ olcrtc://<Auth>?<Transport><key=value&key=value>@<RoomID>#<EncryptionKey>$<MIMO>
 
 | Поле | Значение |
 |------|----------|
-| `<Auth>` | Имя auth-провайдера, например `telemost`, `wbstream`, `jitsi` |
+| `<Provider>` | Имя провайдера, например `telemost`, `wbstream`, `jitsi` |
 | `<Transport>` | Имя транспорта, например `datachannel`, `vp8channel`, `seichannel`, `videochannel` |
 | payload | Параметры транспорта в `<key=value&...>`. Ключи совпадают с YAML полями. Блок опускается если используются defaults |
-| `<RoomID>` | Идентификатор комнаты или auth-specific room URL/ID |
+| `<RoomID>` | Идентификатор комнаты или provider-specific room URL/ID |
 | `<EncryptionKey>` | Ключ шифрования в hex, обычно 64 символа (`32` байта) |
 | `<MIMO>` | Свободный комментарий для UI/метаданных, например `RU / olc free sub / IPv6` |
 
@@ -73,8 +79,6 @@ Payload не используется.
 | `video-w` | `video.width` | Ширина в пикселях |
 | `video-h` | `video.height` | Высота в пикселях |
 | `video-fps` | `video.fps` | FPS |
-| `video-bitrate` | `video.bitrate` | Битрейт, например `5000k` или `2M` |
-| `video-hw` | `video.hw` | Аппаратное ускорение: `none` или `nvenc` |
 | `video-codec` | `video.codec` | `qrcode` или `tile` |
 | `video-qr-size` | `video.qr_size` | Размер фрагмента QR в байтах |
 | `video-qr-recovery` | `video.qr_recovery` | Коррекция ошибок: `low` / `medium` / `high` / `highest` |
@@ -87,7 +91,7 @@ Payload не используется.
 
 | URI поле | YAML поле |
 |----------|-----------|
-| `<Auth>` | `auth.provider` |
+| `<Provider>` | `auth.provider` |
 | `<Transport>` | `net.transport` |
 | payload | соответствующие YAML поля транспорта |
 | `<RoomID>` | `room.id` |
@@ -95,6 +99,8 @@ Payload не используется.
 | `<MIMO>` | В `olcrtc` не передаётся. Это только клиентский комментарий |
 
 `data: data` в этом формате не кодируется, потому что это локальная runtime-настройка конкретного запуска.
+
+Ключ из URI используется текущим record layer OLC2. У OLC2 нет fallback на старый crypto format, поэтому обе стороны должны работать на совместимых сборках. Для `seichannel` и `videochannel` обе стороны также должны поддерживать OLVC версии 5.
 
 ---
 
@@ -135,7 +141,10 @@ crypto:
   key: "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
 net:
   transport: datachannel
-data: data
+  dns: "8.8.8.8:53"
+socks:
+  host: "127.0.0.1"
+  port: 8808
 ```
 
 ### wbstream + vp8channel
@@ -156,10 +165,13 @@ crypto:
   key: "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
 net:
   transport: vp8channel
+  dns: "8.8.8.8:53"
 vp8:
-  fps: 30
+  fps: 60
   batch_size: 64
-data: data
+socks:
+  host: "127.0.0.1"
+  port: 8808
 ```
 
 ### wbstream + seichannel
@@ -180,18 +192,21 @@ crypto:
   key: "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
 net:
   transport: seichannel
+  dns: "8.8.8.8:53"
 sei:
-  fps: 30
+  fps: 60
   batch_size: 64
   fragment_size: 900
   ack_timeout_ms: 2000
-data: data
+socks:
+  host: "127.0.0.1"
+  port: 8808
 ```
 
 ### telemost + videochannel
 
 ```text
-olcrtc://telemost?videochannel<video-w=1080&video-h=1080&video-fps=60&video-bitrate=5000k&video-hw=none&video-codec=qrcode>@room-01#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$MIMO
+olcrtc://telemost?videochannel<video-w=1080&video-h=1080&video-fps=60&video-codec=qrcode>@room-01#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$MIMO
 ```
 
 ### Эквивалент YAML
@@ -206,14 +221,15 @@ crypto:
   key: "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
 net:
   transport: videochannel
+  dns: "8.8.8.8:53"
 video:
   width: 1080
   height: 1080
-  fps: 30
-  bitrate: "5000k"
-  hw: none
+  fps: 60
   codec: qrcode
-data: data
+socks:
+  host: "127.0.0.1"
+  port: 8808
 ```
 
 ---
@@ -221,16 +237,10 @@ data: data
 ### jitsi + datachannel
 
 ```text
-olcrtc://jitsi?datachannel@https://meet.small-dm.ru/myroom#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$RU / olc free sub
+olcrtc://jitsi?datachannel@https://meet.example.org/myroom#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$RU / olc free sub
 ```
 
-Или с `meet.handyweb.org`:
-
-```text
-olcrtc://jitsi?datachannel@https://meet.handyweb.org/myroom#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$RU / olc free sub
-```
-
-`<RoomID>` для jitsi - полный URL комнаты в формате `https://host/room` (или `host/room`). Поддерживается любой self-hosted Jitsi Meet инстанс без аутентификации; для публичных серверов (`meet.small-dm.ru`, `meet1.arbitr.ru`, `meet.handyweb.org`, `meet.jit.si`) тот же формат. **Обязательно проверьте, какой сервер доступен в вашей сети.**
+`<RoomID>` для jitsi - полный URL комнаты в формате `https://host/room` (или `host/room`). Поддерживается любой self-hosted Jitsi Meet инстанс без аутентификации; публичные инстансы - в [`docs/jitsi.instances.yaml`](./jitsi.instances.yaml) (или `meet.jit.si`). **Обязательно проверьте, какой сервер доступен в вашей сети.**
 
 ### Эквивалент YAML
 
@@ -239,13 +249,16 @@ mode: cnc
 auth:
   provider: jitsi
 room:
-  # Используйте meet.small-dm.ru, meet1.arbitr.ru или meet.handyweb.org - тот, что работает в вашей сети
-  id: "https://meet.small-dm.ru/myroom"
+  # Инстансы: docs/jitsi.instances.yaml
+  id: "https://meet.example.org/myroom"
 crypto:
   key: "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
 net:
   transport: datachannel
-data: data
+  dns: "8.8.8.8:53"
+socks:
+  host: "127.0.0.1"
+  port: 8808
 ```
 
 ---
@@ -258,4 +271,4 @@ data: data
 
 Формат подписки (список серверов): [sub.md](sub.ru.md)
 
-Матрица совместимости auth + transport: [settings.md](settings.ru.md)
+Матрица совместимости provider + transport: [settings.md](settings.ru.md)

@@ -23,6 +23,10 @@ Inside, the file holds a list of `olcrtc` URIs from [uri.md](uri.md) plus extra 
 
 Important: this is a convention **for client applications**. `olcrtc` itself does not read or process such a file.
 
+The subscription schema has no in-band version field and is documented as subscription format v1. Its URI lines use the `Provider` slot from URI format v1. Current OLC2 crypto and OLVC v5 video compatibility requirements apply to every listed endpoint.
+
+Migration note: old subscription producers may still include URI payload fields `video-bitrate` and `video-hw`. The current runtime ignores both fields, and producers must stop emitting them. The subscription and URI formats remain v1.
+
 ---
 
 ## Purpose
@@ -94,8 +98,8 @@ Lines like `#key: value` apply to the whole subscription.
 Each server line holds one `olcrtc` URI in the format from [uri.md](uri.md):
 
 ```text
-olcrtc://<Auth>?<Transport>@<RoomID>#<EncryptionKey>$<MIMO>
-olcrtc://<Auth>?<Transport><key=value&key=value>@<RoomID>#<EncryptionKey>$<MIMO>
+olcrtc://<Provider>?<Transport>@<RoomID>#<EncryptionKey>$<MIMO>
+olcrtc://<Provider>?<Transport><key=value&key=value>@<RoomID>#<EncryptionKey>$<MIMO>
 ```
 
 One line = one server / one subscription entry.
@@ -161,10 +165,10 @@ olcrtc://wbstream?datachannel@abc123xyz#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 ## Subscription client implementation
 
-There is no single implementation yet, but they will surely appear soon, even in the official repository.
+The main client that reads this subscription format is [owenewans/owenclave](https://github.com/owenewans/owenclave) ([src.owenewans.org/owenrtc](https://src.owenewans.org/owenrtc)) - an Android proxy client (fork of exclave) that supports all common protocols (vless, hysteria2, mieru, trojan, vmess, tuic, shadowsocks, socks ...) plus `olcrtc`, the `olcrtc://` URI format and subscriptions.
 
 ---
 
 URI format for a single server: [uri.md](uri.md)
 
-Compatibility matrix for auth + transport: [settings.md](settings.md)
+Compatibility matrix for provider + transport: [settings.md](settings.md)

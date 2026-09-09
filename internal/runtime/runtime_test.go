@@ -6,30 +6,39 @@ import (
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
-	"github.com/openlibrecommunity/olcrtc/internal/limits"
+	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 )
 
-func TestSetupCipherErrors(t *testing.T) {
-	if _, err := runtime.SetupCipher(""); !errors.Is(err, runtime.ErrKeyRequired) {
+func TestSetupKeySetErrors(t *testing.T) {
+	if _, err := runtime.SetupKeySet("", crypto.Client); !errors.Is(err, runtime.ErrKeyRequired) {
 		t.Fatalf("empty key error = %v, want ErrKeyRequired", err)
 	}
-	if _, err := runtime.SetupCipher("notHex"); err == nil {
+	if _, err := runtime.SetupKeySet("notHex", crypto.Client); err == nil {
 		t.Fatalf("bad hex error = nil")
 	}
-	if _, err := runtime.SetupCipher("00"); !errors.Is(err, runtime.ErrKeySize) {
+	if _, err := runtime.SetupKeySet("00", crypto.Client); !errors.Is(err, runtime.ErrKeySize) {
 		t.Fatalf("short key error = %v, want ErrKeySize", err)
 	}
 }
 
-func TestSetupCipherSuccess(t *testing.T) {
+func TestSetupKeySetSuccess(t *testing.T) {
 	key := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	c, err := runtime.SetupCipher(key)
+	c, err := runtime.SetupKeySet(key, crypto.Server)
 	if err != nil {
-		t.Fatalf("SetupCipher() error = %v", err)
+		t.Fatalf("SetupKeySet() error = %v", err)
 	}
 	if c == nil {
-		t.Fatal("SetupCipher() returned nil cipher")
+		t.Fatal("SetupKeySet() returned nil key set")
+	}
+}
+
+func TestSmuxWireOverhead(t *testing.T) {
+	if crypto.WireOverhead != 44 {
+		t.Fatalf("crypto.WireOverhead = %d, want 44", crypto.WireOverhead)
+	}
+	if runtime.SmuxWireOverhead != 52 {
+		t.Fatalf("runtime.SmuxWireOverhead = %d, want 52", runtime.SmuxWireOverhead)
 	}
 }
 
@@ -38,7 +47,7 @@ func TestSmuxConfigDefault(t *testing.T) {
 	if cfg.Version != 2 || cfg.MaxFrameSize != 32768 {
 		t.Fatalf("SmuxConfig(0) = %+v", cfg)
 	}
-	if cfg.MaxReceiveBuffer != 8*1024*1024 || cfg.MaxStreamBuffer != 512*1024 {
+	if cfg.MaxReceiveBuffer != 32*1024*1024 || cfg.MaxStreamBuffer != 4*1024*1024 {
 		t.Fatalf("SmuxConfig(0) buffers = %+v", cfg)
 	}
 	if cfg.KeepAliveDisabled || cfg.KeepAliveInterval != 10*time.Second ||
@@ -54,19 +63,6 @@ func TestSmuxConfigLong(t *testing.T) {
 	}
 }
 
-func TestSmuxConfigProfileUsesProfileBuffers(t *testing.T) {
-	profile := limits.MobileLowMemory()
-	data := runtime.SmuxConfigProfile(0, profile)
-	if data.MaxReceiveBuffer != profile.Smux.DataReceiveBuffer || data.MaxStreamBuffer != profile.Smux.DataStreamBuffer {
-		t.Fatalf("data smux buffers = %+v", data)
-	}
-	control := runtime.ControlSmuxConfigProfile(0, profile)
-	if control.MaxReceiveBuffer != profile.Smux.ControlReceiveBuffer ||
-		control.MaxStreamBuffer != profile.Smux.ControlStreamBuffer {
-		t.Fatalf("control smux buffers = %+v", control)
-	}
-}
-
 func TestSmuxConfigShrinks(t *testing.T) {
 	// 100-byte wire payload minus smux+crypto overhead is far below default
 	// 32768, so MaxFrameSize must shrink.
@@ -76,6 +72,16 @@ func TestSmuxConfigShrinks(t *testing.T) {
 	}
 	if cfg.MaxFrameSize+runtime.SmuxWireOverhead != 100 {
 		t.Fatalf("wire size = %d, want 100", cfg.MaxFrameSize+runtime.SmuxWireOverhead)
+	}
+}
+
+func TestControlSmuxConfigUsesSameFrameClamp(t *testing.T) {
+	cfg := runtime.ControlSmuxConfig(100)
+	if cfg.MaxFrameSize+runtime.SmuxWireOverhead != 100 {
+		t.Fatalf("control wire size = %d, want 100", cfg.MaxFrameSize+runtime.SmuxWireOverhead)
+	}
+	if !cfg.KeepAliveDisabled {
+		t.Fatal("ControlSmuxConfig() keepalive is enabled")
 	}
 }
 
