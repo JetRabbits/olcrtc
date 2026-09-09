@@ -134,6 +134,38 @@ func TestDefaultAuthHook(t *testing.T) {
 	}
 }
 
+func TestDataPlaneActiveTracksSingletonAndPeers(t *testing.T) {
+	s := &Server{peerSessions: map[string]*peerSession{"p": newPeerSession("p", false)}}
+	if s.anyDataPlaneActive() {
+		t.Fatal("new server unexpectedly active")
+	}
+	s.beginStream()
+	if !s.anyDataPlaneActive() {
+		t.Fatal("singleton stream not reported active")
+	}
+	s.endStream()
+	peer := s.peerSessions["p"]
+	peer.beginStream()
+	if !s.anyDataPlaneActive() {
+		t.Fatal("peer stream not reported active")
+	}
+	peer.endStream()
+	if s.anyDataPlaneActive() {
+		t.Fatal("server still active after streams ended")
+	}
+}
+
+func TestHandleAcceptErrorRetriesWhenDataPlaneActive(t *testing.T) {
+	s := &Server{peerSessions: map[string]*peerSession{}}
+	s.beginStream()
+	defer s.endStream()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if done := s.handleAcceptError(ctx, nil, errors.New("temporary accept failure")); done {
+		t.Fatal("handleAcceptError ended server while data plane active")
+	}
+}
+
 func TestSocks5ConnectSuccess(t *testing.T) {
 	s := &Server{}
 	server, client := net.Pipe()

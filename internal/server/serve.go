@@ -86,7 +86,11 @@ func (s *Server) serveSingle(ctx context.Context) {
 			}
 			continue
 		}
-		s.goTracked(func() { s.handleStream(ctx, stream, s.currentSessionID()) })
+		s.goTracked(func() {
+			s.beginStream()
+			defer s.endStream()
+			s.handleStream(ctx, stream, s.currentSessionID())
+		})
 	}
 }
 
@@ -95,10 +99,53 @@ func (s *Server) handleAcceptError(ctx context.Context, session *smux.Session, e
 		return true
 	}
 	hadSession := s.handshakeReady()
+	if s.anyDataPlaneActive() {
+		logger.Infof("server: AcceptStream(data) error while data plane active - retrying without reinstall: %v", err)
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(acceptRetryDelay):
+			return false
+		}
+	}
 	logger.Infof("server: AcceptStream(data) error - reinstalling session: %v", err)
 	s.reinstallSession(ctx, session)
 	if hadSession && s.ln != nil {
 		s.ln.Reconnect("liveness")
+	}
+	return false
+}
+
+const acceptRetryDelay = 100 * time.Millisecond
+
+func (s *Server) beginStream() {
+	s.activeStreams.Add(1)
+	s.stampTraffic()
+}
+
+func (s *Server) endStream() {
+	s.stampTraffic()
+	s.activeStreams.Add(-1)
+}
+
+func (s *Server) stampTraffic() {
+	s.lastTrafficUnixNano.Store(time.Now().UnixNano())
+}
+
+func (s *Server) anyDataPlaneActive() bool {
+	if s.activeStreams.Load() > 0 {
+		return true
+	}
+	s.sessMu.RLock()
+	peers := make([]*peerSession, 0, len(s.peerSessions))
+	for _, peer := range s.peerSessions {
+		peers = append(peers, peer)
+	}
+	s.sessMu.RUnlock()
+	for _, peer := range peers {
+		if peer.dataPlaneActive() {
+			return true
+		}
 	}
 	return false
 }

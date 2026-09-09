@@ -65,17 +65,19 @@ type Server struct {
 
 	peerSessions map[string]*peerSession
 	// peerLimitWarn rate-limits the peer-cap warning.
-	peerLimitWarn atomic.Int64
-	peersMu       sync.Mutex
-	peerStats     map[string]peerStat
-	reinstallMu   sync.Mutex
-	wg            sync.WaitGroup
-	authHook      handshake.AuthFunc
-	onOpen        SessionOpenFunc
-	onClose       SessionCloseFunc
-	onTraffic     TrafficFunc
-	deviceID      string
-	sessionID     string
+	peerLimitWarn       atomic.Int64
+	peersMu             sync.Mutex
+	peerStats           map[string]peerStat
+	reinstallMu         sync.Mutex
+	wg                  sync.WaitGroup
+	authHook            handshake.AuthFunc
+	onOpen              SessionOpenFunc
+	onClose             SessionCloseFunc
+	onTraffic           TrafficFunc
+	deviceID            string
+	sessionID           string
+	activeStreams       atomic.Int64
+	lastTrafficUnixNano atomic.Int64
 
 	dnsServer       string
 	resolver        *net.Resolver

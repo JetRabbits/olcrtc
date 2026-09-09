@@ -20,10 +20,14 @@ func (s *Server) startControlLoop(ctx context.Context, session *smux.Session, st
 		Transport: s.ln, Config: s.liveness, Health: s.health,
 		LogFields: func() string { return "role=server session=" + s.currentSessionID() },
 		OnDeath: func(error) {
+			if s.anyDataPlaneActive() {
+				logger.Infof("server reconnect reason=liveness skipped: data plane active")
+				return
+			}
 			s.health.RecordReconnect()
 			logger.Infof("server reconnect reason=liveness - reinstalling smux session")
-			tunnelcore.ResetPeer(s.ln)
 			s.reinstallSession(ctx, session)
+			tunnelcore.ResetPeer(s.ln)
 			if s.ln != nil {
 				s.ln.Reconnect("liveness")
 			}

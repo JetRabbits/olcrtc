@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -45,21 +46,23 @@ type peerStat struct {
 
 // peerSession holds one client's independently synchronized peer-routing state.
 type peerSession struct {
-	peerID        string
-	sessionReady  chan struct{}
-	readyOnce     sync.Once
-	handshakeOnce sync.Once
-	closeOnce     sync.Once
-	mu            sync.Mutex
-	conn          *muxconn.Conn
-	session       *smux.Session
-	controlConn   *muxconn.Conn
-	controlSess   *smux.Session
-	controlStrm   *smux.Stream
-	controlStop   context.CancelFunc
-	sessionID     string
-	deviceID      string
-	closed        bool
+	peerID              string
+	sessionReady        chan struct{}
+	readyOnce           sync.Once
+	handshakeOnce       sync.Once
+	closeOnce           sync.Once
+	mu                  sync.Mutex
+	conn                *muxconn.Conn
+	session             *smux.Session
+	controlConn         *muxconn.Conn
+	controlSess         *smux.Session
+	controlStrm         *smux.Stream
+	controlStop         context.CancelFunc
+	sessionID           string
+	deviceID            string
+	closed              bool
+	activeStreams       atomic.Int64
+	lastTrafficUnixNano atomic.Int64
 }
 
 func newPeerSession(peerID string, needsControl bool) *peerSession {
@@ -167,6 +170,24 @@ func (ps *peerSession) closeSnapshot() teardown {
 		controlSess: ps.controlSess, controlStrm: ps.controlStrm,
 		controlStop: ps.controlStop, sessionID: ps.sessionID,
 	}
+}
+
+func (ps *peerSession) beginStream() {
+	ps.activeStreams.Add(1)
+	ps.stampTraffic()
+}
+
+func (ps *peerSession) endStream() {
+	ps.stampTraffic()
+	ps.activeStreams.Add(-1)
+}
+
+func (ps *peerSession) dataPlaneActive() bool {
+	return ps.activeStreams.Load() > 0
+}
+
+func (ps *peerSession) stampTraffic() {
+	ps.lastTrafficUnixNano.Store(time.Now().UnixNano())
 }
 
 func (s *Server) installPeerControlPlane(control transport.PeerControlPlane) {
@@ -402,7 +423,13 @@ func (s *Server) startPeerControlLoop(ctx context.Context, peer *peerSession, st
 	runner := tunnelcore.ControlRunner{
 		Transport: s.ln, Config: s.liveness, Health: s.health,
 		LogFields: func() string { return "role=server peer=" + peer.peerID },
-		OnDeath:   func(error) { s.removePeer(peer, "liveness") },
+		OnDeath: func(error) {
+			if peer.dataPlaneActive() {
+				logger.Infof("server: peer %s liveness missed but data plane is active; keeping peer", peer.peerID)
+				return
+			}
+			s.removePeer(peer, "liveness")
+		},
 	}
 	s.goTracked(func() {
 		defer func() { _ = stream.Close() }()
