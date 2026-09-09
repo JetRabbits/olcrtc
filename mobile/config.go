@@ -68,6 +68,7 @@ type runtimeConfig struct {
 	vp8           client.VP8Options
 	sei           client.SEIOptions
 	video         client.VideoOptions
+	onFlowStats   client.FlowStatsFunc
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -333,7 +334,7 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		SOCKSUser: cfg.socksUser, SOCKSPass: cfg.socksPass,
 		DNSServer: cfg.dnsServer, Resolver: cfg.resolver,
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
-		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath,
+		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath, OnFlowStats: cfg.onFlowStats,
 	}
 }
 

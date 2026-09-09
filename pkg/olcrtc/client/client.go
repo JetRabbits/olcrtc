@@ -58,8 +58,20 @@ func (SEIOptions) transportOptions() {}
 // HealthStatus is a control-stream health snapshot.
 type HealthStatus = control.Status
 
+// FlowStats reports active accepted SOCKS flows for diagnostics. The public
+// mobile compatibility API keeps this shape for older embedders; upstream's
+// current runtime does not publish these counters yet.
+type FlowStats struct {
+	Seq      uint64
+	TCP, UDP int64
+	Total    int64
+}
+
 // HealthFunc is called when the control-stream health snapshot changes.
 type HealthFunc func(HealthStatus)
+
+// FlowStatsFunc is called when active SOCKS flow counters change.
+type FlowStatsFunc func(FlowStats)
 
 // LivenessConfig controls control-stream ping and pong checks.
 type LivenessConfig struct {
@@ -98,6 +110,7 @@ type Config struct {
 	DeviceIDPath     string
 	Claims           map[string]any
 	OnHealth         HealthFunc
+	OnFlowStats      FlowStatsFunc
 }
 
 type runner func(context.Context, internalclient.Config, func(string)) error
