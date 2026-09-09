@@ -51,7 +51,7 @@ func SetSocksListenHost(host string) {
 
 // SetVP8Options preserves the legacy package-level vp8channel setter.
 func SetVP8Options(fps, batchSize int) {
-	_ = singletonRuntime.SetVP8Options(clampCompat(fps, 120), clampCompat(batchSize, 0))
+	_ = singletonRuntime.SetVP8Options(clampCompat(fps, 120), clampCompat(batchSize, 64))
 }
 
 // SetLowMemoryProfile preserves Galactic's old mobile API hook. Upstream no longer
@@ -106,7 +106,6 @@ func configureSingleton(
 	if err := singletonRuntime.SetRoom(strings.TrimSpace(roomID)); err != nil {
 		return err
 	}
-	singletonRuntime.SetChannel(strings.TrimSpace(clientID))
 	singletonRuntime.SetDeviceID(strings.TrimSpace(clientID))
 	if err := singletonRuntime.SetKey(strings.TrimSpace(keyHex)); err != nil {
 		return err
@@ -126,11 +125,12 @@ func WaitReady(timeoutMillis int) error {
 }
 
 // Stop preserves the legacy singleton stop API.
-func Stop() {
-	_ = singletonRuntime.Stop(defaultCompatibilityStopTimeoutMillis)
+func Stop() error {
+	err := singletonRuntime.Stop(defaultCompatibilityStopTimeoutMillis)
 	singletonMu.Lock()
 	singletonStats = client.FlowStats{}
 	singletonMu.Unlock()
+	return err
 }
 
 // IsRunning reports whether the legacy singleton runtime is active.

@@ -213,7 +213,9 @@ func (r *Runtime) Stop(timeoutMillis int) error {
 	defer timer.Stop()
 	select {
 	case <-gen.done:
-		return nil
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return gen.err
 	case <-timer.C:
 		return ErrStopTimeout
 	}
