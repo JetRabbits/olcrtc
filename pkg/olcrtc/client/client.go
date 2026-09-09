@@ -114,7 +114,22 @@ type Config struct {
 	Claims           map[string]any
 	OnHealth         HealthFunc
 	OnFlowStats      FlowStatsFunc
-	ResourceProfile  ResourceProfile
+
+	// OnClientReady receives the live client's reconnect capability right
+	// before the caller-visible ready callback fires. Hosts that need a
+	// non-terminal transport handover (mobile network changes) capture the
+	// requester here instead of tearing the session down. Nil means no-op.
+	OnClientReady func(ReconnectRequester)
+
+	ResourceProfile ResourceProfile
+}
+
+// ReconnectRequester rebuilds an active session's remote carrier and smux
+// streams without stopping the local SOCKS5 listener. Repeated requests while
+// one is in flight are coalesced. It returns ErrClientStopped-equivalent
+// errors once the session has gone away.
+type ReconnectRequester interface {
+	RequestReconnect(reason string) error
 }
 
 type runner func(context.Context, internalclient.Config, func(string)) error
@@ -168,8 +183,16 @@ func toClientConfig(cfg Config) internalclient.Config {
 		},
 		DeviceID: cfg.DeviceID, DeviceIDPath: cfg.DeviceIDPath, Claims: cfg.Claims,
 		OnHealth: internalclient.HealthFunc(cfg.OnHealth), OnFlowStats: mapFlowStatsFunc(cfg.OnFlowStats),
+		OnClientReady:   mapClientReadyFunc(cfg.OnClientReady),
 		ResourceProfile: cfg.ResourceProfile,
 	}
+}
+
+func mapClientReadyFunc(fn func(ReconnectRequester)) internalclient.ConfigClientReadyFunc {
+	if fn == nil {
+		return nil
+	}
+	return func(requester internalclient.ReconnectRequester) { fn(requester) }
 }
 
 func mapFlowStatsFunc(fn FlowStatsFunc) internalclient.FlowStatsFunc {

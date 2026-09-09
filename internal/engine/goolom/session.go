@@ -151,6 +151,13 @@ type Session struct {
 	reconnecting    atomic.Bool
 	telemetryActive atomic.Bool
 
+	// reconnectReasonMu guards reconnectReason: the reason carried from the
+	// upper-layer Reconnect request until reconnect() consumes it. Network
+	// handovers skip the ghost-participant wait that untriggered reconnects
+	// still need.
+	reconnectReasonMu sync.Mutex
+	reconnectReason   string
+
 	ackMu      sync.Mutex
 	ackWaiters map[string]chan struct{}
 

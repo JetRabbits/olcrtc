@@ -35,6 +35,7 @@ var (
 	ErrStoppedBeforeReady   = errors.New("olcRTC runtime stopped before becoming ready")
 	ErrReadyTimeout         = errors.New("olcRTC runtime readiness timed out")
 	ErrStopTimeout          = errors.New("olcRTC runtime stop timed out")
+	ErrReconnectUnavailable = errors.New("olcRTC runtime cannot accept a reconnect right now")
 	ErrInvalidConfig        = errors.New("invalid mobile runtime configuration")
 	ErrUnsupportedProvider  = errors.New("unsupported provider")
 	ErrUnsupportedTransport = errors.New("unsupported transport")
@@ -54,6 +55,9 @@ type runGeneration struct {
 	doneOnce      sync.Once
 	stopRequested bool
 	err           error
+	// reconnect is published by Config.OnClientReady while this generation
+	// is live; guarded by Runtime.mu.
+	reconnect func(reason string) error
 }
 
 // Runtime owns one independently configured mobile client lifecycle.
@@ -109,10 +113,28 @@ func (r *Runtime) Start() error {
 		ready:  make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	// Capture the live client's reconnect capability for this generation
+	// before ready becomes visible to callers of WaitReady. Assigned before
+	// the copy into gen.cfg, which is what the runner actually receives.
+	cfg.OnClientReady = func(requester client.ReconnectRequester) {
+		r.attachReconnect(gen, requester)
+	}
+	gen.cfg = cfg
 	r.current = gen
 	r.state = stateStarting
 	go r.run(ctx, gen)
 	return nil
+}
+
+// attachReconnect binds the live requester to its generation unless that
+// generation has already been superseded or is winding down.
+func (r *Runtime) attachReconnect(gen *runGeneration, requester client.ReconnectRequester) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.isCurrentGenerationLocked(gen) || r.state == stateStopping || r.state == stateStopped {
+		return
+	}
+	gen.reconnect = requester.RequestReconnect
 }
 
 func (r *Runtime) run(ctx context.Context, gen *runGeneration) {
@@ -141,6 +163,7 @@ func (r *Runtime) finish(gen *runGeneration, runErr error) {
 	gen.err = runErr
 	if r.isCurrentGenerationLocked(gen) {
 		r.state = stateStopped
+		gen.reconnect = nil
 	}
 	r.mu.Unlock()
 	gen.doneOnce.Do(func() { close(gen.done) })
@@ -219,6 +242,23 @@ func (r *Runtime) Stop(timeoutMillis int) error {
 	case <-timer.C:
 		return ErrStopTimeout
 	}
+}
+
+// Reconnect asks the live generation to rebuild its remote carrier and smux
+// streams while the local SOCKS5 listener stays open — the fast transport
+// handover path for host network changes (reason e.g. "network"). It is
+// accepted only while running; callers keep the full Stop/Start restart as
+// the fallback. Repeated calls while a rebuild is queued are coalesced.
+func (r *Runtime) Reconnect(reason string) error {
+	if reason == "" {
+		reason = "network"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != stateRunning || r.current == nil || r.current.reconnect == nil {
+		return ErrReconnectUnavailable
+	}
+	return r.current.reconnect(reason)
 }
 
 // State returns idle, starting, running, stopping, or stopped.
