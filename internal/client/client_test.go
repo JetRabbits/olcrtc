@@ -17,6 +17,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -91,6 +92,49 @@ func TestReadSocks5RequestAcceptsUDPAssociate(t *testing.T) {
 	req := <-done
 	if req.command != socksCommandUDPAssociate || req.addr != "127.0.0.1" || req.port != 0x1234 {
 		t.Fatalf("request = %+v", req)
+	}
+}
+
+func TestFlowStatsTrackActiveTCPAndUDP(t *testing.T) {
+	var got []FlowStats
+	c := &Client{
+		resourceProfile: limits.Normalize(limits.Profile{}),
+		onFlowStats:     func(stats FlowStats) { got = append(got, stats) },
+	}
+	if !c.tryBeginFlow("tcp") || !c.tryBeginFlow("udp") {
+		t.Fatal("tryBeginFlow unexpectedly rejected default profile")
+	}
+	c.endFlow("tcp")
+	c.endFlow("udp")
+	if len(got) != 4 {
+		t.Fatalf("flow callbacks = %d, want 4", len(got))
+	}
+	want := FlowStats{Seq: 4, TCP: 0, UDP: 0, Total: 0}
+	if got[len(got)-1] != want {
+		t.Fatalf("last stats = %+v, want %+v", got[len(got)-1], want)
+	}
+	if got[1].TCP != 1 || got[1].UDP != 1 || got[1].Total != 2 {
+		t.Fatalf("active stats = %+v, want tcp=1 udp=1 total=2", got[1])
+	}
+}
+
+func TestFlowStatsEnforcePerKindAndTotalCaps(t *testing.T) {
+	c := &Client{resourceProfile: limits.Normalize(limits.Profile{SOCKS: limits.SOCKS{MaxTCP: 1, MaxUDP: 1, MaxTotal: 1}})}
+	if !c.tryBeginFlow("tcp") {
+		t.Fatal("first tcp flow rejected")
+	}
+	if c.tryBeginFlow("tcp") {
+		t.Fatal("second tcp flow accepted over MaxTCP")
+	}
+	if c.tryBeginFlow("udp") {
+		t.Fatal("udp flow accepted over MaxTotal")
+	}
+	c.endFlow("tcp")
+	if !c.tryBeginFlow("udp") {
+		t.Fatal("udp flow rejected after total capacity freed")
+	}
+	if c.tryBeginFlow("udp") {
+		t.Fatal("second udp flow accepted over MaxUDP")
 	}
 }
 

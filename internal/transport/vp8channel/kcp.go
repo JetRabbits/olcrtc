@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	kcp "github.com/xtaci/kcp-go/v5"
 
@@ -181,8 +182,12 @@ func (r *kcpRuntime) send(msg []byte) error {
 
 func (r *kcpRuntime) close() {
 	r.closeOnce.Do(func() {
-		_ = r.sess.Close()
 		_ = r.conn.Close()
+		_ = r.sess.Close()
+		select {
+		case <-r.readDone:
+		case <-time.After(250 * time.Millisecond):
+		}
 	})
 }
 
@@ -191,8 +196,8 @@ func (r *kcpRuntime) close() {
 // identical lifecycle rules, so start/restart/drain/close live here once
 // instead of being written twice with only the field names changed.
 type kcpPlane struct {
-	out    chan *packetBuffer
-	onData func([]byte)
+	out          chan *packetBuffer
+	onData       func([]byte)
 	inboundQueue int
 	sendWindow   int
 	recvWindow   int

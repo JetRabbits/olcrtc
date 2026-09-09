@@ -122,6 +122,11 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		if session != nil && !session.IsClosed() && sessionID != "" {
 			switch req.command {
 			case socksCommandConnect:
+				if !c.tryBeginFlow("tcp") {
+					_, _ = conn.Write(replyHostUnreachable(req.addr))
+					return
+				}
+				defer c.endFlow("tcp")
 				c.tunnel(ctx, conn, session, req.addr, req.port)
 			case socksCommandUDPAssociate:
 				c.udpAssociate(ctx, conn, session)
@@ -303,6 +308,11 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 	defer func() { _ = udpConn.Close() }()
 
 	bound := udpConn.LocalAddr().(*net.UDPAddr)
+	if !c.tryBeginFlow("udp") {
+		_, _ = tcpConn.Write(replyHostUnreachable("0.0.0.0"))
+		return
+	}
+	defer c.endFlow("udp")
 	if _, err := tcpConn.Write(replySuccessAddr(bound.IP, bound.Port)); err != nil {
 		return
 	}

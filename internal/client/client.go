@@ -80,6 +80,11 @@ type Client struct {
 	socksMu          sync.Mutex
 	socksConns       map[net.Conn]struct{}
 	socksClosed      bool
+	activeTCP        int64
+	activeUDP        int64
+	activeTotal      int64
+	flowSeq          uint64
+	onFlowStats      FlowStatsFunc
 	livenessFallback time.Duration
 	shutdownGrace    time.Duration
 	fallbackPending  atomic.Bool
@@ -152,7 +157,7 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
 		resourceProfile: limits.Normalize(cfg.ResourceProfile),
-		health:          runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}),
+		health:          runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}), onFlowStats: cfg.OnFlowStats,
 	}
 	defer func() {
 		cancel()
@@ -201,6 +206,60 @@ func (c *Client) maxSocksConns() int {
 		return c.resourceProfile.SOCKS.MaxTotal
 	}
 	return maxSocksConns
+}
+
+func (c *Client) tryBeginFlow(kind string) bool {
+	c.socksMu.Lock()
+	profile := c.resourceProfile.SOCKS
+	if kind == "tcp" && profile.MaxTCP > 0 && c.activeTCP >= int64(profile.MaxTCP) {
+		c.socksMu.Unlock()
+		return false
+	}
+	if kind == "udp" && profile.MaxUDP > 0 && c.activeUDP >= int64(profile.MaxUDP) {
+		c.socksMu.Unlock()
+		return false
+	}
+	if profile.MaxTotal > 0 && c.activeTotal >= int64(profile.MaxTotal) {
+		c.socksMu.Unlock()
+		return false
+	}
+	if kind == "tcp" {
+		c.activeTCP++
+	} else {
+		c.activeUDP++
+	}
+	c.activeTotal++
+	stats := c.nextFlowStatsLocked()
+	c.socksMu.Unlock()
+	c.publishFlowStats(stats)
+	return true
+}
+
+func (c *Client) endFlow(kind string) {
+	c.socksMu.Lock()
+	if kind == "tcp" && c.activeTCP > 0 {
+		c.activeTCP--
+	}
+	if kind == "udp" && c.activeUDP > 0 {
+		c.activeUDP--
+	}
+	if c.activeTotal > 0 {
+		c.activeTotal--
+	}
+	stats := c.nextFlowStatsLocked()
+	c.socksMu.Unlock()
+	c.publishFlowStats(stats)
+}
+
+func (c *Client) nextFlowStatsLocked() FlowStats {
+	c.flowSeq++
+	return FlowStats{Seq: c.flowSeq, TCP: c.activeTCP, UDP: c.activeUDP, Total: c.activeTotal}
+}
+
+func (c *Client) publishFlowStats(stats FlowStats) {
+	if c.onFlowStats != nil {
+		c.onFlowStats(stats)
+	}
 }
 
 func (c *Client) unregisterSocksConn(conn net.Conn) {
