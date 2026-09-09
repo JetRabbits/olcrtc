@@ -3,6 +3,7 @@ package goolom
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -314,7 +315,8 @@ func (s *Session) reconnect(ctx context.Context) error {
 	if s.terminated.Load() {
 		return ErrSessionClosed
 	}
-	logger.Warnf("goolom: full reconnect triggered")
+	reason := s.consumeReconnectReason()
+	logger.Warnf("goolom: full reconnect triggered reason=%s", reason)
 	s.reconnecting.Store(true)
 	defer s.reconnecting.Store(false)
 
@@ -328,7 +330,14 @@ func (s *Session) reconnect(ctx context.Context) error {
 	s.closePeerConns()
 	s.closeWebSocket()
 
-	if err := sleepCtx(ctx, 3*time.Second); err != nil {
+	// The ghost-participant wait is useful when the old connection may still
+	// be accepted by the SFU. A deliberate primary-network handover has
+	// already invalidated that connection, and waiting 3s makes the
+	// user-visible tunnel black-hole the new network. Keep only the 500ms
+	// leave-write grace in that case.
+	if isNetworkReconnectReason(reason) {
+		logger.Warnf("goolom: network handover reconnect - skipping ghost-participant wait")
+	} else if err := sleepCtx(ctx, 3*time.Second); err != nil {
 		return err
 	}
 	if s.refresh == nil {
@@ -366,9 +375,42 @@ func (s *Session) Reconnect(reason string) {
 	if s.closed.Load() {
 		return
 	}
+	if reason == "" {
+		reason = "unspecified"
+	}
 	logger.Infof("goolom reconnect requested: %s", reason)
+	s.setReconnectReason(reason)
 	s.stopSession()
 	s.queueReconnect()
+}
+
+// setReconnectReason records why the next reconnect cycle was requested.
+// The most recent request wins: network handovers must not be diluted by a
+// stale internal reason queued microseconds earlier.
+func (s *Session) setReconnectReason(reason string) {
+	s.reconnectReasonMu.Lock()
+	s.reconnectReason = reason
+	s.reconnectReasonMu.Unlock()
+}
+
+// consumeReconnectReason returns the pending reason once and resets it.
+func (s *Session) consumeReconnectReason() string {
+	s.reconnectReasonMu.Lock()
+	reason := s.reconnectReason
+	s.reconnectReason = ""
+	s.reconnectReasonMu.Unlock()
+	if reason == "" {
+		return "unspecified"
+	}
+	return reason
+}
+
+// isNetworkReconnectReason reports reasons where the old connection is known
+// to be dead from the host's point of view (explicit transport handover), as
+// opposed to unconfirmed liveness loss where the SFU may still hold a ghost
+// participant worth waiting out.
+func isNetworkReconnectReason(reason string) bool {
+	return reason == "handover" || strings.HasPrefix(reason, "network")
 }
 
 func (s *Session) stopSession() {

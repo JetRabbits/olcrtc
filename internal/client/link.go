@@ -100,6 +100,7 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	c.signalSessionReady()
 	c.health.RecordSession(sessionID)
 	c.startControlLoop(ctx, cfg, cancel, control)
+	c.startReconnectRequestLoop(ctx, cfg, cancel)
 	return nil
 }
 
@@ -214,8 +215,14 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
 	if oldControl != nil {
 		_ = oldControl.Close()
 	}
-	if reason == reconnectLiveness && c.ln != nil {
-		c.ln.Reconnect(reconnectLiveness)
+	// An explicit network handover invalidates a still-"live" carrier the
+	// same way liveness loss does: re-handshaking over the dead carrier only
+	// times out while holding reconnectMu, which would also block the carrier
+	// callback that fires once the new network is up. Rebuild the carrier and
+	// let that callback (reason="provider") drive the fresh handshake. The
+	// local SOCKS5 listener stays open across this path either way.
+	if (reason == reconnectLiveness || reason == reconnectNetwork) && c.ln != nil {
+		c.ln.Reconnect(reason)
 		c.scheduleLivenessFallback(ctx, cfg, cancel)
 		return
 	}

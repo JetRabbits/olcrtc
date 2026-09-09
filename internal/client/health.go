@@ -74,6 +74,8 @@ func (c *Client) notifyLinkHealth(unhealthy bool) {
 }
 
 func (c *Client) shutdown() {
+	c.stopReconnectRequests()
+
 	c.sessMu.Lock()
 	pair := c.pair
 	controlStream := c.controlStrm

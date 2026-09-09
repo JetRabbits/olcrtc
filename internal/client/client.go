@@ -38,6 +38,9 @@ var (
 	ErrSOCKSCredTooLong        = errors.New("socks5 user/pass exceeds 255 bytes")
 	ErrEmptySOCKSDomain        = errors.New("empty socks5 domain")
 	ErrSOCKSDomainTooLong      = errors.New("socks5 domain too long")
+	// ErrClientStopped is returned when a client has shut down before a
+	// requested reconnect can be accepted.
+	ErrClientStopped = errors.New("client is stopped")
 )
 
 // SOCKS flow kinds tracked by the resource-profile caps.
@@ -50,6 +53,9 @@ const (
 	reconnectProvider = "provider"
 	reconnectLiveness = "liveness"
 	reconnectFallback = "liveness-fallback"
+	// reconnectNetwork marks an explicit host-side network handover
+	// (e.g. Wi-Fi -> cellular) requested through the mobile Reconnect API.
+	reconnectNetwork = "network"
 )
 
 const (
@@ -70,7 +76,19 @@ type Client struct {
 	controlStop context.CancelFunc
 	sessMu      sync.RWMutex
 	reconnectMu sync.Mutex
-	health      *runtime.HealthTracker
+
+	// Reconnect request path for host-driven network handover; guarded by
+	// requestMu. requestReconnect is non-nil only while the request loop of
+	// the current session is running.
+	requestMu               sync.Mutex
+	requestReconnect        func(reason string) error
+	stopRequestReconnect    context.CancelFunc
+	reconnectRequestPending chan string
+	// requestDispatch replaces handleReconnect for queued requests. Tests
+	// set it before starting the loop; production leaves it nil.
+	requestDispatch func(context.Context, Config, context.CancelFunc, string)
+
+	health *runtime.HealthTracker
 
 	// controlLastPong is independent corroboration for the transport's fast
 	// peer-restart heuristic, not a second session reconnect detector.
@@ -124,7 +142,14 @@ type Config struct {
 	Claims           map[string]any
 	OnHealth         HealthFunc
 	OnFlowStats      func(FlowStats)
-	ResourceProfile  limits.Profile
+
+	// OnClientReady is invoked with the live client's reconnect capability
+	// immediately before the caller-visible ready callback. Mobile hosts use
+	// it to expose a non-terminal Reconnect request without stopping the
+	// SOCKS listener. Nil means no-op.
+	OnClientReady ConfigClientReadyFunc
+
+	ResourceProfile limits.Profile
 }
 
 type FlowStats struct {
@@ -163,10 +188,11 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	client := &Client{
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
-		resourceProfile: limits.Normalize(cfg.ResourceProfile),
-		health:          runtime.NewHealthTracker(cfg.OnHealth),
-		sessionReady:    make(chan struct{}),
-		onFlowStats:     cfg.OnFlowStats,
+		resourceProfile:         limits.Normalize(cfg.ResourceProfile),
+		health:                  runtime.NewHealthTracker(cfg.OnHealth),
+		sessionReady:            make(chan struct{}),
+		reconnectRequestPending: make(chan string, 1),
+		onFlowStats:             cfg.OnFlowStats,
 	}
 	defer func() {
 		cancel()
@@ -182,6 +208,12 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	defer func() { _ = listener.Close() }()
 	actualAddr := listener.Addr().String()
 	logger.Infof("SOCKS5 server listening on %s", actualAddr)
+	// Publish the live client before ready becomes visible to mobile
+	// callers. A network handover immediately after WaitReady must find the
+	// active request path, not a half-initialized runtime.
+	if cfg.OnClientReady != nil {
+		cfg.OnClientReady(client)
+	}
 	if onReady != nil {
 		onReady(actualAddr)
 	}

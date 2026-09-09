@@ -134,6 +134,26 @@ func Stop() error {
 	return err
 }
 
+// StopWithTimeoutMillis bounds graceful singleton teardown: when the deadline
+// expires the run goroutine keeps closing in the background and
+// ErrStopTimeout is returned, so host stop paths never block on a wedged
+// transport.
+func StopWithTimeoutMillis(timeoutMillis int) error {
+	err := singletonRuntime.Stop(timeoutMillis)
+	singletonMu.Lock()
+	singletonStats = client.FlowStats{}
+	singletonMu.Unlock()
+	return err
+}
+
+// Reconnect asks the live singleton session to rebuild its remote carrier and
+// smux streams while the local SOCKS5 listener stays open (host network
+// handover, e.g. Wi-Fi -> cellular). Returns ErrReconnectUnavailable unless a
+// session is running, so callers can fall back to a full Stop/Start restart.
+func Reconnect(reason string) error {
+	return singletonRuntime.Reconnect(reason)
+}
+
 // IsRunning reports whether the legacy singleton runtime is active.
 func IsRunning() bool {
 	return singletonRuntime.IsRunning()
