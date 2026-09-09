@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	kcp "github.com/xtaci/kcp-go/v5"
+
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 )
 
 // Both peers establish a KCP session with the same convid. KCP does not
@@ -62,7 +64,20 @@ type kcpRuntime struct {
 }
 
 func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
-	c := newKCPConn(out, inboundQueueSize, epochHdr)
+	return startKCPWithLimits(out, onData, epochHdr, limits.Default().KCP.DataInboundQueue, limits.Default().KCP.DataSendWindow, limits.Default().KCP.DataReceiveWindow)
+}
+
+func startKCPWithLimits(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, inboundQueue, sndWnd, rcvWnd int) (*kcpRuntime, error) {
+	if inboundQueue <= 0 {
+		inboundQueue = inboundQueueSize
+	}
+	if sndWnd <= 0 {
+		sndWnd = kcpSndWnd
+	}
+	if rcvWnd <= 0 {
+		rcvWnd = kcpRcvWnd
+	}
+	c := newKCPConn(out, inboundQueue, epochHdr)
 
 	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
 	if err != nil {
@@ -79,7 +94,7 @@ func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrL
 	// the wire. With nc=1 KCP keeps the window full and retransmits the few
 	// losses, letting throughput reach the SFU's real ceiling.
 	sess.SetNoDelay(1, 5, 2, 1)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	sess.SetWindowSize(sndWnd, rcvWnd)
 	sess.SetMtu(kcpMTU)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;
 	// stream framing is still required for our wire format.
@@ -178,6 +193,9 @@ func (r *kcpRuntime) close() {
 type kcpPlane struct {
 	out    chan *packetBuffer
 	onData func([]byte)
+	inboundQueue int
+	sendWindow   int
+	recvWindow   int
 
 	// lifecycleMu serializes start/restart/close. Without it two concurrent
 	// restarts - a provider reconnect and an upper-layer ResetPeer fire
@@ -194,7 +212,11 @@ type kcpPlane struct {
 }
 
 func newKCPPlane(queueSize int, onData func([]byte)) *kcpPlane {
-	return &kcpPlane{out: make(chan *packetBuffer, queueSize), onData: onData}
+	return newKCPPlaneWithLimits(queueSize, onData, inboundQueueSize, kcpSndWnd, kcpRcvWnd)
+}
+
+func newKCPPlaneWithLimits(queueSize int, onData func([]byte), inboundQueue, sndWnd, rcvWnd int) *kcpPlane {
+	return &kcpPlane{out: make(chan *packetBuffer, queueSize), onData: onData, inboundQueue: inboundQueue, sendWindow: sndWnd, recvWindow: rcvWnd}
 }
 
 // get returns the live runtime, or nil when the plane has not started (or is
@@ -228,7 +250,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
 			return
 		}
 		var rt *kcpRuntime
-		rt, err = startKCP(p.out, p.onData, hdr)
+		rt, err = startKCPWithLimits(p.out, p.onData, hdr, p.inboundQueue, p.sendWindow, p.recvWindow)
 		if err != nil {
 			return
 		}
@@ -260,7 +282,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
 		old.close()
 	}
 
-	rt, err := startKCP(p.out, p.onData, hdr)
+	rt, err := startKCPWithLimits(p.out, p.onData, hdr, p.inboundQueue, p.sendWindow, p.recvWindow)
 	if err != nil {
 		return
 	}

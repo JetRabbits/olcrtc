@@ -59,8 +59,10 @@ func SetVP8Options(fps, batchSize int) {
 // runtime profile when requested by the iOS NetworkExtension wrapper.
 func SetLowMemoryProfile(enabled bool) {
 	if !enabled {
+		singletonRuntime.SetLowMemoryProfile(false)
 		return
 	}
+	singletonRuntime.SetLowMemoryProfile(true)
 	debug.SetMemoryLimit(14 << 20)
 	debug.SetGCPercent(15)
 }

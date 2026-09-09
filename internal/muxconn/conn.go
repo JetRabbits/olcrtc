@@ -180,12 +180,19 @@ func (c *Conn) sendDeadline() time.Duration {
 // New wires a Conn over the given transport. Push must be set as the
 // transport's OnData callback before this conn is used.
 func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
+	return NewWithQueue(ln, keys, inboundQueue)
+}
+
+func NewWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) *Conn {
+	if queueSize <= 0 {
+		queueSize = inboundQueue
+	}
 	return &Conn{
 		ln:      ln,
 		send:    ln.Send,
 		keys:    keys,
 		aad:     []byte(dataRecordAAD),
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
 	}
 }
@@ -194,6 +201,13 @@ func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
 // control-plane channel (transport.ControlPlane). Returns nil if the
 // transport does not implement ControlPlane.
 func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
+	return NewControlWithQueue(ln, keys, inboundQueue)
+}
+
+func NewControlWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) *Conn {
+	if queueSize <= 0 {
+		queueSize = inboundQueue
+	}
 	cp, ok := ln.(transport.ControlPlane)
 	if !ok {
 		return nil
@@ -204,7 +218,7 @@ func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
 		canSend: cp.ControlCanSend,
 		keys:    keys,
 		aad:     []byte(controlRecordAAD),
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
 	}
 	cp.SetControlOnData(func(data []byte) { c.Push(data) })
@@ -213,6 +227,13 @@ func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
 
 // NewPeer wires a Conn whose writes are addressed to a specific transport peer.
 func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Conn {
+	return NewPeerWithQueue(ln, keys, peerID, inboundQueue)
+}
+
+func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID string, queueSize int) *Conn {
+	if queueSize <= 0 {
+		queueSize = inboundQueue
+	}
 	return &Conn{
 		ln: ln,
 		send: func(data []byte) error {
@@ -220,7 +241,7 @@ func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Co
 		},
 		keys:    keys,
 		aad:     []byte(dataRecordAAD),
-		in:      make(chan *[]byte, inboundQueue),
+		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
 	}
 }

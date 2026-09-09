@@ -12,6 +12,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/app/session"
 	internalclient "github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/control"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/seichannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/videochannel"
@@ -67,6 +68,8 @@ type FlowStats struct {
 	Total    int64
 }
 
+type ResourceProfile = limits.Profile
+
 // HealthFunc is called when the control-stream health snapshot changes.
 type HealthFunc func(HealthStatus)
 
@@ -111,6 +114,7 @@ type Config struct {
 	Claims           map[string]any
 	OnHealth         HealthFunc
 	OnFlowStats      FlowStatsFunc
+	ResourceProfile  ResourceProfile
 }
 
 type runner func(context.Context, internalclient.Config, func(string)) error
@@ -163,7 +167,17 @@ func toClientConfig(cfg Config) internalclient.Config {
 			MinDelay:       cfg.Traffic.MinDelay, MaxDelay: cfg.Traffic.MaxDelay,
 		},
 		DeviceID: cfg.DeviceID, DeviceIDPath: cfg.DeviceIDPath, Claims: cfg.Claims,
-		OnHealth: internalclient.HealthFunc(cfg.OnHealth),
+		OnHealth: internalclient.HealthFunc(cfg.OnHealth), OnFlowStats: mapFlowStatsFunc(cfg.OnFlowStats),
+		ResourceProfile: cfg.ResourceProfile,
+	}
+}
+
+func mapFlowStatsFunc(fn FlowStatsFunc) internalclient.FlowStatsFunc {
+	if fn == nil {
+		return nil
+	}
+	return func(stats internalclient.FlowStats) {
+		fn(FlowStats{Seq: stats.Seq, TCP: stats.TCP, UDP: stats.UDP, Total: stats.Total})
 	}
 }
 

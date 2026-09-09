@@ -15,6 +15,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 )
 
@@ -65,13 +66,18 @@ func SetupKeySet(keyHex string, role crypto.Role) (*crypto.KeySet, error) {
 // constrains the smux payload size so the encrypted whole smux frame fits
 // under the transport's per-message payload cap.
 func SmuxConfig(maxWirePayload int) *smux.Config {
+	return SmuxConfigWithProfile(maxWirePayload, limits.Default())
+}
+
+func SmuxConfigWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	profile = limits.Normalize(profile)
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = smuxMaxFrameSize
 	clampMaxFrameSize(cfg, maxWirePayload)
-	cfg.MaxReceiveBuffer = smuxMaxReceiveBuffer
-	cfg.MaxStreamBuffer = smuxMaxStreamBuffer
+	cfg.MaxReceiveBuffer = profile.Smux.DataReceiveBuffer
+	cfg.MaxStreamBuffer = profile.Smux.DataStreamBuffer
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg
@@ -86,7 +92,13 @@ func SmuxConfig(maxWirePayload int) *smux.Config {
 // (jitsi/datachannel) keep the conservative 30s timeout so a genuinely dead
 // link is detected and reconnected promptly.
 func SmuxConfigLong(maxWirePayload int) *smux.Config {
-	cfg := SmuxConfig(maxWirePayload)
+	cfg := SmuxConfigWithProfile(maxWirePayload, limits.Default())
+	cfg.KeepAliveTimeout = 120 * time.Second
+	return cfg
+}
+
+func SmuxConfigLongWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	cfg := SmuxConfigWithProfile(maxWirePayload, profile)
 	cfg.KeepAliveTimeout = 120 * time.Second
 	return cfg
 }
@@ -103,11 +115,15 @@ func IsControlPlane(tr transport.Transport) bool {
 // transport: relaxed keep-alive for ControlPlane providers, conservative
 // otherwise.
 func SmuxConfigFor(tr transport.Transport) *smux.Config {
+	return SmuxConfigForProfile(tr, limits.Default())
+}
+
+func SmuxConfigForProfile(tr transport.Transport, profile limits.Profile) *smux.Config {
 	maxWirePayload := MaxPayload(tr)
 	if IsControlPlane(tr) {
-		return SmuxConfigLong(maxWirePayload)
+		return SmuxConfigLongWithProfile(maxWirePayload, profile)
 	}
-	return SmuxConfig(maxWirePayload)
+	return SmuxConfigWithProfile(maxWirePayload, profile)
 }
 
 // LivenessTimeout returns the control-stream pong timeout for a transport:
@@ -137,13 +153,18 @@ func ConnectAckTimeout(tr transport.Transport) time.Duration {
 // small stream buffers and disable smux keepalives (the olcrtc control.Run
 // ping loop handles liveness itself).
 func ControlSmuxConfig(maxWirePayload int) *smux.Config {
+	return ControlSmuxConfigWithProfile(maxWirePayload, limits.Default())
+}
+
+func ControlSmuxConfigWithProfile(maxWirePayload int, profile limits.Profile) *smux.Config {
+	profile = limits.Normalize(profile)
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.MaxFrameSize = smuxMaxFrameSize
 	clampMaxFrameSize(cfg, maxWirePayload)
 	// Tiny buffers: control frames are at most a few hundred bytes.
-	cfg.MaxReceiveBuffer = 256 * 1024
-	cfg.MaxStreamBuffer = 32 * 1024
+	cfg.MaxReceiveBuffer = profile.Smux.ControlReceiveBuffer
+	cfg.MaxStreamBuffer = profile.Smux.ControlStreamBuffer
 	// Disable smux keepalive - control.Run runs its own ping/pong loop.
 	cfg.KeepAliveDisabled = true
 	return cfg

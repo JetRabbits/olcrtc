@@ -18,6 +18,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	enginebuiltin "github.com/openlibrecommunity/olcrtc/internal/engine/builtin"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 )
 
 // ErrTransportNotFound is returned when a requested transport is not registered.
@@ -218,6 +219,9 @@ type Config struct {
 	// Traffic controls payload-size and pacing shaping applied around the
 	// underlying transport's Send.
 	Traffic TrafficConfig
+
+	// ResourceProfile carries optional mobile/server resource budgets.
+	ResourceProfile limits.Profile
 }
 
 // EngineConfig projects the provider-facing part of the transport config onto

@@ -14,6 +14,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -76,17 +77,18 @@ type Server struct {
 	deviceID      string
 	sessionID     string
 
-	dnsServer      string
-	resolver       *net.Resolver
-	socksProxyAddr string
-	socksProxyPort int
-	socksProxyUser string
-	socksProxyPass string
-	liveness       control.Config
-	health         *runtime.HealthTracker
-	state          stateGate
-	done           chan struct{}
-	doneOnce       sync.Once
+	dnsServer       string
+	resolver        *net.Resolver
+	socksProxyAddr  string
+	socksProxyPort  int
+	socksProxyUser  string
+	socksProxyPass  string
+	liveness        control.Config
+	resourceProfile limits.Profile
+	health          *runtime.HealthTracker
+	state           stateGate
+	done            chan struct{}
+	doneOnce        sync.Once
 }
 
 // Config holds runtime configuration for [Run].
@@ -114,6 +116,7 @@ type Config struct {
 	OnSessionClose   SessionCloseFunc
 	OnTraffic        TrafficFunc
 	OnHealth         HealthFunc
+	ResourceProfile  limits.Profile
 }
 
 // Run starts the server with the given configuration.
@@ -145,7 +148,7 @@ func Run(ctx context.Context, cfg Config) error {
 		dnsServer: cfg.DNSServer, resolver: tunnelcore.Resolver(cfg.Resolver, cfg.DNSServer),
 		socksProxyAddr: cfg.SOCKSProxyAddr, socksProxyPort: cfg.SOCKSProxyPort,
 		socksProxyUser: cfg.SOCKSProxyUser, socksProxyPass: cfg.SOCKSProxyPass,
-		liveness: cfg.Liveness, health: runtime.NewHealthTracker(cfg.OnHealth),
+		liveness: cfg.Liveness, resourceProfile: limits.Normalize(cfg.ResourceProfile), health: runtime.NewHealthTracker(cfg.OnHealth),
 		peerSessions: make(map[string]*peerSession), peerStats: make(map[string]peerStat),
 		done: make(chan struct{}),
 	}

@@ -45,6 +45,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/common"
@@ -134,6 +135,7 @@ type streamTransport struct {
 
 	frameInterval time.Duration
 	batchSize     int
+	profile       limits.Profile
 
 	// localEpoch is stamped into every outgoing VP8 frame. Explicit
 	// upper-layer resets rotate it so the peer can reset its KCP state too.
@@ -216,6 +218,7 @@ func newStreamTransport(
 	cfg transport.Config,
 	opts Options,
 ) *streamTransport {
+	profile := limits.Normalize(cfg.ResourceProfile)
 	tr := &streamTransport{
 		Lifecycle:        common.NewLifecycle(stream),
 		stream:           stream,
@@ -227,17 +230,18 @@ func newStreamTransport(
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(opts.FPS),
 		batchSize:        opts.BatchSize,
+		profile:          profile,
 		bindingToken:     channelBindingToken(cfg),
 		localEpoch:       randomEpoch(),
 		peerRestartGrace: defaultPeerRestartGrace,
 	}
 
-	tr.data = newKCPPlane(outboundQueueSize, func(data []byte) {
+	tr.data = newKCPPlaneWithLimits(profile.VP8.DataOutboundQueue, func(data []byte) {
 		if tr.onData != nil {
 			tr.onData(data)
 		}
-	})
-	tr.control = newKCPPlane(controlOutboundQueueSize, tr.deliverControlData)
+	}, profile.KCP.DataInboundQueue, profile.KCP.DataSendWindow, profile.KCP.DataReceiveWindow)
+	tr.control = newKCPPlaneWithLimits(profile.VP8.ControlOutboundQueue, tr.deliverControlData, profile.KCP.ControlInboundQueue, profile.KCP.ControlSendWindow, profile.KCP.ControlReceiveWindow)
 
 	tr.shaper = transport.NewShaper(cfg.Traffic, tr.Features())
 

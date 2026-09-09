@@ -18,7 +18,7 @@ func (s *Server) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 		Provider: cfg.Provider, RoomURL: cfg.RoomURL, Engine: cfg.Engine,
 		URL: cfg.URL, Token: cfg.Token, ProviderToken: cfg.ProviderToken,
 		ChannelID: cfg.ChannelID, DNSServer: s.dnsServer,
-		Options: cfg.TransportOptions, Traffic: cfg.Traffic,
+		Options: cfg.TransportOptions, Traffic: cfg.Traffic, ResourceProfile: cfg.ResourceProfile,
 	}, tunnelcore.LinkRoleConfig{
 		OnData: s.onData, OnPeerData: s.onPeerData, Resolver: s.resolver,
 		ProxyAddr: s.socksProxyAddr, ProxyPort: s.socksProxyPort,
@@ -57,7 +57,7 @@ func (s *Server) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 }
 
 func (s *Server) installSession() {
-	pair, err := tunnelcore.NewSessionPair(s.ln, s.keys, tunnelcore.ServerRole)
+	pair, err := tunnelcore.NewSessionPairWithProfile(s.ln, s.keys, tunnelcore.ServerRole, s.resourceProfile)
 	if pair == nil {
 		logger.Warnf("smux server init failed: %v", err)
 		return
@@ -80,7 +80,7 @@ func (s *Server) installControlSession(ctx context.Context) {
 		s.installPeerControlPlane(peerControl)
 		return
 	}
-	conn, session, err := tunnelcore.NewControlSession(s.ln, s.keys, tunnelcore.ServerRole)
+	conn, session, err := tunnelcore.NewControlSessionWithProfile(s.ln, s.keys, tunnelcore.ServerRole, s.resourceProfile)
 	if err != nil {
 		logger.Warnf("control smux server init failed (peer-routing): %v", err)
 		return
@@ -135,7 +135,7 @@ func (s *Server) reinstallSession(ctx context.Context, dead *smux.Session) {
 		}
 	}
 	s.sessMu.RUnlock()
-	replacement, err := tunnelcore.NewSessionPair(s.ln, s.keys, tunnelcore.ServerRole)
+	replacement, err := tunnelcore.NewSessionPairWithProfile(s.ln, s.keys, tunnelcore.ServerRole, s.resourceProfile)
 	if replacement == nil {
 		logger.Warnf("smux server re-init failed: %v", err)
 		return

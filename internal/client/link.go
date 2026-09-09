@@ -29,7 +29,7 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 		Provider: cfg.Provider, RoomURL: cfg.RoomURL, Engine: cfg.Engine,
 		URL: cfg.URL, Token: cfg.Token, ProviderToken: cfg.ProviderToken,
 		ChannelID: cfg.ChannelID, DNSServer: cfg.DNSServer,
-		Options: cfg.TransportOptions, Traffic: cfg.Traffic,
+		Options: cfg.TransportOptions, Traffic: cfg.Traffic, ResourceProfile: cfg.ResourceProfile,
 	}, tunnelcore.LinkRoleConfig{
 		DeviceID: c.deviceID, OnData: c.onData, Resolver: cfg.Resolver,
 		RequireTargetedPeer: true,
@@ -61,8 +61,8 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	// with nobody consuming it yet - a deadlock where the fix (reconnect)
 	// waits on the very handshake it needs to unstick.
 	c.goTracked(func() { link.WatchConnection(ctx) })
-	conn := muxconn.New(link, c.keys)
-	controlConn := muxconn.NewControl(link, c.keys)
+	conn := muxconn.NewWithQueue(link, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
+	controlConn := muxconn.NewControlWithQueue(link, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
 	// ai-generated: write under sessMu. onData reads c.conn under sessMu.RLock from the transport's
 	// delivery goroutine, live from the moment link.Connect() above succeeded; an unlocked write here
 	// raced it.
@@ -70,7 +70,7 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	c.conn, c.controlConn = conn, controlConn
 	c.sessMu.Unlock()
 	pair, err := tunnelcore.NewSessionPairWithConns(
-		link, conn, controlConn, tunnelcore.ClientRole,
+		link, conn, controlConn, tunnelcore.ClientRole, c.resourceProfile,
 	)
 	if err != nil {
 		if pair != nil {
@@ -320,8 +320,8 @@ func (c *Client) tryReopenSession(
 	cancel context.CancelFunc,
 	attempt int,
 ) bool {
-	conn := muxconn.New(c.ln, c.keys)
-	controlConn := muxconn.NewControl(c.ln, c.keys)
+	conn := muxconn.NewWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
+	controlConn := muxconn.NewControlWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
 	c.sessMu.Lock()
 	oldConn, oldControlConn := c.conn, c.controlConn
 	c.conn, c.controlConn = conn, controlConn
@@ -333,7 +333,7 @@ func (c *Client) tryReopenSession(
 		_ = oldControlConn.Close()
 	}
 	pair, err := tunnelcore.NewSessionPairWithConns(
-		c.ln, conn, controlConn, tunnelcore.ClientRole,
+		c.ln, conn, controlConn, tunnelcore.ClientRole, c.resourceProfile,
 	)
 	if err != nil {
 		logger.Warnf("smux re-init failed (attempt %d): %v", attempt, err)

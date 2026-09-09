@@ -264,17 +264,17 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
 	}
 
 	peerID := formatPeerID(epoch)
-	out := make(chan *packetBuffer, outboundQueueSize)
+	out := make(chan *packetBuffer, p.profile.VP8.DataOutboundQueue)
 
 	// Address downlink frames to the specific client epoch so other clients
 	// do not ingest them (issue #95 multi-client cross-talk).
 	hdr := buildEpochHeaderTo(p.bindingToken, p.localEpochValue(), epoch)
 
-	data, err := startKCP(out, func(payload []byte) {
+	data, err := startKCPWithLimits(out, func(payload []byte) {
 		if p.onPeerData != nil {
 			p.onPeerData(peerID, payload)
 		}
-	}, hdr)
+	}, hdr, p.profile.KCP.DataInboundQueue, p.profile.KCP.DataSendWindow, p.profile.KCP.DataReceiveWindow)
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer 0x%08x failed: %v", epoch, err)
 
@@ -323,9 +323,9 @@ func (p *streamTransport) peerControlFor(epoch uint32) *kcpRuntime {
 		epoch|controlEpochFlag,
 	)
 
-	control, err := startKCP(p.control.out, func(data []byte) {
+	control, err := startKCPWithLimits(p.control.out, func(data []byte) {
 		p.deliverPeerControlData(peerID, data)
-	}, hdr)
+	}, hdr, p.profile.KCP.ControlInboundQueue, p.profile.KCP.ControlSendWindow, p.profile.KCP.ControlReceiveWindow)
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer control 0x%08x failed: %v", epoch, err)
 

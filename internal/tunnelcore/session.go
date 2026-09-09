@@ -8,6 +8,7 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -37,9 +38,14 @@ type SessionPair struct {
 // NewSessionPair builds data and optional isolated-control muxconn/smux sessions.
 // If only the control session fails, the usable data pair is returned with the error.
 func NewSessionPair(tr transport.Transport, keys *crypto.KeySet, role SessionRole) (*SessionPair, error) {
-	dataConn := muxconn.New(tr, keys)
-	controlConn := muxconn.NewControl(tr, keys)
-	return NewSessionPairWithConns(tr, dataConn, controlConn, role)
+	return NewSessionPairWithProfile(tr, keys, role, limits.Default())
+}
+
+func NewSessionPairWithProfile(tr transport.Transport, keys *crypto.KeySet, role SessionRole, profile limits.Profile) (*SessionPair, error) {
+	profile = limits.Normalize(profile)
+	dataConn := muxconn.NewWithQueue(tr, keys, profile.MuxConn.DataInboundQueue)
+	controlConn := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
+	return NewSessionPairWithConns(tr, dataConn, controlConn, role, profile)
 }
 
 // NewSessionPairWithConns builds a pair from muxconns already installed by the caller.
@@ -47,8 +53,10 @@ func NewSessionPairWithConns(
 	tr transport.Transport,
 	dataConn, controlConn *muxconn.Conn,
 	role SessionRole,
+	profile limits.Profile,
 ) (*SessionPair, error) {
-	dataSession, err := NewSession(dataConn, role, runtime.SmuxConfigFor(tr))
+	profile = limits.Normalize(profile)
+	dataSession, err := NewSession(dataConn, role, runtime.SmuxConfigForProfile(tr, profile))
 	if err != nil {
 		_ = dataConn.Close()
 		if controlConn != nil {
@@ -66,7 +74,7 @@ func NewSessionPairWithConns(
 		return pair, nil
 	}
 	pair.ControlConn = controlConn
-	controlSession, err := NewSession(controlConn, role, runtime.ControlSmuxConfig(runtime.MaxPayload(tr)))
+	controlSession, err := NewSession(controlConn, role, runtime.ControlSmuxConfigWithProfile(runtime.MaxPayload(tr), profile))
 	if err != nil {
 		_ = controlConn.Close()
 		pair.ControlConn = nil
@@ -82,11 +90,21 @@ func NewControlSession(
 	keys *crypto.KeySet,
 	role SessionRole,
 ) (*muxconn.Conn, *smux.Session, error) {
-	conn := muxconn.NewControl(tr, keys)
+	return NewControlSessionWithProfile(tr, keys, role, limits.Default())
+}
+
+func NewControlSessionWithProfile(
+	tr transport.Transport,
+	keys *crypto.KeySet,
+	role SessionRole,
+	profile limits.Profile,
+) (*muxconn.Conn, *smux.Session, error) {
+	profile = limits.Normalize(profile)
+	conn := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
 	if conn == nil {
 		return nil, nil, nil
 	}
-	session, err := NewSession(conn, role, runtime.ControlSmuxConfig(runtime.MaxPayload(tr)))
+	session, err := NewSession(conn, role, runtime.ControlSmuxConfigWithProfile(runtime.MaxPayload(tr), profile))
 	if err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("control smux session: %w", err)

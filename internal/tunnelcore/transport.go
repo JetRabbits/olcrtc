@@ -3,22 +3,24 @@ package tunnelcore
 import (
 	"net"
 
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 )
 
 // LinkConfig contains transport fields shared by server and client roles.
 type LinkConfig struct {
-	Provider      string
-	RoomURL       string
-	Engine        string
-	URL           string
-	Token         string
-	ProviderToken string
-	ChannelID     string
-	DNSServer     string
-	Options       transport.Options
-	Traffic       transport.TrafficConfig
+	Provider        string
+	RoomURL         string
+	Engine          string
+	URL             string
+	Token           string
+	ProviderToken   string
+	ChannelID       string
+	DNSServer       string
+	Options         transport.Options
+	Traffic         transport.TrafficConfig
+	ResourceProfile limits.Profile
 }
 
 // LinkRoleConfig contains transport fields that differ by tunnel role.
@@ -53,5 +55,6 @@ func BuildTransportConfig(base LinkConfig, role LinkRoleConfig) transport.Config
 		RequireTargetedPeer: role.RequireTargetedPeer,
 		Options:             base.Options,
 		Traffic:             base.Traffic,
+		ResourceProfile:     base.ResourceProfile,
 	}
 }

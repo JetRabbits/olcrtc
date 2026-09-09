@@ -47,10 +47,18 @@ type reorderBuffer struct {
 	free    []*rtp.Packet
 	nextSeq uint16
 	started bool
+	window  int
 }
 
 func newReorderBuffer() *reorderBuffer {
-	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, reorderWindow)}
+	return newReorderBufferWithWindow(reorderWindow)
+}
+
+func newReorderBufferWithWindow(window int) *reorderBuffer {
+	if window <= 0 {
+		window = reorderWindow
+	}
+	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, window), window: window}
 }
 
 // push adds pkt and synchronously delivers packets now available in strict
@@ -74,7 +82,7 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 
 	// Holding a full window behind a hole means the head sequence is
 	// genuinely lost: skip forward to the oldest buffered packet.
-	if len(b.pkts) > reorderWindow {
+	if len(b.pkts) > b.window {
 		b.skipToOldest()
 	}
 	b.drain(deliver)
@@ -218,7 +226,7 @@ func (p *streamTransport) drainTrack(track *webrtc.TrackRemote) {
 
 func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	var state vp8FrameState
-	reorder := newReorderBuffer()
+	reorder := newReorderBufferWithWindow(p.profile.VP8.RTPReorderWindow)
 	buf := make([]byte, rtpBufSize)
 	var rtpCount, frameCount int
 

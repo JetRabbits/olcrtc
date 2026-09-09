@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/pkg/olcrtc/client"
@@ -46,29 +47,30 @@ const (
 )
 
 type runtimeConfig struct {
-	provider      string
-	transport     string
-	roomURL       string
-	channelID     string
-	keyHex        string
-	dnsServer     string
-	resolver      *net.Resolver
-	socksHost     string
-	socksPort     int
-	socksUser     string
-	socksPass     string
-	providerToken string
-	deviceID      string
-	deviceIDPath  string
-	engine        string
-	serviceURL    string
-	engineToken   string
-	liveness      client.LivenessConfig
-	traffic       client.TrafficConfig
-	vp8           client.VP8Options
-	sei           client.SEIOptions
-	video         client.VideoOptions
-	onFlowStats   client.FlowStatsFunc
+	provider        string
+	transport       string
+	roomURL         string
+	channelID       string
+	keyHex          string
+	dnsServer       string
+	resolver        *net.Resolver
+	socksHost       string
+	socksPort       int
+	socksUser       string
+	socksPass       string
+	providerToken   string
+	deviceID        string
+	deviceIDPath    string
+	engine          string
+	serviceURL      string
+	engineToken     string
+	liveness        client.LivenessConfig
+	traffic         client.TrafficConfig
+	vp8             client.VP8Options
+	sei             client.SEIOptions
+	video           client.VideoOptions
+	onFlowStats     client.FlowStatsFunc
+	resourceProfile client.ResourceProfile
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -335,7 +337,24 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		DNSServer: cfg.dnsServer, Resolver: cfg.resolver,
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
 		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath, OnFlowStats: cfg.onFlowStats,
+		ResourceProfile: cfg.resourceProfile,
 	}
+}
+
+func (r *Runtime) SetResourceProfile(profile client.ResourceProfile) {
+	r.mu.Lock()
+	r.defaults.resourceProfile = profile
+	r.mu.Unlock()
+}
+
+func (r *Runtime) SetLowMemoryProfile(enabled bool) {
+	r.mu.Lock()
+	if enabled {
+		r.defaults.resourceProfile = limits.MobileLowMemory()
+	} else {
+		r.defaults.resourceProfile = client.ResourceProfile{}
+	}
+	r.mu.Unlock()
 }
 
 func (cfg runtimeConfig) transportOptions() client.TransportOptions {

@@ -101,7 +101,7 @@ func nextAcceptDelay(current time.Duration) time.Duration {
 
 func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(socksNegotiationTimeout))
+	_ = conn.SetDeadline(time.Now().Add(c.socksHandshakeTimeout()))
 	if err := c.socks5Handshake(conn); err != nil {
 		return
 	}
@@ -343,7 +343,7 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 
 	buf := make([]byte, maxUDPPacketSize)
 	for {
-		_ = udpConn.SetReadDeadline(time.Now().Add(udpAssociateIdleTimeout))
+		_ = udpConn.SetReadDeadline(time.Now().Add(c.udpAssociateIdleTimeout()))
 		n, src, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			return
@@ -485,4 +485,18 @@ func marshalSocks5UDPDatagram(addr string, port int, payload []byte) ([]byte, er
 	out = append(out, portBuf[:]...)
 	out = append(out, payload...)
 	return out, nil
+}
+
+func (c *Client) socksHandshakeTimeout() time.Duration {
+	if c.resourceProfile.SOCKS.HandshakeTimeout > 0 {
+		return c.resourceProfile.SOCKS.HandshakeTimeout
+	}
+	return socksNegotiationTimeout
+}
+
+func (c *Client) udpAssociateIdleTimeout() time.Duration {
+	if c.resourceProfile.SOCKS.UDPAssociateIdleTimeout > 0 {
+		return c.resourceProfile.SOCKS.UDPAssociateIdleTimeout
+	}
+	return udpAssociateIdleTimeout
 }

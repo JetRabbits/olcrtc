@@ -18,6 +18,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
@@ -70,6 +71,7 @@ type Client struct {
 	deviceID         string
 	sessionID        string
 	claims           map[string]any
+	resourceProfile  limits.Profile
 	dnsServer        string
 	socksUser        string
 	socksPass        string
@@ -109,7 +111,17 @@ type Config struct {
 	DeviceIDPath     string
 	Claims           map[string]any
 	OnHealth         HealthFunc
+	OnFlowStats      func(FlowStats)
+	ResourceProfile  limits.Profile
 }
+
+type FlowStats struct {
+	Seq      uint64
+	TCP, UDP int64
+	Total    int64
+}
+
+type FlowStatsFunc func(FlowStats)
 
 // Run starts the client with the given configuration.
 func Run(ctx context.Context, cfg Config) error {
@@ -139,7 +151,8 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	client := &Client{
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
-		health: runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}),
+		resourceProfile: limits.Normalize(cfg.ResourceProfile),
+		health:          runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}),
 	}
 	defer func() {
 		cancel()
@@ -172,8 +185,8 @@ func (c *Client) registerSocksConn(conn net.Conn) bool {
 	if c.socksClosed {
 		return false
 	}
-	if len(c.socksConns) >= maxSocksConns {
-		logger.Warnf("SOCKS5: %d concurrent connections reached, refusing new ones", maxSocksConns)
+	if len(c.socksConns) >= c.maxSocksConns() {
+		logger.Warnf("SOCKS5: %d concurrent connections reached, refusing new ones", c.maxSocksConns())
 		return false
 	}
 	if c.socksConns == nil {
@@ -181,6 +194,13 @@ func (c *Client) registerSocksConn(conn net.Conn) bool {
 	}
 	c.socksConns[conn] = struct{}{}
 	return true
+}
+
+func (c *Client) maxSocksConns() int {
+	if c.resourceProfile.SOCKS.MaxTotal > 0 {
+		return c.resourceProfile.SOCKS.MaxTotal
+	}
+	return maxSocksConns
 }
 
 func (c *Client) unregisterSocksConn(conn net.Conn) {
