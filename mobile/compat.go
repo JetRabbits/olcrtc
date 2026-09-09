@@ -4,7 +4,6 @@ import (
 	"log"
 	"net"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -14,9 +13,9 @@ import (
 const defaultCompatibilityStopTimeoutMillis = 5000
 
 var (
-	singletonMu      sync.Mutex //nolint:gochecknoglobals // gomobile compatibility singleton
-	singletonRuntime = New()    //nolint:gochecknoglobals // old mobile API exposed a process singleton
-	singletonStats   client.FlowStats
+	singletonMu      sync.Mutex       //nolint:gochecknoglobals // gomobile compatibility singleton
+	singletonRuntime = New()          //nolint:gochecknoglobals // old mobile API exposed a process singleton
+	singletonStats   client.FlowStats //nolint:gochecknoglobals // flow-counter mirror of the legacy singleton client
 )
 
 // SetProviders preserves the legacy package-level gomobile API.
@@ -54,9 +53,10 @@ func SetVP8Options(fps, batchSize int) {
 	_ = singletonRuntime.SetVP8Options(clampCompat(fps, 120), clampCompat(batchSize, 64))
 }
 
-// SetLowMemoryProfile preserves Galactic's old mobile API hook. Upstream no longer
-// exposes per-session resource profiles, so apply a conservative process-wide Go
-// runtime profile when requested by the iOS NetworkExtension wrapper.
+// SetLowMemoryProfile preserves Galactic's old mobile API hook. It selects the
+// mobile resource profile (internal/limits) for the next session and applies a
+// conservative process-wide Go runtime profile when requested by the iOS
+// NetworkExtension wrapper.
 func SetLowMemoryProfile(enabled bool) {
 	if !enabled {
 		singletonRuntime.SetLowMemoryProfile(false)
@@ -84,7 +84,9 @@ func StartWithTransport(
 	if singletonRuntime.IsRunning() {
 		return ErrAlreadyRunning
 	}
-	if err := configureSingleton(carrierName, transportName, roomID, clientID, keyHex, socksPort, socksUser, socksPass); err != nil {
+	err := configureSingleton(carrierName, transportName, roomID, clientID, keyHex,
+		socksPort, socksUser, socksPass)
+	if err != nil {
 		return err
 	}
 	singletonStats = client.FlowStats{}
@@ -115,10 +117,7 @@ func configureSingleton(
 	if err := singletonRuntime.SetSocksPort(socksPort); err != nil {
 		return err
 	}
-	if err := singletonRuntime.SetSocksCredentials(socksUser, socksPass); err != nil {
-		return err
-	}
-	return nil
+	return singletonRuntime.SetSocksCredentials(socksUser, socksPass)
 }
 
 // WaitReady preserves the legacy singleton readiness wait API.
@@ -172,7 +171,7 @@ func updateSingletonFlowStats(stats client.FlowStats) {
 func normalizeCompatProvider(provider string) string {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
-		return "none"
+		return providerNone
 	}
 	return provider
 }
@@ -222,8 +221,4 @@ func clampCompat(value, maxValue int) int {
 		return maxValue
 	}
 	return value
-}
-
-func socksListenAddr(host string, port int) string {
-	return net.JoinHostPort(normalizeCompatHost(host), strconv.Itoa(port))
 }

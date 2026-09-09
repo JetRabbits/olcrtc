@@ -228,8 +228,8 @@ func TestNewErrorPaths(t *testing.T) {
 func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	tr := &streamTransport{
 		stream:       &fakeVideoStream{canSend: true},
-		data:         newKCPPlane(10, nil),
-		control:      newKCPPlane(1, nil),
+		data:         newKCPPlane(10),
+		control:      newKCPPlane(1),
 		closeCh:      make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		bindingToken: bindingToken("client"),
@@ -274,8 +274,8 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 func TestResetPeerRestartsKCPAndDrainsOutbound(t *testing.T) {
 	tr := &streamTransport{
 		stream:       &fakeVideoStream{canSend: true},
-		data:         newKCPPlane(10, nil),
-		control:      newKCPPlane(10, nil),
+		data:         newKCPPlane(10),
+		control:      newKCPPlane(10),
 		closeCh:      make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		bindingToken: bindingToken("client"),
@@ -364,8 +364,8 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	called := 0
 	tr := &streamTransport{
 		stream:       &fakeVideoStream{canSend: true},
-		data:         newKCPPlane(16, nil),
-		control:      newKCPPlane(16, nil),
+		data:         newKCPPlane(16),
+		control:      newKCPPlane(16),
 		closeCh:      make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		bindingToken: bindingToken("client"),
@@ -476,8 +476,8 @@ func TestPeerRestartRebuildsProviderAfterGrace(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	tr := &streamTransport{
 		stream:           stream,
-		data:             newKCPPlane(16, nil),
-		control:          newKCPPlane(16, nil),
+		data:             newKCPPlane(16),
+		control:          newKCPPlane(16),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		bindingToken:     bindingToken("client"),
@@ -525,8 +525,8 @@ func TestPeerRestartRebuildsOnlyOnce(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	tr := &streamTransport{
 		stream:           stream,
-		data:             newKCPPlane(16, nil),
-		control:          newKCPPlane(16, nil),
+		data:             newKCPPlane(16),
+		control:          newKCPPlane(16),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		bindingToken:     bindingToken("client"),
@@ -557,8 +557,8 @@ func TestLivePeerKeepsLatchFresh(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	tr := &streamTransport{
 		stream:           stream,
-		data:             newKCPPlane(16, nil),
-		control:          newKCPPlane(16, nil),
+		data:             newKCPPlane(16),
+		control:          newKCPPlane(16),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		bindingToken:     bindingToken("client"),
@@ -595,8 +595,8 @@ func TestPeerRestartSuppressedWhenControlHealthy(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	tr := &streamTransport{
 		stream:           stream,
-		data:             newKCPPlane(16, nil),
-		control:          newKCPPlane(16, nil),
+		data:             newKCPPlane(16),
+		control:          newKCPPlane(16),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		bindingToken:     bindingToken("client"),
@@ -630,8 +630,8 @@ func TestPeerRestartFiresOnceCorroborated(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	tr := &streamTransport{
 		stream:           stream,
-		data:             newKCPPlane(16, nil),
-		control:          newKCPPlane(16, nil),
+		data:             newKCPPlane(16),
+		control:          newKCPPlane(16),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		bindingToken:     bindingToken("client"),

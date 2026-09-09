@@ -55,11 +55,10 @@ const (
 	defaultMaxPayloadSize = 60 * 1024
 	defaultConnectTimeout = 60 * time.Second
 	rtpBufSize            = 65536
-	// outboundQueueSize bounds KCP packets waiting for the paced writer. Sized
-	// to a couple of send windows so KCP's flush never blocks (a blocked
-	// WriteTo would stall KCP's update loop and delay ACKs); the paced writer
-	// keeps it drained so this depth is headroom, not standing latency.
-	outboundQueueSize = 1536
+	// The data-plane outbound queue is profile.VP8.DataOutboundQueue. It bounds
+	// KCP packets waiting for the paced writer; sized to a couple of send
+	// windows so KCP's flush never blocks (a blocked WriteTo would stall KCP's
+	// update loop and delay ACKs).
 	// controlOutboundQueueSize is the queue for the control-plane KCP.
 	// Control messages are tiny (ping/pong JSON frames), so a small queue
 	// suffices. We keep it separate from bulk data to guarantee forward
@@ -241,7 +240,10 @@ func newStreamTransport(
 			tr.onData(data)
 		}
 	}, profile.KCP.DataInboundQueue, profile.KCP.DataSendWindow, profile.KCP.DataReceiveWindow)
-	tr.control = newKCPPlaneWithLimits(profile.VP8.ControlOutboundQueue, tr.deliverControlData, profile.KCP.ControlInboundQueue, profile.KCP.ControlSendWindow, profile.KCP.ControlReceiveWindow)
+	tr.control = newKCPPlaneWithLimits(
+		profile.VP8.ControlOutboundQueue, tr.deliverControlData,
+		profile.KCP.ControlInboundQueue, profile.KCP.ControlSendWindow, profile.KCP.ControlReceiveWindow,
+	)
 
 	tr.shaper = transport.NewShaper(cfg.Traffic, tr.Features())
 

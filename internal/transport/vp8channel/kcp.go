@@ -65,10 +65,17 @@ type kcpRuntime struct {
 }
 
 func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
-	return startKCPWithLimits(out, onData, epochHdr, limits.Default().KCP.DataInboundQueue, limits.Default().KCP.DataSendWindow, limits.Default().KCP.DataReceiveWindow)
+	profile := limits.Default().KCP
+	return startKCPWithLimits(out, onData, epochHdr,
+		profile.DataInboundQueue, profile.DataSendWindow, profile.DataReceiveWindow)
 }
 
-func startKCPWithLimits(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, inboundQueue, sndWnd, rcvWnd int) (*kcpRuntime, error) {
+func startKCPWithLimits(
+	out chan<- *packetBuffer,
+	onData func([]byte),
+	epochHdr [epochHdrLen]byte,
+	inboundQueue, sndWnd, rcvWnd int,
+) (*kcpRuntime, error) {
 	if inboundQueue <= 0 {
 		inboundQueue = inboundQueueSize
 	}
@@ -216,12 +223,25 @@ type kcpPlane struct {
 	once sync.Once
 }
 
-func newKCPPlane(queueSize int, onData func([]byte)) *kcpPlane {
-	return newKCPPlaneWithLimits(queueSize, onData, inboundQueueSize, kcpSndWnd, kcpRcvWnd)
+// newKCPPlane builds a plane with the default (server) KCP limits; production
+// paths go through newKCPPlaneWithLimits with a profile. Tests use it with no
+// data sink of their own.
+func newKCPPlane(queueSize int) *kcpPlane {
+	return newKCPPlaneWithLimits(queueSize, nil, inboundQueueSize, kcpSndWnd, kcpRcvWnd)
 }
 
-func newKCPPlaneWithLimits(queueSize int, onData func([]byte), inboundQueue, sndWnd, rcvWnd int) *kcpPlane {
-	return &kcpPlane{out: make(chan *packetBuffer, queueSize), onData: onData, inboundQueue: inboundQueue, sendWindow: sndWnd, recvWindow: rcvWnd}
+func newKCPPlaneWithLimits(
+	queueSize int,
+	onData func([]byte),
+	inboundQueue, sndWnd, rcvWnd int,
+) *kcpPlane {
+	return &kcpPlane{
+		out:          make(chan *packetBuffer, queueSize),
+		onData:       onData,
+		inboundQueue: inboundQueue,
+		sendWindow:   sndWnd,
+		recvWindow:   rcvWnd,
+	}
 }
 
 // get returns the live runtime, or nil when the plane has not started (or is

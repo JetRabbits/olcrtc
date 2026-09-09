@@ -41,7 +41,12 @@ func NewSessionPair(tr transport.Transport, keys *crypto.KeySet, role SessionRol
 	return NewSessionPairWithProfile(tr, keys, role, limits.Default())
 }
 
-func NewSessionPairWithProfile(tr transport.Transport, keys *crypto.KeySet, role SessionRole, profile limits.Profile) (*SessionPair, error) {
+func NewSessionPairWithProfile(
+	tr transport.Transport,
+	keys *crypto.KeySet,
+	role SessionRole,
+	profile limits.Profile,
+) (*SessionPair, error) {
 	profile = limits.Normalize(profile)
 	dataConn := muxconn.NewWithQueue(tr, keys, profile.MuxConn.DataInboundQueue)
 	controlConn := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
@@ -74,7 +79,8 @@ func NewSessionPairWithConns(
 		return pair, nil
 	}
 	pair.ControlConn = controlConn
-	controlSession, err := NewSession(controlConn, role, runtime.ControlSmuxConfigWithProfile(runtime.MaxPayload(tr), profile))
+	controlCfg := runtime.ControlSmuxConfigWithProfile(runtime.MaxPayload(tr), profile)
+	controlSession, err := NewSession(controlConn, role, controlCfg)
 	if err != nil {
 		_ = controlConn.Close()
 		pair.ControlConn = nil

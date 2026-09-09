@@ -122,12 +122,15 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		if session != nil && !session.IsClosed() && sessionID != "" {
 			switch req.command {
 			case socksCommandConnect:
-				if !c.tryBeginFlow("tcp") {
+				if !c.tryBeginFlow(flowKindTCP) {
 					_, _ = conn.Write(replyHostUnreachable(req.addr))
 					return
 				}
-				defer c.endFlow("tcp")
+				// tunnel blocks for the connection's lifetime; endFlow must run
+				// when it returns, not at the enclosing scope's exit (this sits
+				// inside the readiness-poll loop).
 				c.tunnel(ctx, conn, session, req.addr, req.port)
+				c.endFlow(flowKindTCP)
 			case socksCommandUDPAssociate:
 				c.udpAssociate(ctx, conn, session)
 			}
@@ -307,49 +310,25 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 	}
 	defer func() { _ = udpConn.Close() }()
 
-	bound := udpConn.LocalAddr().(*net.UDPAddr)
-	if !c.tryBeginFlow("udp") {
+	bound, valid := udpConn.LocalAddr().(*net.UDPAddr)
+	if !valid {
 		_, _ = tcpConn.Write(replyHostUnreachable("0.0.0.0"))
 		return
 	}
-	defer c.endFlow("udp")
+	if !c.tryBeginFlow(flowKindUDP) {
+		_, _ = tcpConn.Write(replyHostUnreachable("0.0.0.0"))
+		return
+	}
+	defer c.endFlow(flowKindUDP)
 	if _, err := tcpConn.Write(replySuccessAddr(bound.IP, bound.Port)); err != nil {
 		return
 	}
 
-	var (
-		streamMu      sync.Mutex
-		stream        *smux.Stream
-		targetAddr    string
-		targetPort    int
-		udpClientMu   sync.RWMutex
-		udpClientAddr *net.UDPAddr
-	)
-	closeStream := func() {
-		streamMu.Lock()
-		if stream != nil {
-			_ = stream.Close()
-			stream = nil
-		}
-		streamMu.Unlock()
-	}
-	defer closeStream()
-
+	relay := &udpRelay{sess: sess}
+	defer relay.closeStream()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		_, _ = io.Copy(io.Discard, tcpConn)
-		_ = udpConn.Close()
-		closeStream()
-	}()
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = udpConn.Close()
-			closeStream()
-		case <-done:
-		}
-	}()
+	relay.watch(ctx, tcpConn, udpConn, done)
 
 	buf := make([]byte, maxUDPPacketSize)
 	for {
@@ -363,32 +342,111 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 			logger.Debugf("UDP ASSOCIATE parse failed: %v", err)
 			continue
 		}
-		udpClientMu.Lock()
-		udpClientAddr = src
-		udpClientMu.Unlock()
-
-		streamMu.Lock()
-		if stream == nil || targetAddr != datagram.addr || targetPort != datagram.port {
-			if stream != nil {
-				_ = stream.Close()
-			}
-			stream, err = sess.OpenStream()
-			if err == nil {
-				targetAddr, targetPort = datagram.addr, datagram.port
-				err = c.sendUDPDialRequest(stream, targetAddr, targetPort)
-			}
-			if err == nil {
-				go c.forwardUDPReplies(udpConn, stream, targetAddr, targetPort, &udpClientMu, &udpClientAddr)
-			}
-		}
-		current := stream
-		if err == nil && current != nil {
-			err = framing.WriteBytes(current, datagram.payload, maxUDPPacketSize)
-		}
-		streamMu.Unlock()
-		if err != nil {
+		relay.rememberClient(src)
+		if err := relay.relayClientPacket(c, udpConn, datagram); err != nil {
 			logger.Debugf("UDP ASSOCIATE stream write failed: %v", err)
-			closeStream()
+			relay.closeStream()
+		}
+	}
+}
+
+// udpRelay holds the per-UDP-ASSOCIATE state: one lazily opened outbound smux
+// stream that is re-keyed whenever the client retargets, and the last-seen
+// client UDP source used to pump replies back.
+type udpRelay struct {
+	sess *smux.Session
+
+	streamMu   sync.Mutex
+	stream     *smux.Stream
+	targetAddr string
+	targetPort int
+
+	clientMu   sync.RWMutex
+	clientAddr *net.UDPAddr
+}
+
+// watch retires the relay when the TCP control connection closes (SOCKS
+// clients signal teardown that way) or ctx dies; closing done retires the
+// watchers on the normal return path.
+func (r *udpRelay) watch(ctx context.Context, tcpConn net.Conn, udpConn *net.UDPConn, done <-chan struct{}) {
+	go func() {
+		_, _ = io.Copy(io.Discard, tcpConn)
+		_ = udpConn.Close()
+		r.closeStream()
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = udpConn.Close()
+			r.closeStream()
+		case <-done:
+		}
+	}()
+}
+
+func (r *udpRelay) rememberClient(addr *net.UDPAddr) {
+	r.clientMu.Lock()
+	r.clientAddr = addr
+	r.clientMu.Unlock()
+}
+
+func (r *udpRelay) closeStream() {
+	r.streamMu.Lock()
+	if r.stream != nil {
+		_ = r.stream.Close()
+		r.stream = nil
+	}
+	r.streamMu.Unlock()
+}
+
+// relayClientPacket delivers one datagram over the tunnel, opening or
+// replacing the outbound stream whenever the target changes; a fresh stream
+// also spawns its reply pump.
+func (r *udpRelay) relayClientPacket(c *Client, udpConn *net.UDPConn, dgram socksUDPDatagram) error {
+	r.streamMu.Lock()
+	defer r.streamMu.Unlock()
+	var err error
+	if r.stream == nil || r.targetAddr != dgram.addr || r.targetPort != dgram.port {
+		if r.stream != nil {
+			_ = r.stream.Close()
+			r.stream = nil
+		}
+		stream, openErr := r.sess.OpenStream()
+		if openErr == nil {
+			r.targetAddr, r.targetPort = dgram.addr, dgram.port
+			openErr = c.sendUDPDialRequest(stream, r.targetAddr, r.targetPort)
+		}
+		r.stream = stream
+		err = openErr
+		if err == nil {
+			go r.forwardReplies(udpConn, stream, r.targetAddr, r.targetPort)
+		}
+	}
+	if err == nil && r.stream != nil {
+		if writeErr := framing.WriteBytes(r.stream, dgram.payload, maxUDPPacketSize); writeErr != nil {
+			return fmt.Errorf("forward socks udp datagram: %w", writeErr)
+		}
+	}
+	return err
+}
+
+// forwardReplies pumps tunnel-side replies for one stream back to the
+// last-seen client source and exits when the stream dies.
+func (r *udpRelay) forwardReplies(udpConn *net.UDPConn, stream *smux.Stream, addr string, port int) {
+	for {
+		packet, err := framing.ReadBytes(stream, maxUDPPacketSize)
+		if err != nil {
+			return
+		}
+		out, err := marshalSocks5UDPDatagram(addr, port, packet)
+		if err != nil {
+			return
+		}
+		r.clientMu.RLock()
+		client := r.clientAddr
+		r.clientMu.RUnlock()
+		if client != nil {
+			_, _ = udpConn.WriteToUDP(out, client)
 		}
 	}
 }
@@ -400,28 +458,13 @@ func (c *Client) listenUDPRelay(tcpAddr net.Addr) (*net.UDPConn, error) {
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(host, "0"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve socks udp relay addr: %w", err)
 	}
-	return net.ListenUDP("udp4", udpAddr)
-}
-
-func (c *Client) forwardUDPReplies(udpConn *net.UDPConn, stream *smux.Stream, targetAddr string, targetPort int, udpClientMu *sync.RWMutex, udpClientAddr **net.UDPAddr) {
-	for {
-		packet, err := framing.ReadBytes(stream, maxUDPPacketSize)
-		if err != nil {
-			return
-		}
-		out, err := marshalSocks5UDPDatagram(targetAddr, targetPort, packet)
-		if err != nil {
-			return
-		}
-		udpClientMu.RLock()
-		addr := *udpClientAddr
-		udpClientMu.RUnlock()
-		if addr != nil {
-			_, _ = udpConn.WriteToUDP(out, addr)
-		}
+	conn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen socks udp relay: %w", err)
 	}
+	return conn, nil
 }
 
 func parseSocks5UDPDatagram(data []byte) (socksUDPDatagram, error) {
@@ -484,10 +527,11 @@ func marshalSocks5UDPDatagram(addr string, port int, payload []byte) ([]byte, er
 		out = append(out, socksAddrIPv6)
 		out = append(out, ip16...)
 	} else {
-		if len(addr) > 255 {
-			return nil, fmt.Errorf("udp address too long: %d", len(addr))
+		domainLen := len(addr)
+		if domainLen > 255 {
+			return nil, fmt.Errorf("%w: %d", ErrSOCKSDomainTooLong, domainLen)
 		}
-		out = append(out, socksAddrDomain, byte(len(addr)))
+		out = append(out, socksAddrDomain, uint8(domainLen))
 		out = append(out, addr...)
 	}
 	var portBuf [2]byte
