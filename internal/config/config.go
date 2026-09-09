@@ -97,6 +97,13 @@ type Room struct {
 type Crypto struct {
 	Key     string `yaml:"key"`      // 64-char hex (32 bytes)
 	KeyFile string `yaml:"key_file"` // path to a file containing crypto.key
+	// Plaintext is a deprecated Galactic deployment compatibility knob. Older
+	// Kubernetes manifests still render crypto.plaintext=true; the current
+	// authenticated record layer always controls wire protection from Key, so this
+	// field is accepted but intentionally ignored.
+	//
+	// Deprecated: remove crypto.plaintext from generated deployment configs.
+	Plaintext bool `yaml:"plaintext"`
 }
 
 // Net groups network and transport selection.

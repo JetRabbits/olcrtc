@@ -195,6 +195,8 @@ ffmpeg: /usr/bin/ffmpeg
 video:
   bitrate: 5000k
   hw: nvenc
+crypto:
+  plaintext: true
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -205,7 +207,7 @@ video:
 		t.Fatalf("Load() error = %v", err)
 	}
 	if file.Link != "direct" || file.FFmpeg != "/usr/bin/ffmpeg" ||
-		file.Video.Bitrate != "5000k" || file.Video.HW != "nvenc" {
+		file.Video.Bitrate != "5000k" || file.Video.HW != "nvenc" || !file.Crypto.Plaintext {
 		t.Fatalf("legacy fields = %#v", file)
 	}
 	if got := Apply(file); got != (session.Config{Mode: "cnc"}) {
