@@ -83,7 +83,7 @@ func (r *simReceiver) accept(pkt *rtp.Packet) {
 		// hand each embedded packet to KCP. Concatenating them reconstructs the
 		// byte stream KCP would consume.
 		splitKCPPayload(frame[epochHdrLen:], func(part []byte) {
-			r.delivered.Write(part)
+			_, _ = r.delivered.Write(part)
 		})
 	})
 }
