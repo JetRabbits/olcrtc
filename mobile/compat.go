@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/openlibrecommunity/olcrtc/pkg/olcrtc/client"
 )
@@ -73,6 +74,15 @@ func SetLowMemoryProfile(enabled bool) {
 // field to keep that field from the selected resource profile.
 func SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
 	singletonRuntime.SetSocksFlowLimits(maxTCP, maxUDP, maxTotal)
+}
+
+// SetSocksSlotWait bounds how long the next session waits for a SOCKS flow
+// slot before using the existing host-unreachable refusal. It is independent of
+// SetLowMemoryProfile and runtime profile selection. Passing 0 (or any negative
+// value) restores the default. Do not use a very large value on iOS: a stalled
+// Network Extension can be jetsam-killed, so waiting must never be unbounded.
+func SetSocksSlotWait(timeoutMillis int) {
+	singletonRuntime.SetSocksSlotWait(time.Duration(timeoutMillis) * time.Millisecond)
 }
 
 // Start preserves the legacy singleton start API.
@@ -186,6 +196,20 @@ func ActiveTotalFlows() int64 {
 	singletonMu.Lock()
 	defer singletonMu.Unlock()
 	return singletonStats.Total
+}
+
+// SocksSlotWaitAdmitted returns flows admitted after waiting for a flow slot.
+func SocksSlotWaitAdmitted() int64 {
+	singletonMu.Lock()
+	defer singletonMu.Unlock()
+	return singletonStats.SlotWaitAdmitted
+}
+
+// SocksSlotWaitRefused returns flow requests refused after slot waiting failed.
+func SocksSlotWaitRefused() int64 {
+	singletonMu.Lock()
+	defer singletonMu.Unlock()
+	return singletonStats.SlotWaitRefused
 }
 
 func updateSingletonFlowStats(stats client.FlowStats) {

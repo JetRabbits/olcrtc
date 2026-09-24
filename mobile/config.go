@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	internalclient "github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
@@ -76,6 +77,7 @@ type runtimeConfig struct {
 	onFlowStats     client.FlowStatsFunc
 	resourceProfile client.ResourceProfile
 	socksFlowLimits limits.SOCKS
+	socksSlotWait   time.Duration
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -343,7 +345,7 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		DNSServer: cfg.dnsServer, Resolver: cfg.resolver,
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
 		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath, OnFlowStats: cfg.onFlowStats,
-		ResourceProfile: profile,
+		ResourceProfile: profile, SocksSlotWait: cfg.socksSlotWait,
 	}
 }
 
@@ -372,6 +374,17 @@ func (r *Runtime) SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
 		MaxUDP:   clampSocksFlowLimit(maxUDP),
 		MaxTotal: clampSocksFlowLimit(maxTotal),
 	}
+	r.mu.Unlock()
+}
+
+// SetSocksSlotWait sets the bounded time future sessions wait for a SOCKS flow
+// slot before returning the normal SOCKS host-unreachable refusal. It is
+// independent of SetLowMemoryProfile; pass zero or a negative duration to use
+// the default. Waiting is never unbounded: very large values are clamped because
+// a stalled iOS Network Extension can be jetsam-killed.
+func (r *Runtime) SetSocksSlotWait(wait time.Duration) {
+	r.mu.Lock()
+	r.defaults.socksSlotWait = internalclient.NormalizeSocksSlotWait(wait)
 	r.mu.Unlock()
 }
 

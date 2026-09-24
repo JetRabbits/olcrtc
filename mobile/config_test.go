@@ -169,6 +169,33 @@ func TestSocksFlowLimitsSurviveStartProfileSelection(t *testing.T) {
 	}
 }
 
+func TestSocksSlotWaitSetterDefaultsExplicitAndClamps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  time.Duration
+		want time.Duration
+	}{
+		{name: "unset default", set: 0, want: 0},
+		{name: "zero restores default", set: 0, want: 2 * time.Second},
+		{name: "negative restores default", set: -time.Second, want: 2 * time.Second},
+		{name: "explicit", set: 1500 * time.Millisecond, want: 1500 * time.Millisecond},
+		{name: "clamped", set: time.Minute, want: 10 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := New()
+			if tc.name != "unset default" {
+				runtime.SetSocksSlotWait(tc.set)
+			}
+			runtime.mu.Lock()
+			cfg := runtime.defaults.clientConfig()
+			runtime.mu.Unlock()
+			if cfg.SocksSlotWait != tc.want {
+				t.Fatalf("SocksSlotWait = %s, want %s", cfg.SocksSlotWait, tc.want)
+			}
+		})
+	}
+}
+
 func TestStartValidatesRequiredConfiguration(t *testing.T) {
 	runtime := newRuntime(blockingReadyRunner)
 	if err := runtime.Start(); !errors.Is(err, ErrInvalidConfig) {

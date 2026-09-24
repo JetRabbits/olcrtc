@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -58,6 +59,95 @@ type socksUDPDatagram struct {
 	addr    string
 	port    int
 	payload []byte
+}
+
+type peerWatchConn struct {
+	base     net.Conn
+	done     chan struct{}
+	readDone chan struct{}
+	mu       sync.Mutex
+	prefix   []byte
+}
+
+type prefixConn struct {
+	net.Conn
+	mu     sync.Mutex
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		return n, fmt.Errorf("read prefixed conn: %w", err)
+	}
+	return n, nil
+}
+
+func watchPeerGone(conn net.Conn, maxWait time.Duration) (*peerWatchConn, <-chan struct{}) {
+	w := &peerWatchConn{base: conn, done: make(chan struct{}), readDone: make(chan struct{})}
+	gone := make(chan struct{})
+	probe := 50 * time.Millisecond
+	if maxWait > 0 && maxWait < probe {
+		probe = maxWait
+	}
+	go func() {
+		defer close(w.readDone)
+		buf := make([]byte, 1)
+		for {
+			select {
+			case <-w.done:
+				return
+			default:
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(probe))
+			n, err := conn.Read(buf)
+			if n > 0 {
+				w.mu.Lock()
+				w.prefix = append(w.prefix, buf[:n]...)
+				w.mu.Unlock()
+				return
+			}
+			if err == nil {
+				continue
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+			close(gone)
+			return
+		}
+	}()
+	return w, gone
+}
+
+func (w *peerWatchConn) stop() {
+	select {
+	case <-w.done:
+	default:
+		close(w.done)
+	}
+	<-w.readDone
+	_ = w.base.SetReadDeadline(time.Time{})
+}
+
+func (w *peerWatchConn) conn() net.Conn {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.prefix) == 0 {
+		return w.base
+	}
+	prefix := append([]byte(nil), w.prefix...)
+	w.prefix = nil
+	return &prefixConn{Conn: w.base, prefix: prefix}
 }
 
 func (c *Client) acceptLoop(ctx context.Context, listener net.Listener) {
@@ -122,7 +212,9 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		if session != nil && !session.IsClosed() && sessionID != "" {
 			switch req.command {
 			case socksCommandConnect:
-				if !c.tryBeginFlow(flowKindTCP) {
+				var ok bool
+				conn, ok = c.waitBeginFlow(ctx, conn, flowKindTCP)
+				if !ok {
 					_, _ = conn.Write(replyHostUnreachable(req.addr))
 					return
 				}
@@ -315,7 +407,9 @@ func (c *Client) udpAssociate(ctx context.Context, tcpConn net.Conn, sess *smux.
 		_, _ = tcpConn.Write(replyHostUnreachable("0.0.0.0"))
 		return
 	}
-	if !c.tryBeginFlow(flowKindUDP) {
+	var ok bool
+	tcpConn, ok = c.waitBeginFlow(ctx, tcpConn, flowKindUDP)
+	if !ok {
 		_, _ = tcpConn.Write(replyHostUnreachable("0.0.0.0"))
 		return
 	}

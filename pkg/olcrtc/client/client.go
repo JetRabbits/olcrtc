@@ -63,9 +63,10 @@ type HealthStatus = control.Status
 // mobile compatibility API keeps this shape for older embedders; upstream's
 // current runtime does not publish these counters yet.
 type FlowStats struct {
-	Seq      uint64
-	TCP, UDP int64
-	Total    int64
+	Seq                               uint64
+	TCP, UDP                          int64
+	Total                             int64
+	SlotWaitAdmitted, SlotWaitRefused int64
 }
 
 type ResourceProfile = limits.Profile
@@ -122,6 +123,7 @@ type Config struct {
 	OnClientReady func(ReconnectRequester)
 
 	ResourceProfile ResourceProfile
+	SocksSlotWait   time.Duration
 }
 
 // ReconnectRequester rebuilds an active session's remote carrier and smux
@@ -185,6 +187,7 @@ func toClientConfig(cfg Config) internalclient.Config {
 		OnHealth: internalclient.HealthFunc(cfg.OnHealth), OnFlowStats: mapFlowStatsFunc(cfg.OnFlowStats),
 		OnClientReady:   mapClientReadyFunc(cfg.OnClientReady),
 		ResourceProfile: cfg.ResourceProfile,
+		SocksSlotWait:   cfg.SocksSlotWait,
 	}
 }
 
@@ -200,7 +203,8 @@ func mapFlowStatsFunc(fn FlowStatsFunc) internalclient.FlowStatsFunc {
 		return nil
 	}
 	return func(stats internalclient.FlowStats) {
-		fn(FlowStats{Seq: stats.Seq, TCP: stats.TCP, UDP: stats.UDP, Total: stats.Total})
+		fn(FlowStats{Seq: stats.Seq, TCP: stats.TCP, UDP: stats.UDP, Total: stats.Total,
+			SlotWaitAdmitted: stats.SlotWaitAdmitted, SlotWaitRefused: stats.SlotWaitRefused})
 	}
 }
 

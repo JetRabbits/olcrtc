@@ -50,6 +50,18 @@ const (
 )
 
 const (
+	// DefaultSocksSlotWait bounds backpressure for SOCKS flow ceilings. It is
+	// deliberately finite: mobile Network Extensions that stall indefinitely are
+	// vulnerable to jetsam.
+	DefaultSocksSlotWait = 2 * time.Second
+	// MaxSocksSlotWait clamps host-provided slot waits to a finite value.
+	MaxSocksSlotWait = 10 * time.Second
+	// maxSocksSlotWaiters bounds goroutines/fds retained only to wait for a flow
+	// slot during bursty clients such as Speedtest.
+	maxSocksSlotWaiters = 64
+)
+
+const (
 	reconnectProvider = "provider"
 	reconnectLiveness = "liveness"
 	reconnectFallback = "liveness-fallback"
@@ -108,8 +120,12 @@ type Client struct {
 	activeTCP        int64
 	activeUDP        int64
 	activeTotal      int64
+	slotWaitAdmitted int64
+	slotWaitRefused  int64
 	flowSeq          uint64
 	onFlowStats      FlowStatsFunc
+	socksSlotWait    time.Duration
+	slotWaiters      chan struct{}
 	livenessFallback time.Duration
 	shutdownGrace    time.Duration
 	fallbackPending  atomic.Bool
@@ -150,12 +166,14 @@ type Config struct {
 	OnClientReady ConfigClientReadyFunc
 
 	ResourceProfile limits.Profile
+	SocksSlotWait   time.Duration
 }
 
 type FlowStats struct {
-	Seq      uint64
-	TCP, UDP int64
-	Total    int64
+	Seq                               uint64
+	TCP, UDP                          int64
+	Total                             int64
+	SlotWaitAdmitted, SlotWaitRefused int64
 }
 
 type FlowStatsFunc func(FlowStats)
@@ -189,6 +207,8 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
 		resourceProfile:         limits.Normalize(cfg.ResourceProfile),
+		socksSlotWait:           NormalizeSocksSlotWait(cfg.SocksSlotWait),
+		slotWaiters:             make(chan struct{}, maxSocksSlotWaiters),
 		health:                  runtime.NewHealthTracker(cfg.OnHealth),
 		sessionReady:            make(chan struct{}),
 		reconnectRequestPending: make(chan string, 1),
@@ -222,9 +242,21 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	return nil
 }
 
+// NormalizeSocksSlotWait returns the effective bounded SOCKS slot wait.
+func NormalizeSocksSlotWait(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return DefaultSocksSlotWait
+	}
+	if wait > MaxSocksSlotWait {
+		return MaxSocksSlotWait
+	}
+	return wait
+}
+
 // registerSocksConn tracks conn so shutdown can close it, and enforces the
-// concurrency cap. It reports false when the cap is reached or the client is
-// tearing down; the caller then closes conn itself.
+// accepted-client cap. Flow ceilings are handled later with bounded waiting.
+// It reports false when the cap is reached or the client is tearing down; the
+// caller then closes conn itself.
 func (c *Client) registerSocksConn(conn net.Conn) bool {
 	c.socksMu.Lock()
 	defer c.socksMu.Unlock()
@@ -244,7 +276,7 @@ func (c *Client) registerSocksConn(conn net.Conn) bool {
 
 func (c *Client) maxSocksConns() int {
 	if c.resourceProfile.SOCKS.MaxTotal > 0 {
-		return c.resourceProfile.SOCKS.MaxTotal
+		return c.resourceProfile.SOCKS.MaxTotal + maxSocksSlotWaiters
 	}
 	return maxSocksConns
 }
@@ -276,6 +308,86 @@ func (c *Client) tryBeginFlow(kind string) bool {
 	return true
 }
 
+func (c *Client) waitBeginFlow(ctx context.Context, conn net.Conn, kind string) (net.Conn, bool) {
+	if c.tryBeginFlow(kind) {
+		return conn, true
+	}
+	wait := NormalizeSocksSlotWait(c.socksSlotWait)
+	if !c.tryAcquireSlotWaiter() {
+		c.recordSlotWaitRefused()
+		logger.Warnf("SOCKS5: slot waiter limit reached, refusing %s flow", kind)
+		return conn, false
+	}
+	defer c.releaseSlotWaiter()
+
+	peerConn, peerGone := watchPeerGone(conn, wait)
+	defer peerConn.stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return peerConn.conn(), false
+		case <-peerGone:
+			return peerConn.conn(), false
+		case <-timer.C:
+			c.recordSlotWaitRefused()
+			return peerConn.conn(), false
+		case <-ticker.C:
+			if c.tryBeginFlow(kind) {
+				c.recordSlotWaitAdmitted()
+				return peerConn.conn(), true
+			}
+		}
+	}
+}
+
+func (c *Client) tryAcquireSlotWaiter() bool {
+	c.socksMu.Lock()
+	if c.slotWaiters == nil {
+		c.slotWaiters = make(chan struct{}, maxSocksSlotWaiters)
+	}
+	waiters := c.slotWaiters
+	c.socksMu.Unlock()
+	select {
+	case waiters <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) releaseSlotWaiter() {
+	c.socksMu.Lock()
+	waiters := c.slotWaiters
+	c.socksMu.Unlock()
+	if waiters == nil {
+		return
+	}
+	select {
+	case <-waiters:
+	default:
+	}
+}
+
+func (c *Client) recordSlotWaitAdmitted() {
+	c.socksMu.Lock()
+	c.slotWaitAdmitted++
+	stats := c.nextFlowStatsLocked()
+	c.socksMu.Unlock()
+	c.publishFlowStats(stats)
+}
+
+func (c *Client) recordSlotWaitRefused() {
+	c.socksMu.Lock()
+	c.slotWaitRefused++
+	stats := c.nextFlowStatsLocked()
+	c.socksMu.Unlock()
+	c.publishFlowStats(stats)
+}
+
 func (c *Client) endFlow(kind string) {
 	c.socksMu.Lock()
 	if kind == flowKindTCP && c.activeTCP > 0 {
@@ -294,7 +406,8 @@ func (c *Client) endFlow(kind string) {
 
 func (c *Client) nextFlowStatsLocked() FlowStats {
 	c.flowSeq++
-	return FlowStats{Seq: c.flowSeq, TCP: c.activeTCP, UDP: c.activeUDP, Total: c.activeTotal}
+	return FlowStats{Seq: c.flowSeq, TCP: c.activeTCP, UDP: c.activeUDP, Total: c.activeTotal,
+		SlotWaitAdmitted: c.slotWaitAdmitted, SlotWaitRefused: c.slotWaitRefused}
 }
 
 func (c *Client) publishFlowStats(stats FlowStats) {

@@ -138,6 +138,99 @@ func TestFlowStatsEnforcePerKindAndTotalCaps(t *testing.T) {
 	}
 }
 
+func TestWaitBeginFlowAdmitsBurstWhenSlotsFreeQuickly(t *testing.T) {
+	c := &Client{
+		resourceProfile: limits.Normalize(limits.Profile{SOCKS: limits.SOCKS{MaxTCP: 1, MaxTotal: 1}}),
+		socksSlotWait:   300 * time.Millisecond,
+	}
+	if !c.tryBeginFlow(flowKindTCP) {
+		t.Fatal("initial flow rejected")
+	}
+	const waiters = 3
+	results := make(chan bool, waiters)
+	peers := make([]net.Conn, 0, waiters)
+	for range waiters {
+		server, peer := net.Pipe()
+		peers = append(peers, peer)
+		go func(conn net.Conn) {
+			defer func() { _ = conn.Close() }()
+			_, ok := c.waitBeginFlow(context.Background(), conn, flowKindTCP)
+			if ok {
+				c.endFlow(flowKindTCP)
+			}
+			results <- ok
+		}(server)
+	}
+	defer func() {
+		for _, peer := range peers {
+			_ = peer.Close()
+		}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	c.endFlow(flowKindTCP)
+	for range waiters {
+		if !<-results {
+			t.Fatal("waiter was refused despite slots freeing within wait window")
+		}
+	}
+	if c.slotWaitAdmitted != waiters || c.slotWaitRefused != 0 {
+		t.Fatalf("slot wait counters admitted=%d refused=%d, want admitted=%d refused=0",
+			c.slotWaitAdmitted, c.slotWaitRefused, waiters)
+	}
+}
+
+func TestWaitBeginFlowRefusesAfterBoundedTimeout(t *testing.T) {
+	c := &Client{
+		resourceProfile: limits.Normalize(limits.Profile{SOCKS: limits.SOCKS{MaxTCP: 1, MaxTotal: 1}}),
+		socksSlotWait:   40 * time.Millisecond,
+	}
+	if !c.tryBeginFlow(flowKindTCP) {
+		t.Fatal("initial flow rejected")
+	}
+	defer c.endFlow(flowKindTCP)
+	server, peer := net.Pipe()
+	defer func() { _ = server.Close(); _ = peer.Close() }()
+	start := time.Now()
+	_, ok := c.waitBeginFlow(context.Background(), server, flowKindTCP)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatal("waitBeginFlow admitted while slot remained occupied")
+	}
+	if elapsed < 40*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("wait elapsed = %s, want bounded timeout around 40ms", elapsed)
+	}
+	if c.slotWaitRefused != 1 {
+		t.Fatalf("slotWaitRefused = %d, want 1", c.slotWaitRefused)
+	}
+}
+
+func TestWaitBeginFlowStopsPromptlyWhenContextCanceled(t *testing.T) {
+	c := &Client{
+		resourceProfile: limits.Normalize(limits.Profile{SOCKS: limits.SOCKS{MaxTCP: 1, MaxTotal: 1}}),
+		socksSlotWait:   500 * time.Millisecond,
+	}
+	if !c.tryBeginFlow(flowKindTCP) {
+		t.Fatal("initial flow rejected")
+	}
+	defer c.endFlow(flowKindTCP)
+	server, peer := net.Pipe()
+	defer func() { _ = server.Close(); _ = peer.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, ok := c.waitBeginFlow(ctx, server, flowKindTCP)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatal("waitBeginFlow admitted after context cancellation")
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("canceled wait took %s, want <200ms", elapsed)
+	}
+}
+
 func newClientTestKeys(t *testing.T) *cryptopkg.KeySet {
 	t.Helper()
 	keys, err := cryptopkg.NewKeySet([]byte("01234567890123456789012345678901"), cryptopkg.Client)
