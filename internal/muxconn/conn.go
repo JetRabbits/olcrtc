@@ -147,6 +147,7 @@ type Conn struct {
 	send    func([]byte) error
 	canSend func() bool // if nil, uses ln.CanSend
 	keys    *crypto.KeySet
+	sealer  *crypto.Sealer
 	aad     []byte
 
 	in        chan *[]byte
@@ -179,60 +180,74 @@ func (c *Conn) sendDeadline() time.Duration {
 
 // New wires a Conn over the given transport. Push must be set as the
 // transport's OnData callback before this conn is used.
-func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
+func New(ln transport.Transport, keys *crypto.KeySet) (*Conn, error) {
 	return NewWithQueue(ln, keys, inboundQueue)
 }
 
-func NewWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) *Conn {
+func NewWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) (*Conn, error) {
 	if queueSize <= 0 {
 		queueSize = inboundQueue
+	}
+	sealer, err := keys.Session()
+	if err != nil {
+		return nil, err
 	}
 	return &Conn{
 		ln:      ln,
 		send:    ln.Send,
 		keys:    keys,
+		sealer:  sealer,
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
-	}
+	}, nil
 }
 
 // NewControl wires a Conn that routes through the transport's isolated
 // control-plane channel (transport.ControlPlane). Returns nil if the
 // transport does not implement ControlPlane.
-func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
+func NewControl(ln transport.Transport, keys *crypto.KeySet) (*Conn, error) {
 	return NewControlWithQueue(ln, keys, inboundQueue)
 }
 
-func NewControlWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) *Conn {
+func NewControlWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) (*Conn, error) {
 	if queueSize <= 0 {
 		queueSize = inboundQueue
 	}
 	cp, ok := ln.(transport.ControlPlane)
 	if !ok {
-		return nil
+		return nil, nil
+	}
+	sealer, err := keys.Session()
+	if err != nil {
+		return nil, err
 	}
 	c := &Conn{
 		ln:      ln,
 		send:    cp.ControlSend,
 		canSend: cp.ControlCanSend,
 		keys:    keys,
+		sealer:  sealer,
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
 	}
 	cp.SetControlOnData(func(data []byte) { c.Push(data) })
-	return c
+	return c, nil
 }
 
 // NewPeer wires a Conn whose writes are addressed to a specific transport peer.
-func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Conn {
+func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) (*Conn, error) {
 	return NewPeerWithQueue(ln, keys, peerID, inboundQueue)
 }
 
-func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID string, queueSize int) *Conn {
+func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID string, queueSize int) (*Conn, error) {
 	if queueSize <= 0 {
 		queueSize = inboundQueue
+	}
+	sealer, err := keys.Session()
+	if err != nil {
+		return nil, err
 	}
 	return &Conn{
 		ln: ln,
@@ -240,10 +255,11 @@ func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID st
 			return ln.SendTo(peerID, data)
 		},
 		keys:    keys,
+		sealer:  sealer,
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, queueSize),
 		closeCh: make(chan struct{}),
-	}
+	}, nil
 }
 
 // NewPeerControlUnbound wires a Conn to the per-peer control plane of a
@@ -254,10 +270,14 @@ func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID st
 // caller must feed it via Push. PeerControlPlane exposes a single
 // SetControlOnPeerData callback covering every peer, so registering here
 // would clobber the caller's demultiplexer - hence the name.
-func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID string) *Conn {
+func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID string) (*Conn, error) {
 	cp, ok := ln.(transport.PeerControlPlane)
 	if !ok {
-		return nil
+		return nil, nil
+	}
+	sealer, err := keys.Session()
+	if err != nil {
+		return nil, err
 	}
 	c := &Conn{
 		ln: ln,
@@ -268,11 +288,12 @@ func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID s
 			return cp.ControlPeerCanSend(peerID)
 		},
 		keys:    keys,
+		sealer:  sealer,
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
 	}
-	return c
+	return c, nil
 }
 
 // Push hands an encrypted wire payload (one OnData event) to the conn.
@@ -410,7 +431,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 
-	enc, err := c.keys.SealInto(nil, p, c.aad)
+	enc, err := c.sealer.SealInto(nil, p, c.aad)
 	if err != nil {
 		return 0, fmt.Errorf("encrypt: %w", err)
 	}

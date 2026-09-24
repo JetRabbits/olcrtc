@@ -51,7 +51,11 @@ func TestSwapSessionDiscardsStaleReinstall(t *testing.T) {
 		session: liveData,
 		health:  runtime.NewHealthTracker(nil),
 	}
-	r := &tunnelcore.SessionPair{DataSession: newData, DataConn: muxconn.New(ln, keys)}
+	conn, err := muxconn.New(ln, keys)
+	if err != nil {
+		t.Fatalf("muxconn.New() error = %v", err)
+	}
+	r := &tunnelcore.SessionPair{DataSession: newData, DataConn: conn}
 	if ok := s.swapSession(stale, r); ok {
 		t.Fatal("swapSession accepted a stale reinstall that matched no live session")
 	}

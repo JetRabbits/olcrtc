@@ -103,9 +103,36 @@ func newTestKeyPair(t *testing.T) (*cryptopkg.KeySet, *cryptopkg.KeySet) {
 	return client, server
 }
 
+func mustNew(t *testing.T, ln transport.Transport, keys *cryptopkg.KeySet) *Conn {
+	t.Helper()
+	conn, err := New(ln, keys)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return conn
+}
+
+func mustNewControl(t *testing.T, ln transport.Transport, keys *cryptopkg.KeySet) *Conn {
+	t.Helper()
+	conn, err := NewControl(ln, keys)
+	if err != nil {
+		t.Fatalf("NewControl() error = %v", err)
+	}
+	return conn
+}
+
+func mustNewPeer(t *testing.T, ln transport.PeerTransport, keys *cryptopkg.KeySet, peerID string) *Conn {
+	t.Helper()
+	conn, err := NewPeer(ln, keys, peerID)
+	if err != nil {
+		t.Fatalf("NewPeer() error = %v", err)
+	}
+	return conn
+}
+
 func TestPushAndReadRoundTrip(t *testing.T) {
 	clientKeys, serverKeys := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, serverKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 
 	msg1, err := clientKeys.Seal([]byte("hello "), []byte(dataRecordAAD))
 	if err != nil {
@@ -131,7 +158,7 @@ func TestPushAndReadRoundTrip(t *testing.T) {
 
 func TestPushIgnoresInvalidCiphertext(t *testing.T) {
 	_, serverKeys := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, serverKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 
 	conn.Push([]byte("bad"))
 	if err := conn.Close(); err != nil {
@@ -148,7 +175,7 @@ func TestPushIgnoresInvalidCiphertext(t *testing.T) {
 func TestWriteEncryptsAndSends(t *testing.T) {
 	clientKeys, serverKeys := newTestKeyPair(t)
 	ln := &stubLink{canSend: true}
-	conn := New(ln, clientKeys)
+	conn := mustNew(t, ln, clientKeys)
 
 	n, err := conn.Write([]byte("payload"))
 	if err != nil {
@@ -175,16 +202,53 @@ func TestComplementaryKeySetsRoundTripBothPlanes(t *testing.T) {
 	clientLink, serverLink := &loopLink{}, &loopLink{}
 	clientLink.peer, serverLink.peer = serverLink, clientLink
 
-	clientData := New(clientLink, clientKeys)
-	serverData := New(serverLink, serverKeys)
+	clientData := mustNew(t, clientLink, clientKeys)
+	serverData := mustNew(t, serverLink, serverKeys)
 	clientLink.onData, serverLink.onData = clientData.Push, serverData.Push
-	clientControl := NewControl(clientLink, clientKeys)
-	serverControl := NewControl(serverLink, serverKeys)
+	clientControl := mustNewControl(t, clientLink, clientKeys)
+	serverControl := mustNewControl(t, serverLink, serverKeys)
 
 	assertConnRoundTrip(t, clientData, serverData, "client data")
 	assertConnRoundTrip(t, serverData, clientData, "server data")
 	assertConnRoundTrip(t, clientControl, serverControl, "client control")
 	assertConnRoundTrip(t, serverControl, clientControl, "server control")
+}
+
+func TestControlAndDataConnectionsDoNotShareReplayWindow(t *testing.T) {
+	clientKeys, serverKeys := newTestKeyPair(t)
+	dataLink := &stubLink{canSend: true}
+	controlLink := &stubLink{canSend: true}
+	clientData := mustNew(t, dataLink, clientKeys)
+	clientControl := mustNew(t, controlLink, clientKeys)
+	clientControl.aad = []byte(controlRecordAAD)
+	serverData, err := NewWithQueue(&stubLink{canSend: true}, serverKeys, 256)
+	if err != nil {
+		t.Fatalf("NewWithQueue(server data) error = %v", err)
+	}
+	serverControl, err := NewWithQueue(&stubLink{canSend: true}, serverKeys, 4)
+	if err != nil {
+		t.Fatalf("NewWithQueue(server control) error = %v", err)
+	}
+	serverControl.aad = []byte(controlRecordAAD)
+
+	if _, err := clientControl.Write([]byte("control")); err != nil {
+		t.Fatalf("Write(control) error = %v", err)
+	}
+	const dataRecords = 150
+	for i := range dataRecords {
+		if _, err := clientData.Write([]byte{byte(i)}); err != nil {
+			t.Fatalf("Write(data %d) error = %v", i, err)
+		}
+	}
+	for i, record := range dataLink.sent {
+		serverData.Push(record)
+		if len(serverData.in) == 0 {
+			t.Fatalf("data record %d was dropped", i)
+		}
+		assertRead(t, serverData, string([]byte{byte(i)}))
+	}
+	serverControl.Push(controlLink.sent[0])
+	assertRead(t, serverControl, "control")
 }
 
 func assertConnRoundTrip(t *testing.T, sender, receiver *Conn, payload string) {
@@ -204,8 +268,8 @@ func assertConnRoundTrip(t *testing.T, sender, receiver *Conn, payload string) {
 func TestReplayRejectedAcrossMuxconnRecreation(t *testing.T) {
 	clientKeys, serverKeys := newTestKeyPair(t)
 	clientLink := &stubLink{canSend: true}
-	clientConn := New(clientLink, clientKeys)
-	firstServerConn := New(&stubLink{canSend: true}, serverKeys)
+	clientConn := mustNew(t, clientLink, clientKeys)
+	firstServerConn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 	if _, err := clientConn.Write([]byte("first")); err != nil {
 		t.Fatalf("Write(first) error = %v", err)
 	}
@@ -213,7 +277,7 @@ func TestReplayRejectedAcrossMuxconnRecreation(t *testing.T) {
 	firstServerConn.Push(firstRecord)
 	assertRead(t, firstServerConn, "first")
 
-	secondServerConn := New(&stubLink{canSend: true}, serverKeys)
+	secondServerConn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 	secondServerConn.Push(firstRecord)
 	if len(secondServerConn.in) != 0 {
 		t.Fatalf("replayed frames queued = %d, want 0", len(secondServerConn.in))
@@ -243,7 +307,7 @@ func TestPeerWriteEncryptsAndSendsToPeer(t *testing.T) {
 		t.Fatalf("NewKeySet(client receiver) error = %v", err)
 	}
 	ln := &stubLink{canSend: true}
-	conn := NewPeer(ln, serverKeys, "peer-a")
+	conn := mustNewPeer(t, ln, serverKeys, "peer-a")
 
 	n, err := conn.Write([]byte("payload"))
 	if err != nil {
@@ -277,7 +341,7 @@ func TestWriteWaitsForCanSend(t *testing.T) {
 			return time.Now().After(readyAt)
 		},
 	}
-	conn := New(ln, clientKeys)
+	conn := mustNew(t, ln, clientKeys)
 
 	if _, err := conn.Write([]byte("payload")); err != nil {
 		t.Fatalf("Write() error = %v", err)
@@ -289,7 +353,7 @@ func TestWriteWaitsForCanSend(t *testing.T) {
 
 func TestWriteReturnsErrClosedWhileWaiting(t *testing.T) {
 	clientKeys, _ := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: false}, clientKeys)
+	conn := mustNew(t, &stubLink{canSend: false}, clientKeys)
 
 	done := make(chan error, 1)
 	go func() {
@@ -314,7 +378,7 @@ func TestWriteReturnsErrClosedWhileWaiting(t *testing.T) {
 
 func TestWriteWrapsSendError(t *testing.T) {
 	clientKeys, _ := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true, sendErr: errMuxBoom}, clientKeys)
+	conn := mustNew(t, &stubLink{canSend: true, sendErr: errMuxBoom}, clientKeys)
 
 	_, err := conn.Write([]byte("payload"))
 	if err == nil || err.Error() != "send: boom" {
@@ -324,7 +388,7 @@ func TestWriteWrapsSendError(t *testing.T) {
 
 func TestWriteTimesOutWhenTransportNeverReady(t *testing.T) {
 	clientKeys, _ := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: false}, clientKeys)
+	conn := mustNew(t, &stubLink{canSend: false}, clientKeys)
 	conn.writeTimeout = 20 * time.Millisecond
 
 	done := make(chan error, 1)
@@ -349,7 +413,7 @@ func TestWriteTimesOutWhenTransportNeverReady(t *testing.T) {
 
 func TestReadCloseErrorIsBothEOFAndErrClosed(t *testing.T) {
 	clientKeys, _ := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, clientKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, clientKeys)
 	if err := conn.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -365,7 +429,7 @@ func TestReadCloseErrorIsBothEOFAndErrClosed(t *testing.T) {
 
 func TestCloseRecyclesQueuedFrames(t *testing.T) {
 	clientKeys, serverKeys := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, serverKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 	for range 4 {
 		msg, err := clientKeys.Seal([]byte("queued"), []byte(dataRecordAAD))
 		if err != nil {
@@ -386,7 +450,7 @@ func TestCloseRecyclesQueuedFrames(t *testing.T) {
 
 func TestPushRateLimitsDecryptFailureLogs(t *testing.T) {
 	_, serverKeys := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, serverKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, serverKeys)
 
 	var buf bytes.Buffer
 	old := log.Writer()
@@ -404,7 +468,7 @@ func TestPushRateLimitsDecryptFailureLogs(t *testing.T) {
 
 func TestCloseMakesReadReturnEOF(t *testing.T) {
 	clientKeys, _ := newTestKeyPair(t)
-	conn := New(&stubLink{canSend: true}, clientKeys)
+	conn := mustNew(t, &stubLink{canSend: true}, clientKeys)
 
 	done := make(chan struct{})
 	go func() {

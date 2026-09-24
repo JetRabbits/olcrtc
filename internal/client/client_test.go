@@ -715,10 +715,14 @@ func TestOnDataWithNilConn(_ *testing.T) {
 func TestShutdownClosesLinkAndConn(t *testing.T) {
 	keys := newClientTestKeys(t)
 	ln := &closerLinkStub{}
+	conn, err := muxconn.New(ln, keys)
+	if err != nil {
+		t.Fatalf("muxconn.New() error = %v", err)
+	}
 	c := &Client{
 		ln:   ln,
 		keys: keys,
-		conn: muxconn.New(ln, keys),
+		conn: conn,
 	}
 	c.shutdown()
 	if !ln.closed {

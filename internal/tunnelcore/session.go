@@ -48,8 +48,15 @@ func NewSessionPairWithProfile(
 	profile limits.Profile,
 ) (*SessionPair, error) {
 	profile = limits.Normalize(profile)
-	dataConn := muxconn.NewWithQueue(tr, keys, profile.MuxConn.DataInboundQueue)
-	controlConn := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
+	dataConn, err := muxconn.NewWithQueue(tr, keys, profile.MuxConn.DataInboundQueue)
+	if err != nil {
+		return nil, fmt.Errorf("data muxconn: %w", err)
+	}
+	controlConn, err := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
+	if err != nil {
+		_ = dataConn.Close()
+		return nil, fmt.Errorf("control muxconn: %w", err)
+	}
 	return NewSessionPairWithConns(tr, dataConn, controlConn, role, profile)
 }
 
@@ -106,7 +113,10 @@ func NewControlSessionWithProfile(
 	profile limits.Profile,
 ) (*muxconn.Conn, *smux.Session, error) {
 	profile = limits.Normalize(profile)
-	conn := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
+	conn, err := muxconn.NewControlWithQueue(tr, keys, profile.MuxConn.ControlInboundQueue)
+	if err != nil {
+		return nil, nil, fmt.Errorf("control muxconn: %w", err)
+	}
 	if conn == nil {
 		return nil, nil, nil
 	}

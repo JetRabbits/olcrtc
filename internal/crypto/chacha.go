@@ -30,7 +30,9 @@ const (
 	noncePrefixSize     = chacha20poly1305.NonceSizeX - 8
 	recordHeaderSize    = len(recordMagic) + 8 + noncePrefixSize
 	replayWindowSize    = 64
-	maxReplaySenders    = 256
+	// maxReplaySenders covers many live peers (server peer stacks are capped at
+	// 128 today) plus reconnect/control/data sessions while bounding prefix-flood memory.
+	maxReplaySenders = 4096
 
 	// WireOverhead is magic, counter, sender prefix, and authentication tag.
 	WireOverhead = recordHeaderSize + chacha20poly1305.Overhead
@@ -94,7 +96,12 @@ func (r Role) String() string {
 	}
 }
 
-type sealState struct {
+// Sealer owns the sender nonce state for one encrypted connection/session.
+//
+// The AEAD nonce is prefix || counter. For one directional key, a prefix must
+// never be reissued and the counter for that prefix must never reset; reconnects
+// must mint a new Sealer instead of restarting an old one.
+type Sealer struct {
 	aead    cipher.AEAD
 	prefix  [noncePrefixSize]byte
 	counter atomic.Uint64
@@ -113,13 +120,17 @@ type replayCache struct {
 	lru     list.List
 }
 
-// KeySet owns one directional sender and shared receive replay state.
+// KeySet owns one directional send key and shared receive replay state.
 // It is safe for concurrent use and should be reused across data, control,
 // peer, and reconnect muxconn instances for one process role.
 type KeySet struct {
-	send    sealState
-	receive cipher.AEAD
-	replay  replayCache
+	sendAEAD cipher.AEAD
+	receive  cipher.AEAD
+	replay   replayCache
+
+	sealersMu      sync.Mutex
+	issuedPrefixes map[[noncePrefixSize]byte]struct{}
+	defaultSealer  *Sealer
 }
 
 // NewKeySet derives directional v2 keys from a 32-byte PSK and selects them by role.
@@ -165,14 +176,32 @@ func newKeySetForRole(clientKey, serverKey [chacha20poly1305.KeySize]byte, role 
 		return nil, fmt.Errorf("create receive AEAD: %w", err)
 	}
 	keys := &KeySet{
-		send:    sealState{aead: sendAEAD},
-		receive: receiveAEAD,
-		replay:  replayCache{senders: make(map[[noncePrefixSize]byte]*replayState, maxReplaySenders)},
-	}
-	if _, err := rand.Read(keys.send.prefix[:]); err != nil {
-		return nil, fmt.Errorf("seed sender nonce prefix: %w", err)
+		sendAEAD:       sendAEAD,
+		receive:        receiveAEAD,
+		replay:         replayCache{senders: make(map[[noncePrefixSize]byte]*replayState, maxReplaySenders)},
+		issuedPrefixes: make(map[[noncePrefixSize]byte]struct{}),
 	}
 	return keys, nil
+}
+
+// Session mints a fresh sender state for one connection using this KeySet's
+// send key. The record wire format is unchanged; only the nonce prefix differs
+// between concurrent connections so receiver replay windows remain independent.
+func (k *KeySet) Session() (*Sealer, error) {
+	for {
+		sealer := &Sealer{aead: k.sendAEAD}
+		if _, err := rand.Read(sealer.prefix[:]); err != nil {
+			return nil, fmt.Errorf("seed sender nonce prefix: %w", err)
+		}
+		k.sealersMu.Lock()
+		_, exists := k.issuedPrefixes[sealer.prefix]
+		if !exists {
+			k.issuedPrefixes[sealer.prefix] = struct{}{}
+			k.sealersMu.Unlock()
+			return sealer, nil
+		}
+		k.sealersMu.Unlock()
+	}
 }
 
 // Seal allocates and seals one v2 record with aad.
@@ -183,22 +212,57 @@ func (k *KeySet) Seal(plaintext, aad []byte) ([]byte, error) {
 // SealInto appends one v2 record to dst. The record layout is:
 // magic "OLC2" | counter uint64 big-endian | sender prefix [16]byte | ciphertext | tag.
 func (k *KeySet) SealInto(dst, plaintext, aad []byte) ([]byte, error) {
-	counter, err := k.send.nextCounter()
+	sealer, err := k.defaultSession()
+	if err != nil {
+		return nil, err
+	}
+	return sealer.SealInto(dst, plaintext, aad)
+}
+
+func (k *KeySet) defaultSession() (*Sealer, error) {
+	k.sealersMu.Lock()
+	defaultSealer := k.defaultSealer
+	k.sealersMu.Unlock()
+	if defaultSealer != nil {
+		return defaultSealer, nil
+	}
+	sealer, err := k.Session()
+	if err != nil {
+		return nil, err
+	}
+	k.sealersMu.Lock()
+	if k.defaultSealer == nil {
+		k.defaultSealer = sealer
+	}
+	defaultSealer = k.defaultSealer
+	k.sealersMu.Unlock()
+	return defaultSealer, nil
+}
+
+// Seal allocates and seals one v2 record with aad.
+func (s *Sealer) Seal(plaintext, aad []byte) ([]byte, error) {
+	return s.SealInto(nil, plaintext, aad)
+}
+
+// SealInto appends one v2 record to dst. The record layout is:
+// magic "OLC2" | counter uint64 big-endian | sender prefix [16]byte | ciphertext | tag.
+func (s *Sealer) SealInto(dst, plaintext, aad []byte) ([]byte, error) {
+	counter, err := s.nextCounter()
 	if err != nil {
 		return nil, err
 	}
 	base := len(dst)
-	recordLen := recordHeaderSize + len(plaintext) + k.send.aead.Overhead()
+	recordLen := recordHeaderSize + len(plaintext) + s.aead.Overhead()
 	out := appendSpace(dst, recordLen)
 	header := out[base : base+recordHeaderSize]
 	copy(header, recordMagic)
 	binary.BigEndian.PutUint64(header[len(recordMagic):], counter)
-	copy(header[len(recordMagic)+8:], k.send.prefix[:])
+	copy(header[len(recordMagic)+8:], s.prefix[:])
 
 	nonce := acquireNonce()
-	copy(nonce[:noncePrefixSize], k.send.prefix[:])
+	copy(nonce[:noncePrefixSize], s.prefix[:])
 	binary.BigEndian.PutUint64(nonce[noncePrefixSize:], counter)
-	sealed := k.send.aead.Seal(out[:base+recordHeaderSize], nonce[:], plaintext, aad)
+	sealed := s.aead.Seal(out[:base+recordHeaderSize], nonce[:], plaintext, aad)
 	noncePool.Put(nonce)
 	return sealed, nil
 }
@@ -210,7 +274,7 @@ func appendSpace(dst []byte, size int) []byte {
 	return append(dst, make([]byte, size)...)
 }
 
-func (s *sealState) nextCounter() (uint64, error) {
+func (s *Sealer) nextCounter() (uint64, error) {
 	for {
 		current := s.counter.Load()
 		if current == math.MaxUint64 {
@@ -291,6 +355,7 @@ func (r *replayCache) accept(prefix [noncePrefixSize]byte, counter uint64) error
 
 func (r *replayCache) insert(prefix [noncePrefixSize]byte, counter uint64) {
 	if len(r.senders) >= maxReplaySenders {
+		// Eviction bounds memory under prefix floods but makes a very old evicted sender acceptable again.
 		oldest := r.lru.Back()
 		state, ok := oldest.Value.(*replayState)
 		if ok {

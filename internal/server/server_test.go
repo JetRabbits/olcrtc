@@ -350,10 +350,14 @@ func (s *serverLinkStub) ResetPeer() {
 func TestShutdownClosesLinkAndConn(t *testing.T) {
 	keys := newServerTestKeys(t)
 	ln := &serverLinkStub{}
+	conn, err := muxconn.New(ln, keys)
+	if err != nil {
+		t.Fatalf("muxconn.New() error = %v", err)
+	}
 	s := &Server{
 		ln:   ln,
 		keys: keys,
-		conn: muxconn.New(ln, keys),
+		conn: conn,
 	}
 	s.shutdown()
 	if !ln.closed {
@@ -611,11 +615,15 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 
 	keys := newServerTestKeys(t)
 	ln := &serverLinkStub{resetCh: make(chan struct{}, 1)}
+	conn, err := muxconn.New(ln, keys)
+	if err != nil {
+		t.Fatalf("muxconn.New() error = %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		ln:      ln,
 		keys:    keys,
-		conn:    muxconn.New(ln, keys),
+		conn:    conn,
 		session: serverSess,
 		health:  runtime.NewHealthTracker(nil),
 		liveness: control.Config{
@@ -775,7 +783,10 @@ func TestReinstallSessionClosesOldConnBeforeSwap(t *testing.T) {
 	// so Push calls during the swap window are discarded.
 	keys := newServerTestKeys(t)
 	ln := &serverLinkStub{}
-	conn := muxconn.New(ln, keys)
+	conn, err := muxconn.New(ln, keys)
+	if err != nil {
+		t.Fatalf("muxconn.New() error = %v", err)
+	}
 	sess, err := smux.Server(conn, testSmuxCfg())
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
@@ -932,7 +943,12 @@ func TestPeerSessionConcurrentAccess(t *testing.T) {
 			case 0:
 				ps.setHandshake(handshakeResult{sessionID: "sid", deviceID: "dev"})
 			case 1:
-				ps.attachData(muxconn.New(ln, keys), nil)
+				conn, err := muxconn.New(ln, keys)
+				if err != nil {
+					t.Errorf("muxconn.New() error = %v", err)
+					return
+				}
+				ps.attachData(conn, nil)
 			case 2:
 				ps.setControl(nil, func() {})
 			default:

@@ -47,7 +47,10 @@ func benchmarkKeyPair(b *testing.B) (*cryptopkg.KeySet, *cryptopkg.KeySet) {
 func BenchmarkConnPushRead12KiB(b *testing.B) {
 	const recordBatch = 64
 	clientKeys, serverKeys := benchmarkKeyPair(b)
-	conn := New(&synchronousTransport{}, serverKeys)
+	conn, err := New(&synchronousTransport{}, serverKeys)
+	if err != nil {
+		b.Fatalf("New() error = %v", err)
+	}
 	payload := make([]byte, muxBenchmarkPayloadSize)
 	records := make([][]byte, recordBatch)
 	for i := range records {
@@ -63,10 +66,10 @@ func BenchmarkConnPushRead12KiB(b *testing.B) {
 		count := min(recordBatch, b.N-completed)
 		b.StopTimer()
 		for i := range count {
-			var err error
-			records[i], err = clientKeys.SealInto(records[i][:0], payload, aad)
-			if err != nil {
-				b.Fatalf("SealInto() error = %v", err)
+			var sealErr error
+			records[i], sealErr = clientKeys.SealInto(records[i][:0], payload, aad)
+			if sealErr != nil {
+				b.Fatalf("SealInto() error = %v", sealErr)
 			}
 		}
 		b.StartTimer()
@@ -83,9 +86,15 @@ func BenchmarkConnPushRead12KiB(b *testing.B) {
 func BenchmarkConnWriteRead12KiB(b *testing.B) {
 	clientKeys, serverKeys := benchmarkKeyPair(b)
 	clientLink := &synchronousTransport{}
-	server := New(&synchronousTransport{}, serverKeys)
+	server, err := New(&synchronousTransport{}, serverKeys)
+	if err != nil {
+		b.Fatalf("New(server) error = %v", err)
+	}
 	clientLink.onSend = server.Push
-	client := New(clientLink, clientKeys)
+	client, err := New(clientLink, clientKeys)
+	if err != nil {
+		b.Fatalf("New(client) error = %v", err)
+	}
 	payload := make([]byte, muxBenchmarkPayloadSize)
 	readBuf := make([]byte, muxBenchmarkPayloadSize)
 
