@@ -165,6 +165,12 @@ type Config struct {
 	// SOCKS listener. Nil means no-op.
 	OnClientReady ConfigClientReadyFunc
 
+	// OnSocksFlowControl is invoked with the live client's flow-ceiling
+	// capability next to OnClientReady. Mobile hosts use it to re-tune flow
+	// ceilings from a memory sampler while the session stays up. Nil means
+	// no-op.
+	OnSocksFlowControl ConfigSocksFlowControlFunc
+
 	ResourceProfile limits.Profile
 	SocksSlotWait   time.Duration
 }
@@ -233,6 +239,9 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	// active request path, not a half-initialized runtime.
 	if cfg.OnClientReady != nil {
 		cfg.OnClientReady(client)
+	}
+	if cfg.OnSocksFlowControl != nil {
+		cfg.OnSocksFlowControl(client)
 	}
 	if onReady != nil {
 		onReady(actualAddr)

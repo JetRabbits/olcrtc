@@ -122,9 +122,21 @@ type Config struct {
 	// requester here instead of tearing the session down. Nil means no-op.
 	OnClientReady func(ReconnectRequester)
 
+	// OnSocksFlowControl receives the live client's flow-ceiling capability
+	// alongside OnClientReady. Memory-constrained hosts (iOS Network
+	// Extensions) capture it to raise or shed SOCKS flow ceilings while the
+	// session keeps running. Nil means no-op.
+	OnSocksFlowControl func(SocksFlowController)
+
 	ResourceProfile ResourceProfile
 	SocksSlotWait   time.Duration
 }
+
+// SocksFlowController retunes an active session's SOCKS flow ceilings. Values
+// of zero or less leave that field unchanged. Lowering a ceiling below the
+// current active count is supported: established flows drain while new ones
+// wait or are refused.
+type SocksFlowController = internalclient.SocksFlowController
 
 // ReconnectRequester rebuilds an active session's remote carrier and smux
 // streams without stopping the local SOCKS5 listener. Repeated requests while
@@ -185,9 +197,10 @@ func toClientConfig(cfg Config) internalclient.Config {
 		},
 		DeviceID: cfg.DeviceID, DeviceIDPath: cfg.DeviceIDPath, Claims: cfg.Claims,
 		OnHealth: internalclient.HealthFunc(cfg.OnHealth), OnFlowStats: mapFlowStatsFunc(cfg.OnFlowStats),
-		OnClientReady:   mapClientReadyFunc(cfg.OnClientReady),
-		ResourceProfile: cfg.ResourceProfile,
-		SocksSlotWait:   cfg.SocksSlotWait,
+		OnClientReady:      mapClientReadyFunc(cfg.OnClientReady),
+		OnSocksFlowControl: mapSocksFlowControlFunc(cfg.OnSocksFlowControl),
+		ResourceProfile:    cfg.ResourceProfile,
+		SocksSlotWait:      cfg.SocksSlotWait,
 	}
 }
 
@@ -196,6 +209,13 @@ func mapClientReadyFunc(fn func(ReconnectRequester)) internalclient.ConfigClient
 		return nil
 	}
 	return func(requester internalclient.ReconnectRequester) { fn(requester) }
+}
+
+func mapSocksFlowControlFunc(fn func(SocksFlowController)) internalclient.ConfigSocksFlowControlFunc {
+	if fn == nil {
+		return nil
+	}
+	return func(controller internalclient.SocksFlowController) { fn(controller) }
 }
 
 func mapFlowStatsFunc(fn FlowStatsFunc) internalclient.FlowStatsFunc {

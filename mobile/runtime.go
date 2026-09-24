@@ -39,6 +39,15 @@ var (
 	ErrInvalidConfig        = errors.New("invalid mobile runtime configuration")
 	ErrUnsupportedProvider  = errors.New("unsupported provider")
 	ErrUnsupportedTransport = errors.New("unsupported transport")
+	ErrInvalidBufferProfile = errors.New("unsupported buffer profile")
+)
+
+// Buffer profile names accepted by Runtime.SetBufferProfile and the package-level
+// SetBufferProfile. BufferProfileDefault is desktop/server-sized buffering;
+// BufferProfileMobileLowMemory is sized for a ~50 MB process budget.
+const (
+	BufferProfileDefault         = "default"
+	BufferProfileMobileLowMemory = "mobile_low_memory"
 )
 
 type runtimeState string
@@ -58,6 +67,9 @@ type runGeneration struct {
 	// reconnect is published by Config.OnClientReady while this generation
 	// is live; guarded by Runtime.mu.
 	reconnect func(reason string) error
+	// socksFlowControl is published by Config.OnSocksFlowControl while this
+	// generation is live; guarded by Runtime.mu.
+	socksFlowControl client.SocksFlowController
 }
 
 // Runtime owns one independently configured mobile client lifecycle.
@@ -119,6 +131,9 @@ func (r *Runtime) Start() error {
 	cfg.OnClientReady = func(requester client.ReconnectRequester) {
 		r.attachReconnect(gen, requester)
 	}
+	cfg.OnSocksFlowControl = func(controller client.SocksFlowController) {
+		r.attachSocksFlowControl(gen, controller)
+	}
 	gen.cfg = cfg
 	r.current = gen
 	r.state = stateStarting
@@ -135,6 +150,18 @@ func (r *Runtime) attachReconnect(gen *runGeneration, requester client.Reconnect
 		return
 	}
 	gen.reconnect = requester.RequestReconnect
+}
+
+// attachSocksFlowControl binds the live flow-ceiling capability to its
+// generation unless that generation has already been superseded or is winding
+// down.
+func (r *Runtime) attachSocksFlowControl(gen *runGeneration, controller client.SocksFlowController) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.isCurrentGenerationLocked(gen) || r.state == stateStopping || r.state == stateStopped {
+		return
+	}
+	gen.socksFlowControl = controller
 }
 
 func (r *Runtime) run(ctx context.Context, gen *runGeneration) {
@@ -164,6 +191,7 @@ func (r *Runtime) finish(gen *runGeneration, runErr error) {
 	if r.isCurrentGenerationLocked(gen) {
 		r.state = stateStopped
 		gen.reconnect = nil
+		gen.socksFlowControl = nil
 	}
 	r.mu.Unlock()
 	gen.doneOnce.Do(func() { close(gen.done) })
@@ -244,11 +272,28 @@ func (r *Runtime) Stop(timeoutMillis int) error {
 	}
 }
 
+// SetSocksFlowCeilings retunes the live generation's SOCKS flow ceilings from a
+// host memory sampler: raise them while the process has headroom, shed them as
+// phys_footprint approaches the platform limit. It returns false (a no-op) when
+// no generation can accept the change, so a caller never mistakes a request made
+// while idle for one that took effect. Ceilings are per-generation: a new
+// session always starts from the profile/session defaults set via
+// SetSocksFlowLimits, never from a leftover memory-derived value.
+func (r *Runtime) SetSocksFlowCeilings(maxTCP, maxUDP, maxTotal int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != stateRunning || r.current == nil || r.current.socksFlowControl == nil {
+		return false
+	}
+	r.current.socksFlowControl.SetSocksFlowCeilings(maxTCP, maxUDP, maxTotal)
+	return true
+}
+
 // Reconnect asks the live generation to rebuild its remote carrier and smux
 // streams while the local SOCKS5 listener stays open — the fast transport
 // handover path for host network changes (reason e.g. "network"). It is
 // accepted only while running; callers keep the full Stop/Start restart as
-// the fallback. Repeated calls while a rebuild is queued are coalesced.
+// the fallback. Repeated calls while a rebuild are coalesced.
 func (r *Runtime) Reconnect(reason string) error {
 	if reason == "" {
 		reason = "network"

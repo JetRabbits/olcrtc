@@ -365,6 +365,48 @@ func (r *Runtime) SetLowMemoryProfile(enabled bool) {
 	r.mu.Unlock()
 }
 
+// SetBufferProfile selects only the transport/relay buffer and window sizes for
+// future runs, by name, and never touches the Go runtime.
+//
+// SetLowMemoryProfile bundles three independent decisions — buffer sizes, SOCKS
+// flow ceilings, and a hard debug.SetMemoryLimit + SetGCPercent pair — and a host
+// that needs only the first is forced to take the others. On iOS that combination
+// was unusable: the 14 MiB memory limit with GOGC=15 starved the data path (52
+// inbound bytes in 71 s at 165 collections/s), while the profile's MaxUDP=8
+// starved tunnelled DNS. Meanwhile leaving the profile at Default handed the
+// Network Extension desktop-sized buffering — a 32 MiB smux receive buffer and
+// 4096-packet KCP windows — inside a ~50 MB jetsam budget, so phys_footprint grew
+// with bytes in flight and the extension was killed.
+//
+// Selecting the buffer profile alone lets a host keep its own GC/memory settings
+// and its own SOCKS ceilings (see SetSocksFlowLimits, which overrides profile
+// fields independently).
+func (r *Runtime) SetBufferProfile(name string) error {
+	profile, err := bufferProfile(name)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.defaults.resourceProfile = profile
+	r.mu.Unlock()
+	return nil
+}
+
+// bufferProfile maps a buffer-profile name to its limits.Profile. Unknown names
+// are an error rather than a silent fallback to Default: a host that believes it
+// shrank its buffers must not silently keep desktop-sized ones.
+func bufferProfile(name string) (client.ResourceProfile, error) {
+	switch name {
+	case BufferProfileDefault:
+		return client.ResourceProfile{}, nil
+	case BufferProfileMobileLowMemory:
+		return limits.MobileLowMemory(), nil
+	default:
+		return client.ResourceProfile{}, fmt.Errorf("%w: %q (want %q or %q)",
+			ErrInvalidBufferProfile, name, BufferProfileDefault, BufferProfileMobileLowMemory)
+	}
+}
+
 // SetSocksFlowLimits bounds only the SOCKS TCP, UDP, and total flow ceilings
 // for future runs. Zero or negative values keep the selected profile's field.
 func (r *Runtime) SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
