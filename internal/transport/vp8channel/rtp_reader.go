@@ -156,13 +156,6 @@ type vp8FrameState struct {
 // nil otherwise. The result remains valid until the next call. Detects packet
 // loss/reordering to avoid silently corrupting fragmented VP8 frames.
 func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
-	if s.haveLastSeq && pkt.SequenceNumber != s.lastSeq+1 {
-		s.frameValid = false
-		s.frameBuf = s.frameBuf[:0]
-	}
-	s.lastSeq = pkt.SequenceNumber
-	s.haveLastSeq = true
-
 	vp8Payload, err := s.vp8Pkt.Unmarshal(pkt.Payload)
 	if err != nil {
 		s.frameValid = false
@@ -170,9 +163,21 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 		return nil
 	}
 
+	// A sequence gap is only evidence of loss when it interrupts a frame we are
+	// still assembling. The reorder buffer has already restored order by the
+	// time we get here, so a gap immediately before a start-of-partition packet
+	// is harmless - penalising it threw away the *next* frame as collateral and
+	// doubled the cost of every real loss.
+	gap := s.haveLastSeq && pkt.SequenceNumber != s.lastSeq+1
+	s.lastSeq = pkt.SequenceNumber
+	s.haveLastSeq = true
+
 	if s.vp8Pkt.S == 1 {
 		s.frameBuf = s.frameBuf[:0]
 		s.frameValid = true
+	} else if gap && s.frameValid {
+		s.frameValid = false
+		s.frameBuf = s.frameBuf[:0]
 	}
 
 	if !s.frameValid {

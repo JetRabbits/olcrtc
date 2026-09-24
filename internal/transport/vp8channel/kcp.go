@@ -22,8 +22,13 @@ const kcpConvID = 0xC0FFEE01
 // are TCP-like and recover slowly after burst losses.
 const (
 	// kcp-go hardcodes mtuLimit=1500, so SetMtu() above this is silently
-	// clamped. Stay below that with headroom for KCP overhead (24 bytes).
-	kcpMTU = 1400
+	// clamped. Stay below it and keep a whole KCP packet plus the 36-byte epoch
+	// header inside ONE RTP packet: with the VP8 track on pion's default
+	// 1400-byte MTU and the writer's singleSampleLimit, a 1300-byte KCP packet
+	// never fragments, so a lost RTP packet costs exactly the one segment it
+	// carried. Pushing this back toward 1400 makes samples span two RTP packets
+	// and reintroduces the loss amplification (see singleSampleLimit).
+	kcpMTU = 1300
 
 	// Send/receive window in segments. Bulk data runs on its own KCP session,
 	// isolated from the control plane (ping/pong has a separate startKCP and is

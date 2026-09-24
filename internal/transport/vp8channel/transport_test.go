@@ -156,7 +156,9 @@ func TestBatchSampleCarriesMultipleKCPPackets(t *testing.T) {
 
 func TestBatchSampleReusesWriterBuffer(t *testing.T) {
 	hdr := testEpochHdr(1)
-	frame := make([]byte, epochHdrLen+900)
+	// Two 600-byte segments plus batch framing stay inside one RTP packet, which
+	// is the ceiling the writer must never exceed (see singleSampleLimit).
+	frame := make([]byte, epochHdrLen+600)
 	copy(frame, hdr[:])
 	src := make(chan *packetBuffer, 1)
 	tr := &streamTransport{batchSize: 2}
@@ -177,7 +179,7 @@ func TestBatchSampleReusesWriterBuffer(t *testing.T) {
 	count := 0
 	splitKCPPayload(second[epochHdrLen:], func(payload []byte) {
 		count++
-		if len(payload) != 900 {
+		if len(payload) != 600 {
 			t.Fatalf("batched payload length = %d", len(payload))
 		}
 	})
@@ -197,7 +199,7 @@ func TestBatchSamplePreservesOverflowPacket(t *testing.T) {
 		return &packetBuffer{data: frame, pool: pool}
 	}
 
-	firstSize := defaultMaxPayloadSize - epochHdrLen - len(kcpBatchMagic) - 2 - 4
+	firstSize := singleSampleLimit - epochHdrLen - len(kcpBatchMagic) - 2 - 4
 	var pool sync.Pool
 	overflow := packet(8, 'b', &pool)
 	src := make(chan *packetBuffer, 1)
@@ -208,8 +210,8 @@ func TestBatchSamplePreservesOverflowPacket(t *testing.T) {
 	if pending != overflow {
 		t.Fatalf("pending packet = %p, want overflow packet %p", pending, overflow)
 	}
-	if len(first) > defaultMaxPayloadSize {
-		t.Fatalf("first batch size = %d, max %d", len(first), defaultMaxPayloadSize)
+	if len(first) > singleSampleLimit {
+		t.Fatalf("first batch size = %d, max %d", len(first), singleSampleLimit)
 	}
 	if overflow.pool == nil || len(overflow.data) == 0 {
 		t.Fatal("overflow packet was released before the next batch")
