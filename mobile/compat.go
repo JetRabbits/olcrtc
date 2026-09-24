@@ -67,6 +67,14 @@ func SetLowMemoryProfile(enabled bool) {
 	debug.SetGCPercent(15)
 }
 
+// SetSocksFlowLimits bounds only the SOCKS TCP, UDP, and total flow ceilings
+// for the next session. It does not change the Go runtime memory/GC profile
+// and is independent of SetLowMemoryProfile; pass zero or negative for any
+// field to keep that field from the selected resource profile.
+func SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
+	singletonRuntime.SetSocksFlowLimits(maxTCP, maxUDP, maxTotal)
+}
+
 // Start preserves the legacy singleton start API.
 func Start(carrierName, roomID, clientID, keyHex string, socksPort int, socksUser, socksPass string) error {
 	return StartWithTransport(carrierName, defaultTransport, roomID, clientID, keyHex, socksPort, socksUser, socksPass)

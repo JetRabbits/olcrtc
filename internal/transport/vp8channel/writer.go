@@ -205,6 +205,8 @@ func (p *streamTransport) writerLoop() {
 // queued) keeps the per-peer writes interleaved with the keyframe injection
 // below and lets batchSampleFrom coalesce segments into full samples. Stops
 // when the peer session is released or the transport shuts down.
+//
+//nolint:gocognit // writer priority loop is intentionally kept linear.
 func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan struct{}) {
 	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
@@ -244,7 +246,7 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 			// Up to batchSize samples per tick, each within one RTP packet: this
 			// is the server->client bulk path, so it carries the download
 			// direction that Speedtest-style transfers live or die on.
-			for sent := 0; sent < budget; sent++ {
+			for range budget {
 				frame := pending
 				pending = nil
 				if frame == nil {

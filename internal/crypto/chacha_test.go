@@ -259,8 +259,9 @@ func TestDefaultSessionCompatibilityWithExplicitSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KeySet.Seal() error = %v", err)
 	}
-	if got, err := server.Open(legacyRecord, []byte(testDataAAD)); err != nil || string(got) != "legacy-default" {
-		t.Fatalf("Open(default record) = %q, %v", got, err)
+	got, openErr := server.Open(legacyRecord, []byte(testDataAAD))
+	if openErr != nil || string(got) != "legacy-default" {
+		t.Fatalf("Open(default record) = %q, %v", got, openErr)
 	}
 
 	explicit, err := client.Session()

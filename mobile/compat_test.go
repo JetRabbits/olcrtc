@@ -55,6 +55,7 @@ func TestCompatibilitySettersStoreValuesWithoutPanic(t *testing.T) {
 	SetDebug(false)
 	SetDNS("1.1.1.1")
 	SetSocksListenHost("[127.0.0.1]")
+	SetSocksFlowLimits(15, 14, 29)
 	SetVP8Options(200, 1000)
 	SetLowMemoryProfile(false)
 
@@ -68,6 +69,9 @@ func TestCompatibilitySettersStoreValuesWithoutPanic(t *testing.T) {
 	}
 	if singletonRuntime.defaults.vp8.FPS != 120 || singletonRuntime.defaults.vp8.BatchSize != 64 {
 		t.Fatalf("VP8 clamp = %+v, want FPS 120 batch 64", singletonRuntime.defaults.vp8)
+	}
+	if singletonRuntime.defaults.socksFlowLimits.MaxTCP != 15 || singletonRuntime.defaults.socksFlowLimits.MaxUDP != 14 || singletonRuntime.defaults.socksFlowLimits.MaxTotal != 29 {
+		t.Fatalf("SOCKS flow limits = %+v", singletonRuntime.defaults.socksFlowLimits)
 	}
 }
 

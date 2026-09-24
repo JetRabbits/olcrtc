@@ -42,7 +42,7 @@ func TestInterleavedConnectionsUseIndependentReplayWindows(t *testing.T) {
 	sealed := make([][]byte, 0, bulkRecords)
 	for i := range bulkRecords {
 		body[0] = byte(i)
-		rec, err := dataSession.Seal(body[:], nil)
+		rec, err := dataSession.Seal(body, nil)
 		if err != nil {
 			t.Fatalf("Seal(data %d) error = %v", i, err)
 		}

@@ -190,7 +190,7 @@ func NewWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize int) (*
 	}
 	sealer, err := keys.Session()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create data crypto session: %w", err)
 	}
 	return &Conn{
 		ln:      ln,
@@ -216,11 +216,11 @@ func NewControlWithQueue(ln transport.Transport, keys *crypto.KeySet, queueSize 
 	}
 	cp, ok := ln.(transport.ControlPlane)
 	if !ok {
-		return nil, nil
+		return nil, nil //nolint:nilnil // nil conn means the transport has no isolated control plane.
 	}
 	sealer, err := keys.Session()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create control crypto session: %w", err)
 	}
 	c := &Conn{
 		ln:      ln,
@@ -247,7 +247,7 @@ func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID st
 	}
 	sealer, err := keys.Session()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create peer data crypto session: %w", err)
 	}
 	return &Conn{
 		ln: ln,
@@ -273,11 +273,11 @@ func NewPeerWithQueue(ln transport.PeerTransport, keys *crypto.KeySet, peerID st
 func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID string) (*Conn, error) {
 	cp, ok := ln.(transport.PeerControlPlane)
 	if !ok {
-		return nil, nil
+		return nil, nil //nolint:nilnil // nil conn means the transport has no per-peer control plane.
 	}
 	sealer, err := keys.Session()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create peer control crypto session: %w", err)
 	}
 	c := &Conn{
 		ln: ln,

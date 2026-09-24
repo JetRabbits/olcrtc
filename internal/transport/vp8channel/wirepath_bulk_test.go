@@ -35,7 +35,7 @@ func simFrameTag(i int) []byte { return []byte(fmt.Sprintf("<#%06d>", i)) }
 func buildSimFrames(n int) [][]byte {
 	hdr := testEpochHdr(1)
 	frames := make([][]byte, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		f := make([]byte, 0, epochHdrLen+simFrameBody)
 		f = append(f, hdr[:]...)
 		f = append(f, simFrameTag(i)...)
@@ -89,7 +89,7 @@ func (r *simReceiver) accept(pkt *rtp.Packet) {
 }
 
 // runWirePath feeds frames through batch/reassembly, injecting RTP-level loss.
-func runWirePath(t *testing.T, batchSize int, dropRatio float64, seed int64, mode writerMode) (got []byte, gotFrames, gotSamples, gotMaxSample int) {
+func runWirePath(t *testing.T, batchSize int, dropRatio float64, seed int64, mode writerMode) ([]byte, int, int, int) {
 	t.Helper()
 
 	p := &streamTransport{batchSize: batchSize}
@@ -163,11 +163,13 @@ func runWirePath(t *testing.T, batchSize int, dropRatio float64, seed int64, mod
 					n = batchSize // nothing more queued this tick
 				}
 			}
-		default:
+		case modeCoalesced:
 			sample, pending := p.batchSampleFrom(src, first, batchBuf)
 			batchBuf = sample[:0]
 			sendSample(sample, &seq)
 			carry = pending
+		default:
+			t.Fatalf("unknown writer mode %d", mode)
 		}
 	}
 }
@@ -279,7 +281,7 @@ func firstDiff(a, b []byte) int {
 	if len(b) < n {
 		n = len(b)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if a[i] != b[i] {
 			return i
 		}

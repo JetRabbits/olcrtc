@@ -47,6 +47,7 @@ const (
 	defaultLivenessTimeout  = 15 * time.Second
 	defaultLivenessFailures = 4
 	minTrafficPayloadSize   = 53
+	maxSocksFlowLimit       = 512
 )
 
 type runtimeConfig struct {
@@ -74,6 +75,7 @@ type runtimeConfig struct {
 	video           client.VideoOptions
 	onFlowStats     client.FlowStatsFunc
 	resourceProfile client.ResourceProfile
+	socksFlowLimits limits.SOCKS
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -331,6 +333,7 @@ func (r *Runtime) SetDebug(enabled bool) {
 }
 
 func (cfg runtimeConfig) clientConfig() client.Config {
+	profile := applySocksFlowLimits(cfg.resourceProfile, cfg.socksFlowLimits)
 	return client.Config{
 		Transport: cfg.transport, Provider: cfg.provider, RoomURL: cfg.roomURL,
 		ChannelID: cfg.channelID, Engine: cfg.engine, URL: cfg.serviceURL, Token: cfg.engineToken,
@@ -340,7 +343,7 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		DNSServer: cfg.dnsServer, Resolver: cfg.resolver,
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
 		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath, OnFlowStats: cfg.onFlowStats,
-		ResourceProfile: cfg.resourceProfile,
+		ResourceProfile: profile,
 	}
 }
 
@@ -358,6 +361,41 @@ func (r *Runtime) SetLowMemoryProfile(enabled bool) {
 		r.defaults.resourceProfile = client.ResourceProfile{}
 	}
 	r.mu.Unlock()
+}
+
+// SetSocksFlowLimits bounds only the SOCKS TCP, UDP, and total flow ceilings
+// for future runs. Zero or negative values keep the selected profile's field.
+func (r *Runtime) SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
+	r.mu.Lock()
+	r.defaults.socksFlowLimits = limits.SOCKS{
+		MaxTCP:   clampSocksFlowLimit(maxTCP),
+		MaxUDP:   clampSocksFlowLimit(maxUDP),
+		MaxTotal: clampSocksFlowLimit(maxTotal),
+	}
+	r.mu.Unlock()
+}
+
+func applySocksFlowLimits(profile client.ResourceProfile, override limits.SOCKS) client.ResourceProfile {
+	if override.MaxTCP > 0 {
+		profile.SOCKS.MaxTCP = override.MaxTCP
+	}
+	if override.MaxUDP > 0 {
+		profile.SOCKS.MaxUDP = override.MaxUDP
+	}
+	if override.MaxTotal > 0 {
+		profile.SOCKS.MaxTotal = override.MaxTotal
+	}
+	return profile
+}
+
+func clampSocksFlowLimit(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	if value > maxSocksFlowLimit {
+		return maxSocksFlowLimit
+	}
+	return value
 }
 
 func (cfg runtimeConfig) transportOptions() client.TransportOptions {
