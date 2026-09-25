@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	internalclient "github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
@@ -47,6 +48,7 @@ const (
 	defaultLivenessTimeout  = 15 * time.Second
 	defaultLivenessFailures = 4
 	minTrafficPayloadSize   = 53
+	maxSocksFlowLimit       = 512
 )
 
 type runtimeConfig struct {
@@ -74,6 +76,8 @@ type runtimeConfig struct {
 	video           client.VideoOptions
 	onFlowStats     client.FlowStatsFunc
 	resourceProfile client.ResourceProfile
+	socksFlowLimits limits.SOCKS
+	socksSlotWait   time.Duration
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -331,6 +335,7 @@ func (r *Runtime) SetDebug(enabled bool) {
 }
 
 func (cfg runtimeConfig) clientConfig() client.Config {
+	profile := applySocksFlowLimits(cfg.resourceProfile, cfg.socksFlowLimits)
 	return client.Config{
 		Transport: cfg.transport, Provider: cfg.provider, RoomURL: cfg.roomURL,
 		ChannelID: cfg.channelID, Engine: cfg.engine, URL: cfg.serviceURL, Token: cfg.engineToken,
@@ -340,7 +345,7 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		DNSServer: cfg.dnsServer, Resolver: cfg.resolver,
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
 		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath, OnFlowStats: cfg.onFlowStats,
-		ResourceProfile: cfg.resourceProfile,
+		ResourceProfile: profile, SocksSlotWait: cfg.socksSlotWait,
 	}
 }
 
@@ -358,6 +363,94 @@ func (r *Runtime) SetLowMemoryProfile(enabled bool) {
 		r.defaults.resourceProfile = client.ResourceProfile{}
 	}
 	r.mu.Unlock()
+}
+
+// SetBufferProfile selects only the transport/relay buffer and window sizes for
+// future runs, by name, and never touches the Go runtime.
+//
+// SetLowMemoryProfile bundles three independent decisions — buffer sizes, SOCKS
+// flow ceilings, and a hard debug.SetMemoryLimit + SetGCPercent pair — and a host
+// that needs only the first is forced to take the others. On iOS that combination
+// was unusable: the 14 MiB memory limit with GOGC=15 starved the data path (52
+// inbound bytes in 71 s at 165 collections/s), while the profile's MaxUDP=8
+// starved tunnelled DNS. Meanwhile leaving the profile at Default handed the
+// Network Extension desktop-sized buffering — a 32 MiB smux receive buffer and
+// 4096-packet KCP windows — inside a ~50 MB jetsam budget, so phys_footprint grew
+// with bytes in flight and the extension was killed.
+//
+// Selecting the buffer profile alone lets a host keep its own GC/memory settings
+// and its own SOCKS ceilings (see SetSocksFlowLimits, which overrides profile
+// fields independently).
+func (r *Runtime) SetBufferProfile(name string) error {
+	profile, err := bufferProfile(name)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.defaults.resourceProfile = profile
+	r.mu.Unlock()
+	return nil
+}
+
+// bufferProfile maps a buffer-profile name to its limits.Profile. Unknown names
+// are an error rather than a silent fallback to Default: a host that believes it
+// shrank its buffers must not silently keep desktop-sized ones.
+func bufferProfile(name string) (client.ResourceProfile, error) {
+	switch name {
+	case BufferProfileDefault:
+		return client.ResourceProfile{}, nil
+	case BufferProfileMobileLowMemory:
+		return limits.MobileLowMemory(), nil
+	default:
+		return client.ResourceProfile{}, fmt.Errorf("%w: %q (want %q or %q)",
+			ErrInvalidBufferProfile, name, BufferProfileDefault, BufferProfileMobileLowMemory)
+	}
+}
+
+// SetSocksFlowLimits bounds only the SOCKS TCP, UDP, and total flow ceilings
+// for future runs. Zero or negative values keep the selected profile's field.
+func (r *Runtime) SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
+	r.mu.Lock()
+	r.defaults.socksFlowLimits = limits.SOCKS{
+		MaxTCP:   clampSocksFlowLimit(maxTCP),
+		MaxUDP:   clampSocksFlowLimit(maxUDP),
+		MaxTotal: clampSocksFlowLimit(maxTotal),
+	}
+	r.mu.Unlock()
+}
+
+// SetSocksSlotWait sets the bounded time future sessions wait for a SOCKS flow
+// slot before returning the normal SOCKS host-unreachable refusal. It is
+// independent of SetLowMemoryProfile; pass zero or a negative duration to use
+// the default. Waiting is never unbounded: very large values are clamped because
+// a stalled iOS Network Extension can be jetsam-killed.
+func (r *Runtime) SetSocksSlotWait(wait time.Duration) {
+	r.mu.Lock()
+	r.defaults.socksSlotWait = internalclient.NormalizeSocksSlotWait(wait)
+	r.mu.Unlock()
+}
+
+func applySocksFlowLimits(profile client.ResourceProfile, override limits.SOCKS) client.ResourceProfile {
+	if override.MaxTCP > 0 {
+		profile.SOCKS.MaxTCP = override.MaxTCP
+	}
+	if override.MaxUDP > 0 {
+		profile.SOCKS.MaxUDP = override.MaxUDP
+	}
+	if override.MaxTotal > 0 {
+		profile.SOCKS.MaxTotal = override.MaxTotal
+	}
+	return profile
+}
+
+func clampSocksFlowLimit(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	if value > maxSocksFlowLimit {
+		return maxSocksFlowLimit
+	}
+	return value
 }
 
 func (cfg runtimeConfig) transportOptions() client.TransportOptions {

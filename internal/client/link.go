@@ -61,8 +61,15 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	// with nobody consuming it yet - a deadlock where the fix (reconnect)
 	// waits on the very handshake it needs to unstick.
 	c.goTracked(func() { link.WatchConnection(ctx) })
-	conn := muxconn.NewWithQueue(link, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
-	controlConn := muxconn.NewControlWithQueue(link, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
+	conn, err := muxconn.NewWithQueue(link, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
+	if err != nil {
+		return fmt.Errorf("create data muxconn: %w", err)
+	}
+	controlConn, err := muxconn.NewControlWithQueue(link, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("create control muxconn: %w", err)
+	}
 	// ai-generated: write under sessMu. onData reads c.conn under sessMu.RLock from the transport's
 	// delivery goroutine, live from the moment link.Connect() above succeeded; an unlocked write here
 	// raced it.
@@ -327,8 +334,17 @@ func (c *Client) tryReopenSession(
 	cancel context.CancelFunc,
 	attempt int,
 ) bool {
-	conn := muxconn.NewWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
-	controlConn := muxconn.NewControlWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
+	conn, err := muxconn.NewWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.DataInboundQueue)
+	if err != nil {
+		logger.Warnf("data muxconn init failed (attempt %d): %v", attempt, err)
+		return false
+	}
+	controlConn, err := muxconn.NewControlWithQueue(c.ln, c.keys, c.resourceProfile.MuxConn.ControlInboundQueue)
+	if err != nil {
+		logger.Warnf("control muxconn init failed (attempt %d): %v", attempt, err)
+		_ = conn.Close()
+		return false
+	}
 	c.sessMu.Lock()
 	oldConn, oldControlConn := c.conn, c.controlConn
 	c.conn, c.controlConn = conn, controlConn

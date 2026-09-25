@@ -7,6 +7,22 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
+// singleSampleLimit bounds one VP8 sample to what pion emits in ONE RTP packet.
+//
+// This is the whole point of the writer's shape. When a sample is larger than a
+// packet, pion fragments it (a 60 KiB sample becomes ~44 RTP packets) and the
+// receiver can only reassemble it if *every* fragment survives: one lost packet
+// destroys the entire sample and every KCP segment inside it. Measured on the
+// live path, an utterly normal ~1% SFU loss with batch_size=64 delivered only
+// 0.75% of segments - a ~130x loss amplification that starves KCP, stalls the
+// tunnel and corrupts bulk transfers. Keeping a sample inside one packet makes
+// loss 1:1 again: a dropped RTP packet costs exactly the segment it carried.
+//
+// The VP8 track runs on pion's default 1400-byte MTU and the payloader spends 1
+// byte on the descriptor; the margin covers the batch framing (magic + 2-byte
+// length prefixes) so a coalesced sample still lands in one packet.
+const singleSampleLimit = 1360
+
 // writerState holds the per-loop bookkeeping for writerLoop, extracted so the
 // loop body stays within cognitive-complexity limits.
 type writerState struct {
@@ -102,17 +118,45 @@ func (w *writerState) drainControl() bool {
 	}
 }
 
-// drainData sends one batched data frame, or a keepalive when idle.
+// drainData sends up to batchSize samples this tick, or a keepalive when idle.
+//
+// Several samples per tick is what preserves throughput now that a sample is
+// capped at one RTP packet: before the cap, the writer reached the provider's
+// ~10 Mbit ceiling by stuffing batchSize KCP packets into one big fragmented
+// sample, and this loop keeps that same bytes-per-tick without the correlated
+// loss. drainControl has always emitted many samples per tick, so the provider
+// already sees this shape.
 func (w *writerState) drainData() {
-	frame := w.pendingData
-	w.pendingData = nil
-	if frame == nil {
-		select {
-		case frame = <-w.p.data.out:
-		default:
+	budget := max(w.p.batchSize, 1)
+	sent := 0
+	for sent < budget {
+		frame := w.pendingData
+		w.pendingData = nil
+		if frame == nil {
+			select {
+			case frame = <-w.p.data.out:
+			default:
+			}
 		}
+		if frame == nil {
+			break
+		}
+		if !w.p.canBatch(frame.data) {
+			if !w.writeSample(frame.data) {
+				w.pendingData = frame
+				return
+			}
+			frame.release()
+			sent++
+			continue
+		}
+		sample, pending := w.p.batchSampleFrom(w.p.data.out, frame, w.batchBuf[:0])
+		w.pendingData = pending
+		_ = w.writeSample(sample)
+		w.batchBuf = sample[:0]
+		sent++
 	}
-	if frame == nil {
+	if sent == 0 {
 		w.idleTicks++
 		if w.idleTicks >= w.keepaliveEvery {
 			w.idleTicks = 0
@@ -122,15 +166,6 @@ func (w *writerState) drainData() {
 		return
 	}
 	w.idleTicks = 0
-	if !w.p.canBatch(frame.data) {
-		_ = w.writeSample(frame.data)
-		frame.release()
-		return
-	}
-	sample, pending := w.p.batchSampleFrom(w.p.data.out, frame, w.batchBuf[:0])
-	w.pendingData = pending
-	_ = w.writeSample(sample)
-	w.batchBuf = sample[:0]
 }
 
 func (p *streamTransport) writerLoop() {
@@ -170,6 +205,8 @@ func (p *streamTransport) writerLoop() {
 // queued) keeps the per-peer writes interleaved with the keyframe injection
 // below and lets batchSampleFrom coalesce segments into full samples. Stops
 // when the peer session is released or the transport shuts down.
+//
+//nolint:gocognit // writer priority loop is intentionally kept linear.
 func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan struct{}) {
 	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
@@ -184,6 +221,7 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 	// client->server direction kept flowing (issue #95).
 	keyframeEvery := max(int(forceKeepalivePeriod/p.frameInterval), 1)
 	ticksSinceKeyframe := 0
+	budget := max(p.batchSize, 1)
 	var batchBuf []byte
 	var pending *packetBuffer
 	defer func() {
@@ -205,43 +243,53 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 				hdr := p.epochHeader()
 				_ = p.writeSampleLocked(hdr[:])
 			}
-			frame := pending
-			pending = nil
-			if frame == nil {
-				select {
-				case next, ok := <-out:
-					if !ok {
-						return
+			// Up to batchSize samples per tick, each within one RTP packet: this
+			// is the server->client bulk path, so it carries the download
+			// direction that Speedtest-style transfers live or die on.
+			for range budget {
+				frame := pending
+				pending = nil
+				if frame == nil {
+					select {
+					case next, ok := <-out:
+						if !ok {
+							return
+						}
+						frame = next
+					default:
+						break
 					}
-					frame = next
-				default:
 				}
+				if frame == nil {
+					break
+				}
+				if !p.canBatch(frame.data) {
+					_ = p.writeSampleLocked(frame.data)
+					frame.release()
+					continue
+				}
+				var sample []byte
+				sample, pending = p.batchSampleFrom(out, frame, batchBuf[:0])
+				_ = p.writeSampleLocked(sample)
+				batchBuf = sample[:0]
 			}
-			if frame == nil {
-				continue
-			}
-			if !p.canBatch(frame.data) {
-				_ = p.writeSampleLocked(frame.data)
-				frame.release()
-				continue
-			}
-			var sample []byte
-			sample, pending = p.batchSampleFrom(out, frame, batchBuf[:0])
-			_ = p.writeSampleLocked(sample)
-			batchBuf = sample[:0]
 		}
 	}
 }
 
+// canBatch reports whether frame may lead a coalesced sample. The size test is
+// what keeps coalescing from introducing fragmentation: a sample above
+// singleSampleLimit would be split across RTP packets and lost as a whole (see
+// singleSampleLimit).
 func (p *streamTransport) canBatch(frame []byte) bool {
-	return len(frame) > epochHdrLen && p.batchSize > 1
+	return len(frame) > epochHdrLen && len(frame) <= singleSampleLimit && p.batchSize > 1
 }
 
 // batchSampleFrom coalesces up to batchSize KCP frames drained from src into a
-// single VP8 sample, bounded by defaultMaxPayloadSize. The shared writerLoop
-// drains the single-peer outbound queue; per-peer pumps drain their own queue
-// through the same batching so the server->client path is built identically to
-// the client.
+// single VP8 sample, bounded by singleSampleLimit so the sample is never
+// fragmented across RTP packets. The shared writerLoop drains the single-peer
+// outbound queue; per-peer pumps drain their own queue through the same
+// batching so the server->client path is built identically to the client.
 func (p *streamTransport) batchSampleFrom(
 	src <-chan *packetBuffer,
 	first *packetBuffer,
@@ -268,7 +316,7 @@ func (p *streamTransport) batchSampleFrom(
 				continue
 			}
 			payload := frame.data[epochHdrLen:]
-			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+			if len(sample)+2+len(payload) > singleSampleLimit {
 				return sample, frame
 			}
 			sample = appendBatchPacket(sample, payload)
@@ -284,8 +332,8 @@ func (p *streamTransport) prepareBatchBuffer(dst []byte, src <-chan *packetBuffe
 	packetSize := len(first) - epochHdrLen
 	packetCount := min(p.batchSize, len(src)+1)
 	want := epochHdrLen + len(kcpBatchMagic) + packetCount*(2+packetSize)
-	if want > defaultMaxPayloadSize {
-		want = defaultMaxPayloadSize
+	if want > singleSampleLimit {
+		want = singleSampleLimit
 	}
 	if cap(dst) < want {
 		return make([]byte, 0, want)

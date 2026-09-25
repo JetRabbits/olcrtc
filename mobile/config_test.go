@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openlibrecommunity/olcrtc/internal/limits"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/pkg/olcrtc/client"
@@ -103,6 +104,95 @@ func TestTransportSettersAndValidation(t *testing.T) {
 	runtime.mu.Unlock()
 	if defaults.vp8.FPS != 60 || defaults.sei.FragmentSize != 900 || defaults.video.Codec != "qrcode" {
 		t.Fatalf("transport defaults = %#v", defaults)
+	}
+}
+
+func TestSocksFlowLimitsOverrideFieldWise(t *testing.T) {
+	runtime := New()
+	runtime.SetResourceProfile(limits.MobileLowMemory())
+	runtime.SetSocksFlowLimits(24, 0, -1)
+
+	runtime.mu.Lock()
+	cfg := runtime.defaults.clientConfig()
+	runtime.mu.Unlock()
+
+	got := cfg.ResourceProfile.SOCKS
+	low := limits.MobileLowMemory().SOCKS
+	if got.MaxTCP != 24 || got.MaxUDP != low.MaxUDP || got.MaxTotal != low.MaxTotal {
+		t.Fatalf("SOCKS limits = %+v, want tcp override and udp/total defaults from %+v", got, low)
+	}
+	if got.HandshakeTimeout != low.HandshakeTimeout || got.UDPAssociateIdleTimeout != low.UDPAssociateIdleTimeout {
+		t.Fatalf("SOCKS durations changed: got %+v, want durations from %+v", got, low)
+	}
+}
+
+func TestSocksFlowLimitsClamp(t *testing.T) {
+	runtime := New()
+	runtime.SetSocksFlowLimits(maxSocksFlowLimit+100, 2, maxSocksFlowLimit+1)
+
+	runtime.mu.Lock()
+	cfg := runtime.defaults.clientConfig()
+	runtime.mu.Unlock()
+
+	got := cfg.ResourceProfile.SOCKS
+	if got.MaxTCP != maxSocksFlowLimit || got.MaxUDP != 2 || got.MaxTotal != maxSocksFlowLimit {
+		t.Fatalf("clamped SOCKS limits = %+v", got)
+	}
+}
+
+func TestSocksFlowLimitsSurviveStartProfileSelection(t *testing.T) {
+	configs := make(chan client.Config, 1)
+	runtime := configuredRuntime(t, func(ctx context.Context, cfg client.Config, onReady func(string)) error {
+		configs <- cfg
+		onReady(cfg.LocalAddr)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	runtime.SetSocksFlowLimits(20, 16, 30)
+	runtime.SetLowMemoryProfile(false)
+
+	if err := runtime.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := runtime.WaitReady(100); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+	cfg := <-configs
+	if got := cfg.ResourceProfile.SOCKS; got.MaxTCP != 20 || got.MaxUDP != 16 || got.MaxTotal != 30 {
+		t.Fatalf("Start clobbered SOCKS limits: got %+v", got)
+	}
+	if cfg.ResourceProfile.VP8 != (limits.VP8{}) || cfg.ResourceProfile.Smux != (limits.Smux{}) {
+		t.Fatalf("SOCKS override changed non-SOCKS profile fields: %+v", cfg.ResourceProfile)
+	}
+	if err := runtime.Stop(100); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestSocksSlotWaitSetterDefaultsExplicitAndClamps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  time.Duration
+		want time.Duration
+	}{
+		{name: "unset default", set: 0, want: 0},
+		{name: "zero restores default", set: 0, want: 2 * time.Second},
+		{name: "negative restores default", set: -time.Second, want: 2 * time.Second},
+		{name: "explicit", set: 1500 * time.Millisecond, want: 1500 * time.Millisecond},
+		{name: "clamped", set: time.Minute, want: 10 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := New()
+			if tc.name != "unset default" {
+				runtime.SetSocksSlotWait(tc.set)
+			}
+			runtime.mu.Lock()
+			cfg := runtime.defaults.clientConfig()
+			runtime.mu.Unlock()
+			if cfg.SocksSlotWait != tc.want {
+				t.Fatalf("SocksSlotWait = %s, want %s", cfg.SocksSlotWait, tc.want)
+			}
+		})
 	}
 }
 

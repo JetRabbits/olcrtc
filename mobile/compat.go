@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/openlibrecommunity/olcrtc/pkg/olcrtc/client"
 )
@@ -65,6 +66,50 @@ func SetLowMemoryProfile(enabled bool) {
 	singletonRuntime.SetLowMemoryProfile(true)
 	debug.SetMemoryLimit(14 << 20)
 	debug.SetGCPercent(15)
+}
+
+// SetSocksFlowLimits bounds only the SOCKS TCP, UDP, and total flow ceilings
+// for the next session. It does not change the Go runtime memory/GC profile
+// and is independent of SetLowMemoryProfile; pass zero or negative for any
+// field to keep that field from the selected resource profile.
+func SetSocksFlowLimits(maxTCP, maxUDP, maxTotal int) {
+	singletonRuntime.SetSocksFlowLimits(maxTCP, maxUDP, maxTotal)
+}
+
+// SetSocksSlotWait bounds how long the next session waits for a SOCKS flow
+// slot before using the existing host-unreachable refusal. It is independent of
+// SetLowMemoryProfile and runtime profile selection. Passing 0 (or any negative
+// value) restores the default. Do not use a very large value on iOS: a stalled
+// Network Extension can be jetsam-killed, so waiting must never be unbounded.
+func SetSocksSlotWait(timeoutMillis int) {
+	singletonRuntime.SetSocksSlotWait(time.Duration(timeoutMillis) * time.Millisecond)
+}
+
+// SetSocksFlowCeilings retunes the *running* session's SOCKS TCP, UDP, and total
+// flow ceilings from a host memory sampler, without restarting the tunnel. It is
+// the runtime companion to SetSocksFlowLimits, which only shapes future
+// sessions: an iOS Network Extension needs to admit a throughput test's ~50
+// concurrent flows while phys_footprint has headroom, then shed new admissions as
+// it approaches the jetsam line, and no single fixed ceiling does both.
+//
+// Values of zero or less leave that field unchanged. It returns false when no
+// session can accept the change (idle, starting, or stopping), so the caller
+// knows the request was a no-op rather than applied. New sessions always start
+// from the configured profile, never from a leftover ceiling applied here.
+func SetSocksFlowCeilings(maxTCP, maxUDP, maxTotal int) bool {
+	return singletonRuntime.SetSocksFlowCeilings(maxTCP, maxUDP, maxTotal)
+}
+
+// SetBufferProfile selects the transport/relay buffer and window profile for
+// future runs by name — BufferProfileDefault or BufferProfileMobileLowMemory —
+// without touching the Go runtime's memory limit or GC percent.
+//
+// Use this instead of SetLowMemoryProfile when only the buffer sizes are wanted:
+// SetLowMemoryProfile also pins debug.SetMemoryLimit/SetGCPercent and the SOCKS
+// flow ceilings, which on an iOS Network Extension starves the data path. Pair it
+// with SetSocksFlowLimits to keep flow ceilings under host control.
+func SetBufferProfile(name string) error {
+	return singletonRuntime.SetBufferProfile(name)
 }
 
 // Start preserves the legacy singleton start API.
@@ -178,6 +223,20 @@ func ActiveTotalFlows() int64 {
 	singletonMu.Lock()
 	defer singletonMu.Unlock()
 	return singletonStats.Total
+}
+
+// SocksSlotWaitAdmitted returns flows admitted after waiting for a flow slot.
+func SocksSlotWaitAdmitted() int64 {
+	singletonMu.Lock()
+	defer singletonMu.Unlock()
+	return singletonStats.SlotWaitAdmitted
+}
+
+// SocksSlotWaitRefused returns flow requests refused after slot waiting failed.
+func SocksSlotWaitRefused() int64 {
+	singletonMu.Lock()
+	defer singletonMu.Unlock()
+	return singletonStats.SlotWaitRefused
 }
 
 func updateSingletonFlowStats(stats client.FlowStats) {

@@ -28,6 +28,12 @@ func newKeyPair(tb testing.TB) (*KeySet, *KeySet) {
 	return client, server
 }
 
+func recordPrefix(record []byte) [noncePrefixSize]byte {
+	var prefix [noncePrefixSize]byte
+	copy(prefix[:], record[len(recordMagic)+8:recordHeaderSize])
+	return prefix
+}
+
 func TestNewKeySetRejectsInvalidInput(t *testing.T) {
 	if _, err := NewKeySet([]byte("short"), Client); !errors.Is(err, ErrInvalidKeySize) {
 		t.Fatalf("short PSK error = %v, want %v", err, ErrInvalidKeySize)
@@ -171,6 +177,106 @@ func TestReplayRejectsRecordOlderThanWindow(t *testing.T) {
 	}
 }
 
+func TestSessionsUseDistinctPrefixesAndIndependentReplay(t *testing.T) {
+	client, server := newKeyPair(t)
+	control, err := client.Session()
+	if err != nil {
+		t.Fatalf("Session(control) error = %v", err)
+	}
+	data, err := client.Session()
+	if err != nil {
+		t.Fatalf("Session(data) error = %v", err)
+	}
+	controlFirst, err := control.Seal([]byte("control-first"), []byte(testControlAAD))
+	if err != nil {
+		t.Fatalf("Seal(control first) error = %v", err)
+	}
+	dataFirst, err := data.Seal([]byte("data-first"), []byte(testDataAAD))
+	if err != nil {
+		t.Fatalf("Seal(data first) error = %v", err)
+	}
+	if recordPrefix(controlFirst) == recordPrefix(dataFirst) {
+		t.Fatal("two sessions from one KeySet reused a nonce prefix")
+	}
+
+	dataRecords := make([][]byte, replayWindowSize*3)
+	for i := range dataRecords {
+		dataRecords[i], err = data.Seal([]byte("data"), []byte(testDataAAD))
+		if err != nil {
+			t.Fatalf("Seal(data %d) error = %v", i, err)
+		}
+	}
+	for i, record := range dataRecords {
+		if _, err := server.Open(record, []byte(testDataAAD)); errors.Is(err, ErrReplayTooOld) || errors.Is(err, ErrReplayDuplicate) {
+			t.Fatalf("Open(data %d) replay error = %v", i, err)
+		} else if err != nil {
+			t.Fatalf("Open(data %d) error = %v", i, err)
+		}
+	}
+	if _, err := server.Open(controlFirst, []byte(testControlAAD)); errors.Is(err, ErrReplayTooOld) || errors.Is(err, ErrReplayDuplicate) {
+		t.Fatalf("Open(control first) replay error = %v", err)
+	} else if err != nil {
+		t.Fatalf("Open(control first) error = %v", err)
+	}
+	if _, err := server.Open(dataFirst, []byte(testDataAAD)); !errors.Is(err, ErrReplayTooOld) {
+		t.Fatalf("Open(old data first) error = %v, want %v within data session", err, ErrReplayTooOld)
+	}
+}
+
+func TestReplayWindowStillAppliesWithinSession(t *testing.T) {
+	client, server := newKeyPair(t)
+	session, err := client.Session()
+	if err != nil {
+		t.Fatalf("Session() error = %v", err)
+	}
+	records := make([][]byte, replayWindowSize+1)
+	for i := range records {
+		records[i], err = session.Seal([]byte("record"), []byte(testDataAAD))
+		if err != nil {
+			t.Fatalf("Seal(%d) error = %v", i, err)
+		}
+	}
+	if _, err := server.Open(records[1], []byte(testDataAAD)); err != nil {
+		t.Fatalf("Open(counter 2) error = %v", err)
+	}
+	if _, err := server.Open(records[1], []byte(testDataAAD)); !errors.Is(err, ErrReplayDuplicate) {
+		t.Fatalf("Open(duplicate) error = %v, want %v", err, ErrReplayDuplicate)
+	}
+	if _, err := server.Open(records[len(records)-1], []byte(testDataAAD)); err != nil {
+		t.Fatalf("Open(newest) error = %v", err)
+	}
+	if _, err := server.Open(records[0], []byte(testDataAAD)); !errors.Is(err, ErrReplayTooOld) {
+		t.Fatalf("Open(oldest) error = %v, want %v", err, ErrReplayTooOld)
+	}
+}
+
+func TestDefaultSessionCompatibilityWithExplicitSessions(t *testing.T) {
+	client, server := newKeyPair(t)
+	if _, err := server.Session(); err != nil {
+		t.Fatalf("receiver Session() error = %v", err)
+	}
+	legacyRecord, err := client.Seal([]byte("legacy-default"), []byte(testDataAAD))
+	if err != nil {
+		t.Fatalf("KeySet.Seal() error = %v", err)
+	}
+	got, openErr := server.Open(legacyRecord, []byte(testDataAAD))
+	if openErr != nil || string(got) != "legacy-default" {
+		t.Fatalf("Open(default record) = %q, %v", got, openErr)
+	}
+
+	explicit, err := client.Session()
+	if err != nil {
+		t.Fatalf("sender Session() error = %v", err)
+	}
+	explicitRecord, err := explicit.Seal([]byte("explicit"), []byte(testDataAAD))
+	if err != nil {
+		t.Fatalf("Sealer.Seal() error = %v", err)
+	}
+	if got, err := server.Open(explicitRecord, []byte(testDataAAD)); err != nil || string(got) != "explicit" {
+		t.Fatalf("Open(explicit record) = %q, %v", got, err)
+	}
+}
+
 func TestServerAcceptsIndependentClientPrefixes(t *testing.T) {
 	clientA, server := newKeyPair(t)
 	clientB, err := NewKeySet([]byte(testPSK), Client)
@@ -198,8 +304,12 @@ func TestReplayStateUsesBoundedLRU(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewKeySet(client %d) error = %v", i, err)
 		}
-		binary.BigEndian.PutUint64(client.send.prefix[noncePrefixSize-8:], uint64(i))
-		record, err := client.Seal(nil, []byte(testDataAAD))
+		sealer, err := client.Session()
+		if err != nil {
+			t.Fatalf("Session(client %d) error = %v", i, err)
+		}
+		binary.BigEndian.PutUint64(sealer.prefix[noncePrefixSize-8:], uint64(i))
+		record, err := sealer.Seal(nil, []byte(testDataAAD))
 		if err != nil {
 			t.Fatalf("Seal(client %d) error = %v", i, err)
 		}
@@ -273,15 +383,19 @@ func TestConcurrentSealAndOpen(t *testing.T) {
 
 func TestCounterExhaustionDoesNotWrap(t *testing.T) {
 	client, _ := newKeyPair(t)
-	client.send.counter.Store(math.MaxUint64 - 1)
-	record, err := client.Seal(nil, []byte(testDataAAD))
+	sealer, err := client.Session()
+	if err != nil {
+		t.Fatalf("Session() error = %v", err)
+	}
+	sealer.counter.Store(math.MaxUint64 - 1)
+	record, err := sealer.Seal(nil, []byte(testDataAAD))
 	if err != nil {
 		t.Fatalf("Seal(max counter) error = %v", err)
 	}
 	if counter := binary.BigEndian.Uint64(record[len(recordMagic):]); counter != math.MaxUint64 {
 		t.Fatalf("counter = %d, want %d", counter, uint64(math.MaxUint64))
 	}
-	if _, err := client.Seal(nil, []byte(testDataAAD)); !errors.Is(err, ErrCounterExhausted) {
+	if _, err := sealer.Seal(nil, []byte(testDataAAD)); !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("Seal(after max) error = %v, want %v", err, ErrCounterExhausted)
 	}
 }
