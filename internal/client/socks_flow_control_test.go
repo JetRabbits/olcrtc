@@ -9,7 +9,9 @@ import (
 func TestSetSocksFlowCeilingsRaisesAndShedsAdmission(t *testing.T) {
 	c := &Client{resourceProfile: limits.Normalize(limits.Profile{SOCKS: limits.SOCKS{MaxTCP: 2, MaxUDP: 1, MaxTotal: 2}})}
 
-	if !c.tryBeginFlow(flowKindTCP) || !c.tryBeginFlow(flowKindTCP) {
+	firstAccepted := c.tryBeginFlow(flowKindTCP)
+	secondAccepted := c.tryBeginFlow(flowKindTCP)
+	if !firstAccepted || !secondAccepted {
 		t.Fatal("first two tcp flows should fill the initial ceiling")
 	}
 	if c.tryBeginFlow(flowKindTCP) {

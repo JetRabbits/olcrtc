@@ -10,7 +10,7 @@ import (
 )
 
 func TestRuntimeSetBufferProfileSelectsSizesOnly(t *testing.T) {
-	runtime := configuredRuntime(t, func(ctx context.Context, cfg client.Config, onReady func(string)) error {
+	runtime := configuredRuntime(t, func(context.Context, client.Config, func(string)) error {
 		return nil
 	})
 
@@ -45,7 +45,7 @@ func TestRuntimeSetBufferProfileSelectsSizesOnly(t *testing.T) {
 }
 
 func TestRuntimeSetBufferProfileRejectsUnknownName(t *testing.T) {
-	runtime := configuredRuntime(t, func(ctx context.Context, cfg client.Config, onReady func(string)) error {
+	runtime := configuredRuntime(t, func(context.Context, client.Config, func(string)) error {
 		return nil
 	})
 	runtime.SetResourceProfile(client.ResourceProfile{Smux: limits.Smux{DataReceiveBuffer: 1234}})
